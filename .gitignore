@@ -1,0 +1,67 @@
+# ignore all
+*
+# unignore files with extensions
+!*.*
+# unignore all dirs
+!*/
+### Above combination will ignore all files without extension
+
+!Makefile
+!LICENSE
+
+# Binaries
+main
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Built example binaries
+
+# Test binary
+*.test
+
+# Output
+*.out
+
+# iOS c-archive build artifacts
+*.a
+examples/ios_demo/ios/libgoguiapp.h
+
+# WASM build artifacts
+*.wasm
+wasm_exec.js
+
+# npm
+package-lock.json
+
+# Go workspace
+go.work
+go.work.sum
+
+# Dependency directory
+vendor/
+.claude/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Serena
+.serena/
+
+# Graphify
+graphify-out/
+
+# Anitivibe
+deep-dive/
+
+
