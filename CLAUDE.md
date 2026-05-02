@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Roadmap
+
+Post-MVP feature plan with progress checkboxes lives in `ROADMAP.md`
+at the repo root. Tick boxes there as work lands.
+
 ## What this is
 
 `go-term` is a minimal terminal-emulator widget built on the `go-gui`
