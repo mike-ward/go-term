@@ -181,15 +181,32 @@ auto-execute.
 buffer (and for alt-screen apps). Without DECSTBM, vim repaints the
 whole screen on every scroll.
 
-- [ ] `grid.go`: add `Top, Bottom int` (scroll region, default
-      `0..Rows-1`). Convert `scrollUp()` to `scrollUpRegion()` honoring
-      Top/Bottom. Add `ScrollDownRegion()`, `InsertLines(n)`,
-      `DeleteLines(n)`, `InsertChars(n)`, `DeleteChars(n)`.
-- [ ] `parser.go::dispatchCSI`: `r` (DECSTBM), `L` (IL), `M` (DL),
+- [x] `grid.go`: added `Top, Bottom int` (default `0..Rows-1`),
+      replaced `scrollUp()` with `scrollUpRegion(n)` (pushes scrollback
+      only when region is full-screen). Added `scrollDownRegion(n)`,
+      `SetScrollRegion`, `ScrollUp`/`ScrollDown` (CSI S/T wrappers),
+      `InsertLines`, `DeleteLines`, `InsertChars`, `DeleteChars`,
+      `ReverseIndex`, `NextLine`. `Newline` now scrolls only at
+      `Bottom`; cursor below Bottom advances without scrolling.
+      `Resize` resets the region to full screen.
+- [x] `parser.go::dispatchCSI`: `r` (DECSTBM), `L` (IL), `M` (DL),
       `@` (ICH), `P` (DCH), `S` (SU), `T` (SD).
-- [ ] `parser.go::Feed` ESC dispatch: `D` (IND), `M` (RI), `E` (NEL).
-- [ ] Tests for scroll-region edge cases (region == full screen,
-      region of 1 row, IL/DL at top/bottom).
+- [x] `parser.go::Feed` ESC dispatch: `D` (IND), `M` (RI), `E` (NEL).
+- [x] Tests: `TestGrid_SetScrollRegion`,
+      `TestGrid_ScrollUpRegion_Partial`,
+      `TestGrid_ScrollUpRegion_FullScreenScrollback`,
+      `TestGrid_ScrollUpRegion_OverHeight`,
+      `TestGrid_ScrollDownRegion_Partial`,
+      `TestGrid_NewlineAtRegionBottom`,
+      `TestGrid_NewlineBelowRegionDoesNotScroll`,
+      `TestGrid_ReverseIndexAtTop`, `TestGrid_NextLine`,
+      `TestGrid_InsertLines`, `TestGrid_InsertLines_OutsideRegion`,
+      `TestGrid_DeleteLines`, `TestGrid_InsertChars`,
+      `TestGrid_InsertChars_OverWidth`, `TestGrid_DeleteChars`,
+      `TestGrid_ResizeResetsRegion`,
+      `TestParser_DECSTBM_SetAndReset`, `TestParser_IND_RI_NEL`,
+      `TestParser_InsertDeleteLines`, `TestParser_InsertDeleteChars`,
+      `TestParser_SU_SD`.
 
 **Demo test:** `vim` opens a file, scrolling shows partial repaints
 not full clears. `less /etc/services` arrows scroll smoothly.
@@ -202,15 +219,30 @@ not full clears. `less /etc/services` arrows scroll smoothly.
 on Phases 2 + 6. Decision: scrollback writes suppressed while alt is
 active (kitty/iTerm/ghostty default).
 
-- [ ] `grid.go`: `altCells []Cell, altCursorR/C, altSaved bool` plus
-      saved main-screen cursor. `EnterAlt()` swaps in a fresh blank
-      cell buffer; `ExitAlt()` restores.
-- [ ] `parser.go::dispatchCSI`: DEC private modes `?47 h/l`,
-      `?1047 h/l`, `?1049 h/l`. `?1049` calls SaveCursor before
-      EnterAlt, Restore after Exit.
-- [ ] Suppress scrollback writes (`scrollUpRegion`) while alt is
-      active.
-- [ ] Tests for enter/exit symmetry and main-screen restore.
+- [x] `grid.go`: `AltActive bool` + `mainSaved altSavedScreen`
+      (cells, cursor, SGR, scroll region, DECSC slot). `EnterAlt()`
+      stashes main state and swaps in a fresh blank buffer;
+      `ExitAlt()` restores. `Resize` reflows the saved main buffer
+      while alt is active.
+- [x] `parser.go::applyDECMode`: `?47 h/l`, `?1047 h/l`,
+      `?1049 h/l`. `?1049` calls SaveCursor before EnterAlt and
+      RestoreCursor after ExitAlt; the DECSC slot is swapped on
+      enter/exit so DECSC inside the alt buffer can't clobber the
+      main save.
+- [x] Suppress scrollback writes in `scrollUpRegion` while
+      `AltActive`.
+- [x] Tests: `TestGrid_EnterAlt_BlanksAndSwaps`,
+      `TestGrid_EnterExitAlt_RestoresMain`,
+      `TestGrid_EnterAlt_Idempotent`,
+      `TestGrid_ExitAlt_NoOpWhenInactive`,
+      `TestGrid_AltSuppressesScrollback`,
+      `TestGrid_EnterAlt_ResetsView`,
+      `TestGrid_AltResize_ReflowsMainBuffer`,
+      `TestGrid_AltDECSC_DoesNotClobberMainSave`,
+      `TestParser_DEC47_AltScreen`,
+      `TestParser_DEC1047_AltScreen`,
+      `TestParser_DEC1049_SavesAndRestoresCursor`,
+      `TestParser_DEC1049_SuppressesScrollback`.
 
 **Demo test:** `vim`, edit, `:q!` — original prompt + history
 restored exactly. `htop` runs.
@@ -222,16 +254,31 @@ restored exactly. `htop` runs.
 **Why:** small, high-visibility win once alt-screen apps work. go-gui
 has `Window.SetTitle` (window.go:500).
 
-- [ ] `parser.go`: new state `stateOSC`. ESC `]` enters; collect
-      bytes until BEL (`\x07`) or ST (`\x1b\\`).
-- [ ] Dispatch OSC `0;...` and `2;...` → `Term.win.SetTitle(...)`
-      (via `QueueCommand`).
-- [ ] OSC `7;file://host/path` → stash `Term.Cwd` (exposed for
-      embedders).
-- [ ] Drop everything else (no OSC 52, no OSC 8).
-- [ ] `widget.go`: `Cfg.OnTitle func(string)` callback, defaulting
-      to `win.SetTitle`.
-- [ ] Tests for title parsing across BEL and ST terminators.
+- [x] `parser.go`: new state `stOSC` (+ `stOSCEsc`). ESC `]` enters;
+      collect bytes until BEL (`\x07`) or ST (`\x1b\\`). Bare ESC
+      inside OSC aborts cleanly and reprocesses as a fresh ESC.
+      Payload capped at `maxOSCBytes` (4096).
+- [x] Dispatch OSC `0;` / `1;` / `2;` → `Parser.onTitle` callback;
+      widget routes to `Cfg.OnTitle` (or `win.SetTitle`) via
+      `QueueCommand`.
+- [x] OSC `7;file://host/path` → stash `Grid.Cwd`, exposed via
+      `Term.Cwd()`.
+- [x] Drop everything else (OSC 52, OSC 8, malformed, unknown Ps).
+- [x] `widget.go`: `Cfg.OnTitle func(string)`, defaulting to
+      `win.SetTitle`.
+- [x] Tests: `TestParser_OSCTitle_BELTerminator`,
+      `TestParser_OSCTitle_STTerminator`,
+      `TestParser_OSCTitle_Ps0And1And2`,
+      `TestParser_OSCTitle_SplitAcrossFeeds`,
+      `TestParser_OSC7_SetsCwd`,
+      `TestParser_OSC_UnknownPsDropped`,
+      `TestParser_OSC_NoSeparatorDropped`,
+      `TestParser_OSC_OverflowTruncated`,
+      `TestParser_OSC_AbortedByBareESC`.
+- [x] DA1 (CSI c) reply `\x1b[?1;2c` via `Parser.onReply` — wired
+      to `pty.Write`. Tests: `TestParser_DA1_Reply`,
+      `TestParser_DA1_ExplicitZero`, `TestParser_DA1_NonZeroIgnored`,
+      `TestParser_DA1_PrivateIgnored`.
 
 **Demo test:** `printf '\x1b]0;hello world\x07'` → window title
 updates.
@@ -243,16 +290,27 @@ updates.
 **Why:** required by tmux pane-click, vim mouse, midnight commander.
 Depends on Phase 4 mouse wiring.
 
-- [ ] `parser.go`: track DEC private modes `?1000 h/l` (button),
+- [x] `parser.go`: track DEC private modes `?1000 h/l` (button),
       `?1002 h/l` (button + drag), `?1003 h/l` (any-motion),
       `?1006 h/l` (SGR encoding). Default off.
-- [ ] `widget.go::OnClick` / `OnMouseMove` / `OnMouseScroll`: when a
-      reporting mode is active, write the encoded sequence to the
-      PTY and skip local selection logic. SGR form:
-      `\x1b[<{btn};{col};{row}{M|m}`.
-- [ ] Suppress mouse reports while `ViewOffset > 0` (scrollback
-      view).
-- [ ] Tests for SGR-1006 encoding of click/release/scroll.
+- [x] `grid.go`: `MouseTrack`, `MouseTrackBtn`, `MouseTrackAny`,
+      `MouseSGR` flags + `MouseReporting()` aggregate.
+- [x] `widget.go`: `mouseSGRBaseButton`, `mouseModBits`,
+      `encodeMouseSGR` helpers; `mouseSnap` snapshot under lock;
+      `writeMouse` shared emit path. `onClick`/`onMouseMove`/
+      `onMouseUp`/`onMouseScroll` route to encoded reports when
+      reporting + SGR + live viewport, otherwise fall through to
+      selection / scrollback. Drag tracks button + report flag so
+      every press has a paired release.
+- [x] Suppress mouse reports while `ViewOffset > 0` (scrollback
+      view) — `mouseSnap.live` gate.
+- [x] Motion dedupe by cell so a still pointer under ?1003 doesn't
+      flood the PTY.
+- [x] Tests: `TestParser_MouseModes_Toggle`,
+      `TestParser_MouseReporting_Aggregate`,
+      `TestEncodeMouseSGR_Press`, `TestEncodeMouseSGR_Release`,
+      `TestEncodeMouseSGR_WheelUp`, `TestEncodeMouseSGR_DragWithMods`,
+      `TestMouseSGRBaseButton_KnownButtons`, `TestMouseModBits`.
 
 **Demo test:** `tmux` → click between panes. `vim` with
 `:set mouse=a` → click moves cursor.
@@ -266,15 +324,28 @@ underline / bar, blinking or steady — set by zsh/fish via vim-mode
 prompts. Decision: honor DECSCUSR blink request; `Cfg.CursorBlink
 *bool` overrides.
 
-- [ ] `grid.go`: `CursorStyle uint8` (0..6 per spec), `CursorBlink
-      bool`.
-- [ ] `parser.go`: handle ` q` (space-q) intermediate.
-- [ ] `widget.go::onDraw`: render block/underline/bar accordingly.
-- [ ] Blink via `time.Since(t.cursorEpoch)` modulo 1s;
-      `win.QueueCommand` redraw on a `time.AfterFunc` ticker only
-      while widget has focus.
-- [ ] Honor `Cfg.CursorBlink *bool` override.
-- [ ] Tests for DECSCUSR style/blink parameter parsing.
+- [x] `grid.go`: `CursorShape` enum (`CursorBlock`/`CursorUnderline`/
+      `CursorBar`) + `CursorBlink bool`. `ApplyDECSCUSR(ps)` maps
+      Ps=0..6 to shape/blink pairs (xterm convention), unknown Ps
+      falls back to blinking block. Defaults via `NewGrid`.
+- [x] `parser.go`: track last intermediate byte (0x20..0x2F) per CSI
+      and reset on entry/dispatch. `q` final byte fires DECSCUSR
+      only when the intermediate is space.
+- [x] `widget.go::onDraw`: dispatches to `drawCursor` which renders
+      block (inverted), underline (bottom strip ≥2px), or bar (left
+      strip ≥2px). Strips remain visible at small font sizes.
+- [x] Blink: `cursorEpoch` set in `New`; `cursorBlinkOff()` flips
+      every `cursorBlinkPeriod` (500ms). `blinkLoop` goroutine
+      `QueueCommand`s redraws on each tick when the cursor is
+      blinking + visible + at live viewport. Stops on `Close` via
+      `blinkDone` channel.
+- [x] `Cfg.CursorBlink *bool` override; `cursorBlinks()` prefers
+      override, falls back to grid state.
+- [x] Tests: `TestParser_DECSCUSR_AllPs` (table-driven Ps 0..6 +
+      unknown), `TestParser_DECSCUSR_RequiresSpaceIntermediate`
+      (no SP → ignored), `TestParser_DECSCUSR_DefaultParam` (no Ps),
+      `TestCursorBlinks_HonorsGridDefault`,
+      `TestCursorBlinks_CfgOverridesGrid`.
 
 **Demo test:** `printf '\x1b[6 q'` → bar cursor.
 
@@ -285,14 +356,29 @@ prompts. Decision: honor DECSCUSR blink request; `Cfg.CursorBlink
 **Why:** CJK + emoji currently overstrike. `uniseg` is already an
 indirect dep.
 
-- [ ] `grid.go::Cell`: add `Width uint8` (1 or 2). `Put(ch rune)`
-      consults `uniseg.StringWidth(string(ch))`. For width-2, write
-      rune in cell N, mark cell N+1 as continuation (Ch=0, Width=0).
-      Wrap at edge when only 1 column remains.
-- [ ] `widget.go::onDraw`: skip continuation cells. Rect-run
-      coalescing must not split a wide cell.
-- [ ] Tests: wide-cell wrap-at-edge, cursor advance, erase across
-      wide cells.
+- [x] `grid.go::Cell`: added `Width uint8` (0 = continuation,
+      1 = normal, 2 = wide head). `defaultCell` sets Width=1; new
+      `blankCell(fg,bg,attrs)` helper; all erase/scroll/insert paths
+      now route through it so blanks are never Width=0.
+- [x] `runeWidth(r rune) int` ASCII-fast-paths to 0 (control) or
+      1, falls through to `uniseg.StringWidth(string(r))` for the
+      rest. uniseg promoted from indirect to direct require.
+- [x] `Grid.Put` consults `runeWidth`: drops width-0 (combining /
+      ZWJ), pads + wraps when a width-2 char would overflow the
+      right margin, writes head at (r,c) and continuation
+      `{Ch:0, Width:0}` at (r,c+1). Cursor advances by `w`.
+- [x] `Grid.eraseWideAt(r,c)` sanitizes orphaned partner cells when
+      a Put overwrites half of an existing wide pair.
+- [x] `widget.go::onDraw` foreground pass skips continuation cells
+      (Width==0 && Ch==0). Background-pass coalescing already
+      preserves wide pairs because head + continuation share SGR.
+- [x] Tests: `TestRuneWidth_ASCII`, `TestRuneWidth_CJKAndEmoji`,
+      `TestGrid_Put_WideAdvancesTwoColumns`,
+      `TestGrid_Put_WideWrapsAtRightEdge`,
+      `TestGrid_Put_OverwriteWideHeadClearsContinuation`,
+      `TestGrid_Put_OverwriteContinuationClearsHead`,
+      `TestGrid_Put_DropsZeroWidth`,
+      `TestGrid_Put_WideThenNarrowLayout`.
 
 **Demo test:** `echo 你好 🍣 hello`. Cursor advances correctly past
 wide chars.

@@ -3,8 +3,10 @@ package term
 import (
 	"log"
 	"math"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/mike-ward/go-gui/gui"
@@ -71,6 +73,57 @@ func truncatePaste(s string, max int) string {
 	return s[:cut]
 }
 
+// mouseSGRBaseButton maps a go-gui MouseButton to its SGR (?1006) base
+// code. Returns false for unsupported buttons (e.g. MouseInvalid),
+// signaling "do not report".
+func mouseSGRBaseButton(b gui.MouseButton) (int, bool) {
+	switch b {
+	case gui.MouseLeft:
+		return 0, true
+	case gui.MouseMiddle:
+		return 1, true
+	case gui.MouseRight:
+		return 2, true
+	}
+	return 0, false
+}
+
+// mouseModBits encodes shift/alt/ctrl modifier bits into the xterm
+// mouse-button byte. Values from xterm ctlseqs: shift=4, alt/meta=8,
+// ctrl=16. Super/Cmd has no standard mapping and is ignored.
+func mouseModBits(m gui.Modifier) int {
+	bits := 0
+	if m.Has(gui.ModShift) {
+		bits += 4
+	}
+	if m.Has(gui.ModAlt) {
+		bits += 8
+	}
+	if m.Has(gui.ModCtrl) {
+		bits += 16
+	}
+	return bits
+}
+
+// encodeMouseSGR appends an SGR-1006 mouse report to buf:
+// "\x1b[<{cb};{col};{row}{M|m}". Coordinates are converted to 1-based
+// per spec. press=true emits 'M' (press / motion / wheel-tick);
+// press=false emits 'm' (release).
+func encodeMouseSGR(buf []byte, cb, col, row int, press bool) []byte {
+	final := byte('M')
+	if !press {
+		final = 'm'
+	}
+	buf = append(buf, '\x1b', '[', '<')
+	buf = strconv.AppendInt(buf, int64(cb), 10)
+	buf = append(buf, ';')
+	buf = strconv.AppendInt(buf, int64(col+1), 10)
+	buf = append(buf, ';')
+	buf = strconv.AppendInt(buf, int64(row+1), 10)
+	buf = append(buf, final)
+	return buf
+}
+
 // asciiStr caches single-rune strings for runes 0..127 to avoid the
 // per-cell allocation that string(rune) incurs in the OnDraw hot path.
 var asciiStr = func() [128]string {
@@ -98,7 +151,24 @@ type Cfg struct {
 	// ScrollbackRows caps the scrollback ring buffer. Zero uses the
 	// default (defaultScrollbackRows). Negative disables scrollback.
 	ScrollbackRows int
+
+	// OnTitle, if non-nil, receives OSC 0/1/2 window-title updates on
+	// the main goroutine (delivered via Window.QueueCommand). When
+	// nil, the widget calls win.SetTitle directly. Embedders set this
+	// to wrap the title in app-specific framing.
+	OnTitle func(string)
+
+	// CursorBlink, if non-nil, overrides the application's DECSCUSR
+	// blink request. Use *true to force blinking on, *false to force
+	// steady. Leave nil to honor whatever the shell asks for (default
+	// blink for a brand-new grid).
+	CursorBlink *bool
 }
+
+// cursorBlinkPeriod is the half-cycle duration: cursor visible for
+// blinkPeriod, then hidden for blinkPeriod. 500 ms matches xterm
+// defaults.
+const cursorBlinkPeriod = 500 * time.Millisecond
 
 // defaultScrollbackRows is the cap applied when Cfg.ScrollbackRows == 0.
 const defaultScrollbackRows = 5000
@@ -121,12 +191,30 @@ type Term struct {
 	// zero until the first OnDraw.
 	cellW, cellH float32
 
-	// dragging tracks the left-button-held selection state set in
-	// onClick, extended in onMouseMove, finalized in onMouseUp.
-	dragging bool
+	// dragging tracks the button-held state set in onClick, extended
+	// in onMouseMove, finalized in onMouseUp. Used both for local
+	// selection drag and host-side drag reports — distinguished by
+	// dragReport.
+	dragging   bool
+	dragButton gui.MouseButton
+	dragReport bool // true when this drag is being reported to the PTY
+
+	// lastMouseR/C dedupe motion reports under ?1003 so a still
+	// pointer doesn't flood the PTY with identical coordinates each
+	// frame. Set to (-1, -1) when no prior report.
+	lastMouseR int
+	lastMouseC int
 
 	// closed guards Close so multiple calls are safe.
 	closed atomic.Bool
+
+	// cursorEpoch is the reference time for blink-phase calculation.
+	// Set in New so the cursor starts in the "on" half-cycle.
+	cursorEpoch time.Time
+
+	// blinkDone signals the blink ticker goroutine to exit. Closed by
+	// Close.
+	blinkDone chan struct{}
 }
 
 // New starts a shell in a PTY and returns a Term widget. The reader
@@ -148,15 +236,90 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		// Negative: leave ScrollbackCap = 0 (scrollback disabled).
 	}
 	t := &Term{
-		cfg:    cfg,
-		grid:   g,
-		parser: NewParser(g),
-		pty:    pty,
-		win:    w,
+		cfg:         cfg,
+		grid:        g,
+		parser:      NewParser(g),
+		pty:         pty,
+		win:         w,
+		lastMouseR:  -1,
+		lastMouseC:  -1,
+		cursorEpoch: time.Now(),
+		blinkDone:   make(chan struct{}),
 	}
+	t.parser.SetTitleHandler(t.onParserTitle)
+	t.parser.SetReplyHandler(t.onParserReply)
 	w.SetIDFocus(focusID)
 	go t.readLoop()
+	go t.blinkLoop()
 	return t, nil
+}
+
+// blinkLoop wakes every cursorBlinkPeriod and forces a redraw when the
+// cursor is currently blinking + visible at the live viewport. Other
+// states (steady cursor, scrolled-back view, hidden cursor) need no
+// periodic redraw and the loop simply skips.
+func (t *Term) blinkLoop() {
+	tk := time.NewTicker(cursorBlinkPeriod)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.blinkDone:
+			return
+		case <-tk.C:
+			t.grid.Mu.Lock()
+			redraw := t.grid.CursorVisible &&
+				t.grid.ViewOffset == 0 &&
+				t.cursorBlinks()
+			t.grid.Mu.Unlock()
+			if redraw {
+				t.win.QueueCommand(func(w *gui.Window) {
+					w.UpdateWindow()
+				})
+			}
+		}
+	}
+}
+
+// cursorBlinks reports whether the cursor should currently blink,
+// honoring the Cfg.CursorBlink override over the grid's DECSCUSR
+// state. Caller holds Grid.Mu.
+func (t *Term) cursorBlinks() bool {
+	if t.cfg.CursorBlink != nil {
+		return *t.cfg.CursorBlink
+	}
+	return t.grid.CursorBlink
+}
+
+// onParserTitle is the OSC 0/1/2 handler. Runs on the reader goroutine
+// while Grid.Mu is held — must not touch *gui.Window state directly,
+// hence the QueueCommand hop.
+func (t *Term) onParserTitle(title string) {
+	fn := t.cfg.OnTitle
+	t.win.QueueCommand(func(w *gui.Window) {
+		if fn != nil {
+			fn(title)
+			return
+		}
+		w.SetTitle(title)
+	})
+}
+
+// onParserReply writes parser-originated bytes (e.g. DA1 reply) back
+// to the PTY. Called under Grid.Mu; pty.Write is independent of that
+// lock so this is safe.
+func (t *Term) onParserReply(b []byte) {
+	if _, err := t.pty.Write(b); err != nil {
+		log.Printf("term: pty reply: %v", err)
+	}
+}
+
+// Cwd returns the most recent working directory reported via OSC 7,
+// or "" if the shell has never emitted one. Typical payload format
+// is "file://host/path"; embedders parse as needed.
+func (t *Term) Cwd() string {
+	t.grid.Mu.Lock()
+	defer t.grid.Mu.Unlock()
+	return t.grid.Cwd
 }
 
 // focusID is the IDFocus value claimed by the terminal container.
@@ -189,11 +352,13 @@ func (t *Term) View(w *gui.Window) gui.View {
 	})
 }
 
-// Close stops the shell and reader goroutine. Safe to call once.
+// Close stops the shell, reader, and blink goroutine. Safe to call
+// once; subsequent calls are no-ops.
 func (t *Term) Close() error {
 	if t.closed.Swap(true) {
 		return nil
 	}
+	close(t.blinkDone)
 	return t.pty.Close()
 }
 
@@ -285,10 +450,16 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	}
 
 	// Foreground pass: draw each cell's glyph. Skip spaces (already
-	// covered by bg) but still draw if attrs (e.g. underline) apply.
+	// covered by bg) when there are no attrs (e.g. underline).
+	// Continuation cells (right half of a wide char) carry Width==0
+	// and a NUL rune — skip them entirely; the wide head's glyph
+	// renders into both columns at draw time.
 	for r := range rows {
 		for c := range cols {
 			cell := resolveCell(r, c)
+			if cell.Width == 0 && cell.Ch == 0 {
+				continue
+			}
 			if cell.Ch == ' ' && cell.Attrs == 0 {
 				continue
 			}
@@ -300,25 +471,62 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		}
 	}
 
-	// Cursor: invert the cell at the cursor position. Clamp the column so
-	// it stays visible at the right margin where CursorC may equal Cols
-	// (pending wrap before the next Put). Suppress entirely when DEC ?25
-	// has hidden it OR when the viewport is scrolled back into history.
-	if g.CursorVisible && g.ViewOffset == 0 {
+	// Cursor: shape per DECSCUSR (block / underline / bar). Suppress
+	// entirely when DEC ?25 has hidden it OR when the viewport is
+	// scrolled back into history. Honor blink-off half-cycle when
+	// blinking is enabled.
+	if g.CursorVisible && g.ViewOffset == 0 && !t.cursorBlinkOff() {
 		cc := g.CursorC
 		if cc >= cols {
 			cc = cols - 1
 		}
 		if cell := g.At(g.CursorR, cc); cell != nil {
-			x := float32(cc) * t.cellW
-			y := float32(g.CursorR) * t.cellH
-			dc.FilledRect(x, y, t.cellW, t.cellH, fg(*cell))
-			cs := style
-			cs.Color = bg(*cell)
-			dc.Text(x, y, runeString(cell.Ch), cs)
+			t.drawCursor(dc, cc, g.CursorR, *cell, g.CursorShape, style)
 		}
 	}
-	g.Mu.Unlock()
+	t.grid.Mu.Unlock()
+}
+
+// cursorBlinkOff reports whether the cursor is currently in the
+// hidden half of its blink cycle. Returns false (always visible) for
+// steady cursors. Caller holds Grid.Mu.
+func (t *Term) cursorBlinkOff() bool {
+	if !t.cursorBlinks() {
+		return false
+	}
+	elapsed := time.Since(t.cursorEpoch)
+	return (elapsed/cursorBlinkPeriod)%2 == 1
+}
+
+// drawCursor renders the cursor at viewport (row, col) using the
+// current shape. Block inverts the cell (filled bg + cell glyph in
+// fg's color); underline/bar overlay a thin filled rect on top of the
+// regular foreground glyph already drawn in the foreground pass.
+func (t *Term) drawCursor(dc *gui.DrawContext, col, row int, cell Cell,
+	shape CursorShape, style gui.TextStyle) {
+	x := float32(col) * t.cellW
+	y := float32(row) * t.cellH
+	switch shape {
+	case CursorUnderline:
+		// Bottom-aligned bar 1/8th of the cell height (min 2px) so it
+		// stays visible at smaller font sizes.
+		h := t.cellH / 8
+		if h < 2 {
+			h = 2
+		}
+		dc.FilledRect(x, y+t.cellH-h, t.cellW, h, fg(cell))
+	case CursorBar:
+		w := t.cellW / 6
+		if w < 2 {
+			w = 2
+		}
+		dc.FilledRect(x, y, w, t.cellH, fg(cell))
+	default: // CursorBlock
+		dc.FilledRect(x, y, t.cellW, t.cellH, fg(cell))
+		cs := style
+		cs.Color = bg(cell)
+		dc.Text(x, y, runeString(cell.Ch), cs)
+	}
 }
 
 func (t *Term) fillRun(dc *gui.DrawContext, row, c0, c1 int, color gui.Color) {
@@ -392,28 +600,116 @@ func (t *Term) posToCell(x, y float32) (int, int) {
 	return r, c
 }
 
-// onClick (left-button down) starts a new selection anchor.
+// mouseSnap reports the current mouse-mode state under the grid lock.
+// Reporting requires SGR encoding (?1006) and a live viewport — when
+// scrolled back into history we suppress reports so the user can
+// select / scroll without the host consuming the events.
+type mouseSnap struct {
+	report bool // any of ?1000/?1002/?1003 active
+	drag   bool // ?1002
+	any    bool // ?1003
+	sgr    bool // ?1006
+	live   bool // ViewOffset == 0
+}
+
+func (t *Term) mouseSnap() mouseSnap {
+	t.grid.Mu.Lock()
+	defer t.grid.Mu.Unlock()
+	return mouseSnap{
+		report: t.grid.MouseReporting(),
+		drag:   t.grid.MouseTrackBtn,
+		any:    t.grid.MouseTrackAny,
+		sgr:    t.grid.MouseSGR,
+		live:   t.grid.ViewOffset == 0,
+	}
+}
+
+// shouldReport reports whether mouse events should encode to the PTY
+// rather than drive local selection. Requires reporting on, SGR
+// encoding on, and a live viewport.
+func (m mouseSnap) shouldReport() bool { return m.report && m.sgr && m.live }
+
+// writeMouse emits an SGR-1006 mouse report. Allocates a small stack-
+// sized buffer; the per-event cost is the strconv.AppendInt path.
+func (t *Term) writeMouse(cb, col, row int, press bool) {
+	var buf [24]byte
+	out := encodeMouseSGR(buf[:0], cb, col, row, press)
+	if _, err := t.pty.Write(out); err != nil {
+		log.Printf("term: pty mouse: %v", err)
+	}
+}
+
+// onClick handles a button-down event. Under mouse reporting, encodes
+// a press report for any supported button and arms drag tracking.
+// Otherwise (the default) starts a left-button selection anchor.
 func (t *Term) onClick(_ *gui.Layout, e *gui.Event, w *gui.Window) {
+	r, c := t.posToCell(e.MouseX, e.MouseY)
+	snap := t.mouseSnap()
+	if snap.shouldReport() {
+		base, ok := mouseSGRBaseButton(e.MouseButton)
+		if !ok {
+			return
+		}
+		cb := base + mouseModBits(e.Modifiers)
+		t.writeMouse(cb, c, r, true)
+		t.dragging = true
+		t.dragButton = e.MouseButton
+		t.dragReport = true
+		t.lastMouseR, t.lastMouseC = r, c
+		e.IsHandled = true
+		return
+	}
 	if e.MouseButton != gui.MouseLeft {
 		return
 	}
-	r, c := t.posToCell(e.MouseX, e.MouseY)
 	t.grid.Mu.Lock()
 	t.grid.SelAnchor = SelPos{Row: r, Col: c}
 	t.grid.SelHead = SelPos{Row: r, Col: c}
 	t.grid.SelActive = false
 	t.grid.Mu.Unlock()
 	t.dragging = true
+	t.dragButton = e.MouseButton
+	t.dragReport = false
 	w.UpdateWindow()
 	e.IsHandled = true
 }
 
-// onMouseMove extends the selection while the left button is held.
+// onMouseMove handles pointer motion. Under ?1002 with a button held,
+// emits a drag report; under ?1003 even with no button, emits an
+// any-motion report. Falls through to selection extension when this
+// drag was started outside of a reporting mode.
 func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
-	if !t.dragging {
+	r, c := t.posToCell(e.MouseX, e.MouseY)
+	snap := t.mouseSnap()
+	if snap.sgr && snap.live {
+		// Dedupe: only emit when crossing a cell boundary.
+		if r == t.lastMouseR && c == t.lastMouseC {
+			if t.dragReport {
+				return
+			}
+			// Local-selection drag: still fall through to update
+			// SelHead at unchanged coords (cheap; avoids stale state).
+		}
+		switch {
+		case t.dragReport && snap.drag:
+			base, ok := mouseSGRBaseButton(t.dragButton)
+			if !ok {
+				return
+			}
+			cb := base + mouseModBits(e.Modifiers) + 32
+			t.writeMouse(cb, c, r, true)
+			t.lastMouseR, t.lastMouseC = r, c
+			return
+		case !t.dragging && snap.any:
+			cb := 35 + mouseModBits(e.Modifiers) // 3+32 = motion, no button
+			t.writeMouse(cb, c, r, true)
+			t.lastMouseR, t.lastMouseC = r, c
+			return
+		}
+	}
+	if !t.dragging || t.dragReport {
 		return
 	}
-	r, c := t.posToCell(e.MouseX, e.MouseY)
 	t.grid.Mu.Lock()
 	t.grid.SelHead = SelPos{Row: r, Col: c}
 	if t.grid.SelHead != t.grid.SelAnchor {
@@ -423,10 +719,26 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	w.UpdateWindow()
 }
 
-// onMouseUp finalizes the selection and copies to the clipboard if
-// non-empty. A click without drag clears any prior selection.
+// onMouseUp handles button-release. A drag started under reporting
+// emits a release report regardless of whether the mode is still on
+// (the host expects every press to be paired with a release).
 func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	if !t.dragging {
+		return
+	}
+	r, c := t.posToCell(e.MouseX, e.MouseY)
+	if t.dragReport {
+		snap := t.mouseSnap()
+		if snap.sgr {
+			base, ok := mouseSGRBaseButton(t.dragButton)
+			if ok {
+				cb := base + mouseModBits(e.Modifiers)
+				t.writeMouse(cb, c, r, false)
+			}
+		}
+		t.dragging = false
+		t.dragReport = false
+		e.IsHandled = true
 		return
 	}
 	t.dragging = false
@@ -493,10 +805,25 @@ func (t *Term) copySelection(w *gui.Window) bool {
 	return true
 }
 
-// onMouseScroll moves the viewport over scrollback. Positive ScrollY
-// reveals older content, negative reveals newer. Wheel deltas are
-// converted from pixels to rows using the measured cell height.
+// onMouseScroll forwards wheel events to the application as SGR mouse
+// reports when reporting + SGR are active and the viewport is live;
+// otherwise moves the local scrollback viewport. Positive ScrollY
+// reveals older content (wheel-up); negative reveals newer (down).
 func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
+	if e.ScrollY == 0 {
+		return
+	}
+	snap := t.mouseSnap()
+	if snap.shouldReport() {
+		r, c := t.posToCell(e.MouseX, e.MouseY)
+		base := 64
+		if e.ScrollY < 0 {
+			base = 65
+		}
+		t.writeMouse(base+mouseModBits(e.Modifiers), c, r, true)
+		e.IsHandled = true
+		return
+	}
 	lines := linesFromScroll(e.ScrollY, t.cellH)
 	if lines == 0 {
 		return

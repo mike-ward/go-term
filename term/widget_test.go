@@ -3,6 +3,8 @@ package term
 import (
 	"math"
 	"testing"
+
+	"github.com/mike-ward/go-gui/gui"
 )
 
 func TestRuneString_ASCIINoAlloc(t *testing.T) {
@@ -180,5 +182,101 @@ func TestTruncatePaste_ZeroOrNegativeMaxIsEmpty(t *testing.T) {
 	}
 	if got := truncatePaste("abc", -1); got != "" {
 		t.Errorf("max=-1: got %q, want \"\"", got)
+	}
+}
+
+func TestEncodeMouseSGR_Press(t *testing.T) {
+	got := string(encodeMouseSGR(nil, 0, 4, 9, true))
+	if got != "\x1b[<0;5;10M" {
+		t.Errorf("press: %q", got)
+	}
+}
+
+func TestEncodeMouseSGR_Release(t *testing.T) {
+	got := string(encodeMouseSGR(nil, 0, 0, 0, false))
+	if got != "\x1b[<0;1;1m" {
+		t.Errorf("release: %q", got)
+	}
+}
+
+func TestEncodeMouseSGR_WheelUp(t *testing.T) {
+	got := string(encodeMouseSGR(nil, 64, 10, 20, true))
+	if got != "\x1b[<64;11;21M" {
+		t.Errorf("wheel up: %q", got)
+	}
+}
+
+func TestEncodeMouseSGR_DragWithMods(t *testing.T) {
+	got := string(encodeMouseSGR(nil, 48, 7, 3, true))
+	if got != "\x1b[<48;8;4M" {
+		t.Errorf("drag+ctrl: %q", got)
+	}
+}
+
+func TestMouseSGRBaseButton_KnownButtons(t *testing.T) {
+	cases := []struct {
+		btn  gui.MouseButton
+		want int
+		ok   bool
+	}{
+		{gui.MouseLeft, 0, true},
+		{gui.MouseRight, 2, true},
+		{gui.MouseMiddle, 1, true},
+		{gui.MouseInvalid, 0, false},
+	}
+	for _, c := range cases {
+		got, ok := mouseSGRBaseButton(c.btn)
+		if got != c.want || ok != c.ok {
+			t.Errorf("btn=%d: got (%d,%v), want (%d,%v)",
+				c.btn, got, ok, c.want, c.ok)
+		}
+	}
+}
+
+func TestCursorBlinks_HonorsGridDefault(t *testing.T) {
+	g := NewGrid(1, 5)
+	tm := &Term{grid: g}
+	if !tm.cursorBlinks() {
+		t.Error("default cursor should blink")
+	}
+	g.CursorBlink = false
+	if tm.cursorBlinks() {
+		t.Error("steady cursor should not blink")
+	}
+}
+
+func TestCursorBlinks_CfgOverridesGrid(t *testing.T) {
+	g := NewGrid(1, 5)
+	g.CursorBlink = true
+	off := false
+	tm := &Term{cfg: Cfg{CursorBlink: &off}, grid: g}
+	if tm.cursorBlinks() {
+		t.Error("Cfg override (false) should win over grid blink=true")
+	}
+	on := true
+	g.CursorBlink = false
+	tm.cfg.CursorBlink = &on
+	if !tm.cursorBlinks() {
+		t.Error("Cfg override (true) should win over grid blink=false")
+	}
+}
+
+func TestMouseModBits(t *testing.T) {
+	cases := []struct {
+		m    gui.Modifier
+		want int
+	}{
+		{0, 0},
+		{gui.ModShift, 4},
+		{gui.ModAlt, 8},
+		{gui.ModCtrl, 16},
+		{gui.ModCtrl | gui.ModShift, 20},
+		{gui.ModCtrl | gui.ModAlt | gui.ModShift, 28},
+		{gui.ModSuper, 0},
+	}
+	for _, c := range cases {
+		if got := mouseModBits(c.m); got != c.want {
+			t.Errorf("mod=%d: got %d, want %d", c.m, got, c.want)
+		}
 	}
 }

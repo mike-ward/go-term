@@ -8,7 +8,31 @@ package term
 import (
 	"strings"
 	"sync"
+
+	"github.com/rivo/uniseg"
 )
+
+// runeWidth returns the display width of r in cells: 0 (drop / combining),
+// 1 (normal), or 2 (east-asian wide, emoji). ASCII fast-paths to 1
+// without entering uniseg. Non-ASCII allocates a 1- to 4-byte string for
+// the uniseg call — acceptable for correctness, optimized later if the
+// Put path becomes hot.
+func runeWidth(r rune) int {
+	if r < 0x80 {
+		if r < 0x20 {
+			return 0
+		}
+		return 1
+	}
+	w := uniseg.StringWidth(string(r))
+	switch {
+	case w <= 0:
+		return 0
+	case w >= 2:
+		return 2
+	}
+	return 1
+}
 
 // Cell attribute bits.
 const (
@@ -16,6 +40,38 @@ const (
 	AttrUnderline
 	AttrInverse
 )
+
+// CursorShape selects the cursor glyph: filled block, baseline
+// underline, or vertical bar at the leading edge of the cell.
+type CursorShape uint8
+
+const (
+	CursorBlock CursorShape = iota
+	CursorUnderline
+	CursorBar
+)
+
+// ApplyDECSCUSR applies the DECSCUSR (CSI Ps SP q) parameter,
+// setting cursor shape + blink. Unknown values fall back to the
+// xterm default (blinking block, matching Ps=0/1).
+func (g *Grid) ApplyDECSCUSR(ps int) {
+	switch ps {
+	case 0, 1:
+		g.CursorShape, g.CursorBlink = CursorBlock, true
+	case 2:
+		g.CursorShape, g.CursorBlink = CursorBlock, false
+	case 3:
+		g.CursorShape, g.CursorBlink = CursorUnderline, true
+	case 4:
+		g.CursorShape, g.CursorBlink = CursorUnderline, false
+	case 5:
+		g.CursorShape, g.CursorBlink = CursorBar, true
+	case 6:
+		g.CursorShape, g.CursorBlink = CursorBar, false
+	default:
+		g.CursorShape, g.CursorBlink = CursorBlock, true
+	}
+}
 
 // MaxGridDim caps each dimension of the cell buffer. Real terminals stay
 // well below this; the cap exists so a runaway resize (huge canvas, NaN
@@ -75,15 +131,31 @@ func rgbColor(r, g, b uint8) uint32 {
 }
 
 // Cell is one terminal grid cell.
+//
+// Width encodes east-asian wide / emoji handling:
+//
+//	1 — normal single-cell glyph (default, including ASCII space)
+//	2 — wide head; the cell at column+1 is its right-half continuation
+//	0 — continuation cell (right half of a width-2 char to the left).
+//	    Ch == 0 in this state; the renderer skips it.
 type Cell struct {
 	Ch    rune
 	FG    uint32 // packed Color (palette index, RGB, or DefaultColor)
 	BG    uint32
 	Attrs uint8
+	Width uint8
 }
 
 func defaultCell() Cell {
-	return Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor}
+	return Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor, Width: 1}
+}
+
+// blankCell returns a space-filled cell carrying the supplied SGR
+// state. Used by erase / insert / scroll paths that need to clear
+// runs to the *current* attributes (so e.g. an Erase under inverse
+// fills with inverse background).
+func blankCell(fg, bg uint32, attrs uint8) Cell {
+	return Cell{Ch: ' ', FG: fg, BG: bg, Attrs: attrs, Width: 1}
 }
 
 // savedCursor holds the snapshot taken by SaveCursor (DECSC / CSI s).
@@ -94,6 +166,19 @@ type savedCursor struct {
 	fg, bg uint32
 	attrs  uint8
 	valid  bool
+}
+
+// altSavedScreen captures everything needed to restore the main screen
+// when ExitAlt is called: the cell buffer plus cursor/SGR/scroll-region
+// state and the DECSC slot (so DECSC/DECRC inside the alt buffer don't
+// clobber the main-buffer save).
+type altSavedScreen struct {
+	cells            []Cell
+	cursorR, cursorC int
+	curFG, curBG     uint32
+	curAttrs         uint8
+	top, bottom      int
+	saved            savedCursor
 }
 
 // Grid is a fixed-size character grid. All public methods are safe for
@@ -111,7 +196,34 @@ type Grid struct {
 	CurAttrs      uint8
 	CursorVisible  bool // hidden via DEC ?25 l, shown via ?25 h
 	BracketedPaste bool // DEC ?2004 — wrap pasted text in markers
-	saved          savedCursor
+
+	// Cursor shape + blink. Set via DECSCUSR (CSI Ps SP q). Default is
+	// blinking block (Ps=0/1). Embedders can override blink via
+	// Cfg.CursorBlink without overriding shape.
+	CursorShape CursorShape
+	CursorBlink bool
+
+	// Mouse reporting modes. Multiple may be active at once; the
+	// widget emits the broadest report any of them enables. SGR
+	// (?1006) is an encoding flag layered on top — without it, the
+	// widget drops reports rather than fall back to legacy X10
+	// byte-encoding.
+	MouseTrack    bool // ?1000 — button press/release
+	MouseTrackBtn bool // ?1002 — press/release + drag (button held)
+	MouseTrackAny bool // ?1003 — any motion, even with no button
+	MouseSGR      bool // ?1006 — SGR-style "<b;c;rM/m" encoding
+
+	// Cwd is the most recent value reported via OSC 7 (e.g.
+	// "file://host/path"). Embedders read it through Term.Cwd().
+	// Empty until the shell emits an OSC 7.
+	Cwd string
+	// Top, Bottom define the scroll region (inclusive, 0-based).
+	// Default 0..Rows-1 (full screen). Set via DECSTBM (CSI Pt;Pb r).
+	// scrollUpRegion / scrollDownRegion / IND / RI / IL / DL all
+	// honor this window; rows outside are untouched.
+	Top    int
+	Bottom int
+	saved  savedCursor
 
 	// Scrollback ring of rows that have scrolled off the top. Newest
 	// row is the last element. Cap of 0 disables scrollback (rows are
@@ -120,6 +232,14 @@ type Grid struct {
 	Scrollback    [][]Cell
 	ScrollbackCap int
 	ViewOffset    int
+
+	// Alt-screen state. EnterAlt swaps g.Cells with a fresh blank buffer
+	// and stashes main-screen state in mainSaved; ExitAlt restores it.
+	// While AltActive, scrollback writes are suppressed (kitty/iTerm/
+	// ghostty default) so vim/htop/less don't fill history with their
+	// repaint output.
+	AltActive bool
+	mainSaved altSavedScreen
 
 	// Selection state in viewport coordinates (not content coordinates):
 	// when ViewOffset changes mid-selection the highlighted cells follow
@@ -141,6 +261,13 @@ func (g *Grid) selOrder() (start, end SelPos) {
 		a, b = b, a
 	}
 	return a, b
+}
+
+// MouseReporting reports whether any of the press/drag/any-motion
+// modes (?1000/?1002/?1003) are active. The widget consults this to
+// decide between local selection and host-side report emission.
+func (g *Grid) MouseReporting() bool {
+	return g.MouseTrack || g.MouseTrackBtn || g.MouseTrackAny
 }
 
 // InSelection reports whether viewport (r, c) is inside the half-open
@@ -234,6 +361,10 @@ func NewGrid(rows, cols int) *Grid {
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
 		CursorVisible: true,
+		CursorShape:   CursorBlock,
+		CursorBlink:   true,
+		Top:           0,
+		Bottom:        rows - 1,
 	}
 	for i := range g.Cells {
 		g.Cells[i] = defaultCell()
@@ -241,25 +372,52 @@ func NewGrid(rows, cols int) *Grid {
 	return g
 }
 
+// reflowBuffer copies src (oldRows×oldCols) into a freshly allocated
+// newRows×newCols buffer, preserving the top-left intersection and
+// padding the rest with default cells. Used by Resize for both the
+// active cell buffer and (when alt-active) the saved main buffer.
+func reflowBuffer(src []Cell, oldRows, oldCols, newRows, newCols int) []Cell {
+	next := make([]Cell, newRows*newCols)
+	for i := range next {
+		next[i] = defaultCell()
+	}
+	if len(src) == 0 || oldRows <= 0 || oldCols <= 0 {
+		return next
+	}
+	rcopy := min(newRows, oldRows)
+	ccopy := min(newCols, oldCols)
+	for r := range rcopy {
+		copy(next[r*newCols:r*newCols+ccopy], src[r*oldCols:r*oldCols+ccopy])
+	}
+	return next
+}
+
 // Resize reflows to new dims, copying the intersecting region from the
 // top-left corner. New space is filled with default cells. Cursor is
 // clamped. Scrollback rows are reflowed to the new column width
 // (truncated when narrower, padded with default cells when wider) so
-// ViewCellAt does not need to special-case stale row widths.
+// ViewCellAt does not need to special-case stale row widths. When alt
+// is active, the saved main buffer is reflowed too so ExitAlt restores
+// to the new dims.
 func (g *Grid) Resize(rows, cols int) {
 	rows = clampDim(rows)
 	cols = clampDim(cols)
 	if rows == g.Rows && cols == g.Cols {
 		return
 	}
-	next := make([]Cell, rows*cols)
-	for i := range next {
-		next[i] = defaultCell()
-	}
-	rcopy := min(rows, g.Rows)
-	ccopy := min(cols, g.Cols)
-	for r := range rcopy {
-		copy(next[r*cols:r*cols+ccopy], g.Cells[r*g.Cols:r*g.Cols+ccopy])
+	next := reflowBuffer(g.Cells, g.Rows, g.Cols, rows, cols)
+	if g.AltActive && len(g.mainSaved.cells) == g.Rows*g.Cols {
+		g.mainSaved.cells = reflowBuffer(
+			g.mainSaved.cells, g.Rows, g.Cols, rows, cols,
+		)
+		if g.mainSaved.cursorR >= rows {
+			g.mainSaved.cursorR = rows - 1
+		}
+		if g.mainSaved.cursorC >= cols {
+			g.mainSaved.cursorC = cols - 1
+		}
+		g.mainSaved.top = 0
+		g.mainSaved.bottom = rows - 1
 	}
 	if cols != g.Cols {
 		for i, row := range g.Scrollback {
@@ -289,6 +447,11 @@ func (g *Grid) Resize(rows, cols int) {
 	if g.CursorC >= cols {
 		g.CursorC = cols - 1
 	}
+	// Reset scroll region to full screen on resize. Reflowing a custom
+	// region across a row-count change is ambiguous (which app-relative
+	// rows survive?), so drop it; apps re-issue DECSTBM after SIGWINCH.
+	g.Top = 0
+	g.Bottom = rows - 1
 	// Selection coordinates were viewport-relative; the viewport
 	// dimensions just changed, so the highlight no longer maps to the
 	// content the user grabbed. Drop it rather than try to reflow.
@@ -303,27 +466,107 @@ func (g *Grid) At(r, c int) *Cell {
 	return &g.Cells[r*g.Cols+c]
 }
 
-// Put writes ch at the cursor with current attrs and advances. Wraps to
-// the next line at right margin; scrolls up at bottom.
+// Put writes ch at the cursor with current attrs and advances. Wraps
+// to the next line at right margin; scrolls up at bottom. Honors east-
+// asian wide / emoji widths via runeWidth: a width-2 rune occupies the
+// current cell and the cell to its right (the "continuation"), and
+// wraps early if only one column remains. Width-0 runes (combining
+// marks, ZWJ, etc.) are dropped — Phase 11 doesn't model combining.
 func (g *Grid) Put(ch rune) {
+	w := runeWidth(ch)
+	if w == 0 {
+		return
+	}
 	if g.CursorC >= g.Cols {
 		g.Newline()
 		g.CursorC = 0
 	}
-	if c := g.At(g.CursorR, g.CursorC); c != nil {
-		*c = Cell{Ch: ch, FG: g.CurFG, BG: g.CurBG, Attrs: g.CurAttrs}
+	// Wide-char would overflow the right margin: pad the trailing
+	// column blank, wrap, then place the wide char at column 0. The
+	// blank pad inherits current SGR so background runs stay coherent.
+	if w == 2 && g.CursorC+1 >= g.Cols {
+		if c := g.At(g.CursorR, g.CursorC); c != nil {
+			*c = blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+		}
+		g.Newline()
+		g.CursorC = 0
 	}
-	g.CursorC++
+	// About to overwrite a cell that's part of an existing wide pair?
+	// Clear the orphaned partner so we don't leave a stale glyph.
+	g.eraseWideAt(g.CursorR, g.CursorC)
+	if w == 2 {
+		g.eraseWideAt(g.CursorR, g.CursorC+1)
+	}
+	if c := g.At(g.CursorR, g.CursorC); c != nil {
+		*c = Cell{
+			Ch: ch, FG: g.CurFG, BG: g.CurBG,
+			Attrs: g.CurAttrs, Width: uint8(w),
+		}
+	}
+	if w == 2 {
+		if c := g.At(g.CursorR, g.CursorC+1); c != nil {
+			*c = Cell{
+				Ch: 0, FG: g.CurFG, BG: g.CurBG,
+				Attrs: g.CurAttrs, Width: 0,
+			}
+		}
+	}
+	g.CursorC += w
 }
 
-// Newline moves to next row, scrolling if needed. Column unchanged
-// (LF only); shells emit CRLF.
-func (g *Grid) Newline() {
-	if g.CursorR+1 >= g.Rows {
-		g.scrollUp()
+// eraseWideAt sanitizes the wide-char pair (if any) covering (r,c) so
+// a subsequent overwrite doesn't leave half a glyph behind. If (r,c)
+// is a wide head, blanks the continuation to its right. If it's a
+// continuation, blanks the head to its left. No-op for normal cells.
+func (g *Grid) eraseWideAt(r, c int) {
+	cell := g.At(r, c)
+	if cell == nil {
 		return
 	}
-	g.CursorR++
+	switch {
+	case cell.Width == 2:
+		if right := g.At(r, c+1); right != nil &&
+			right.Width == 0 && right.Ch == 0 {
+			*right = defaultCell()
+		}
+	case cell.Width == 0 && cell.Ch == 0:
+		if left := g.At(r, c-1); left != nil && left.Width == 2 {
+			*left = defaultCell()
+		}
+	}
+}
+
+// Newline moves to next row, scrolling the region if needed. Column
+// unchanged (LF only); shells emit CRLF. When the cursor sits on the
+// scroll region's Bottom row, scrollUpRegion is invoked so apps that
+// shrink the active area (less, vim status line) don't blow away
+// untouched rows below. When the cursor is below Bottom (outside the
+// region), it advances toward Rows-1 without scrolling.
+func (g *Grid) Newline() {
+	switch {
+	case g.CursorR == g.Bottom:
+		g.scrollUpRegion(1)
+	case g.CursorR+1 < g.Rows:
+		g.CursorR++
+	}
+}
+
+// ReverseIndex moves the cursor up one row, scrolling the region down
+// when at Top. Above Top (outside region) the cursor moves up without
+// scrolling. Implements ESC M (RI).
+func (g *Grid) ReverseIndex() {
+	switch {
+	case g.CursorR == g.Top:
+		g.scrollDownRegion(1)
+	case g.CursorR > 0:
+		g.CursorR--
+	}
+}
+
+// NextLine implements ESC E (NEL): CR + LF.
+func (g *Grid) NextLine() {
+	g.CarriageReturn()
+	g.Newline()
 }
 
 // CarriageReturn moves to column 0.
@@ -398,7 +641,7 @@ func (g *Grid) EraseInLine(mode int) {
 	default:
 		return
 	}
-	blank := Cell{Ch: ' ', FG: g.CurFG, BG: g.CurBG, Attrs: g.CurAttrs}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
 	for c := cFrom; c < cTo; c++ {
 		g.Cells[row*g.Cols+c] = blank
 	}
@@ -407,7 +650,7 @@ func (g *Grid) EraseInLine(mode int) {
 // EraseInDisplay implements CSI J. mode: 0 = cursor to end of screen,
 // 1 = start of screen to cursor, 2/3 = entire screen.
 func (g *Grid) EraseInDisplay(mode int) {
-	blank := Cell{Ch: ' ', FG: g.CurFG, BG: g.CurBG, Attrs: g.CurAttrs}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
 	switch mode {
 	case 0:
 		g.EraseInLine(0)
@@ -457,24 +700,220 @@ func (g *Grid) RestoreCursor() {
 	g.CurAttrs = g.saved.attrs
 }
 
-// scrollUp drops the top row and clears the bottom. When ScrollbackCap
-// > 0 the dropped row is pushed to the scrollback ring; the ring is
-// trimmed by removing oldest entries once it exceeds the cap.
-func (g *Grid) scrollUp() {
-	if g.ScrollbackCap > 0 {
-		row := make([]Cell, g.Cols)
-		copy(row, g.Cells[:g.Cols])
-		g.Scrollback = append(g.Scrollback, row)
+// regionValid reports whether Top/Bottom describe a usable region.
+// A degenerate region (Top > Bottom or out of bounds) is treated as
+// "no region active" so callers fall back to full-screen behavior.
+func (g *Grid) regionValid() bool {
+	return g.Top >= 0 && g.Bottom < g.Rows && g.Top <= g.Bottom
+}
+
+// regionFullScreen reports whether the scroll region spans every row.
+// Only full-screen scrolls push to scrollback (DEC convention shared
+// by xterm/iTerm/kitty); a status-line app shouldn't fill history with
+// its top pane every keystroke.
+func (g *Grid) regionFullScreen() bool {
+	return g.regionValid() && g.Top == 0 && g.Bottom == g.Rows-1
+}
+
+// scrollUpRegion shifts rows [Top..Bottom] up by n, clearing the bottom
+// n rows of the region with default cells. When the region spans the
+// full screen and ScrollbackCap > 0, the displaced top rows are pushed
+// to the scrollback ring (oldest first) and trimmed to cap. n is
+// clamped: n <= 0 is a no-op, n >= region height clears the region.
+func (g *Grid) scrollUpRegion(n int) {
+	if n <= 0 || !g.regionValid() {
+		return
+	}
+	height := g.Bottom - g.Top + 1
+	if n > height {
+		n = height
+	}
+	full := g.regionFullScreen()
+	if full && g.ScrollbackCap > 0 && !g.AltActive {
+		for r := 0; r < n; r++ {
+			row := make([]Cell, g.Cols)
+			copy(row, g.Cells[(g.Top+r)*g.Cols:(g.Top+r+1)*g.Cols])
+			g.Scrollback = append(g.Scrollback, row)
+		}
 		if extra := len(g.Scrollback) - g.ScrollbackCap; extra > 0 {
-			// Drop oldest entries; reslice rather than copy to keep
-			// the operation amortized O(1) when cap is reached.
 			g.Scrollback = g.Scrollback[extra:]
 		}
 	}
-	copy(g.Cells, g.Cells[g.Cols:])
-	last := g.Cells[(g.Rows-1)*g.Cols:]
-	for i := range last {
-		last[i] = defaultCell()
+	// Shift surviving rows up.
+	if n < height {
+		copy(
+			g.Cells[g.Top*g.Cols:(g.Bottom+1)*g.Cols],
+			g.Cells[(g.Top+n)*g.Cols:(g.Bottom+1)*g.Cols],
+		)
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for r := g.Bottom - n + 1; r <= g.Bottom; r++ {
+		row := g.Cells[r*g.Cols : (r+1)*g.Cols]
+		for i := range row {
+			row[i] = blank
+		}
+	}
+}
+
+// scrollDownRegion shifts rows [Top..Bottom] down by n, clearing the
+// top n rows with default cells. Never writes to scrollback (down-scroll
+// reveals erased space, not displaced history).
+func (g *Grid) scrollDownRegion(n int) {
+	if n <= 0 || !g.regionValid() {
+		return
+	}
+	height := g.Bottom - g.Top + 1
+	if n > height {
+		n = height
+	}
+	if n < height {
+		// copy is destination-overlapping safe only when src precedes
+		// dst; here dst > src so iterate bottom-up.
+		for r := g.Bottom; r >= g.Top+n; r-- {
+			copy(
+				g.Cells[r*g.Cols:(r+1)*g.Cols],
+				g.Cells[(r-n)*g.Cols:(r-n+1)*g.Cols],
+			)
+		}
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for r := g.Top; r < g.Top+n && r <= g.Bottom; r++ {
+		row := g.Cells[r*g.Cols : (r+1)*g.Cols]
+		for i := range row {
+			row[i] = blank
+		}
+	}
+}
+
+// SetScrollRegion implements DECSTBM (CSI Pt;Pb r). top/bottom are
+// 0-based inclusive. Invalid or degenerate ranges (top >= bottom,
+// out of bounds) reset to full screen. Cursor is homed to (0, 0)
+// per DEC convention.
+func (g *Grid) SetScrollRegion(top, bottom int) {
+	if top < 0 || bottom >= g.Rows || top > bottom {
+		g.Top = 0
+		g.Bottom = g.Rows - 1
+	} else {
+		g.Top = top
+		g.Bottom = bottom
+	}
+	g.CursorR, g.CursorC = 0, 0
+}
+
+// ScrollUp implements CSI Ps S — scroll the region up by n rows,
+// cursor unchanged. Wrapper around scrollUpRegion.
+func (g *Grid) ScrollUp(n int) { g.scrollUpRegion(n) }
+
+// ScrollDown implements CSI Ps T — scroll the region down by n rows.
+func (g *Grid) ScrollDown(n int) { g.scrollDownRegion(n) }
+
+// InsertLines implements CSI Ps L (IL): insert n blank lines at the
+// cursor row, pushing existing rows toward Bottom; rows pushed past
+// Bottom are discarded. No-op when the cursor is outside the active
+// scroll region (DEC behavior).
+func (g *Grid) InsertLines(n int) {
+	if n <= 0 || !g.regionValid() {
+		return
+	}
+	if g.CursorR < g.Top || g.CursorR > g.Bottom {
+		return
+	}
+	height := g.Bottom - g.CursorR + 1
+	if n > height {
+		n = height
+	}
+	if n < height {
+		for r := g.Bottom; r >= g.CursorR+n; r-- {
+			copy(
+				g.Cells[r*g.Cols:(r+1)*g.Cols],
+				g.Cells[(r-n)*g.Cols:(r-n+1)*g.Cols],
+			)
+		}
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for r := g.CursorR; r < g.CursorR+n && r <= g.Bottom; r++ {
+		row := g.Cells[r*g.Cols : (r+1)*g.Cols]
+		for i := range row {
+			row[i] = blank
+		}
+	}
+	g.CursorC = 0
+}
+
+// DeleteLines implements CSI Ps M (DL): delete n lines starting at the
+// cursor row, shifting rows below up; blank rows fill the bottom of
+// the region. No-op when cursor is outside the region.
+func (g *Grid) DeleteLines(n int) {
+	if n <= 0 || !g.regionValid() {
+		return
+	}
+	if g.CursorR < g.Top || g.CursorR > g.Bottom {
+		return
+	}
+	height := g.Bottom - g.CursorR + 1
+	if n > height {
+		n = height
+	}
+	if n < height {
+		copy(
+			g.Cells[g.CursorR*g.Cols:(g.Bottom+1)*g.Cols],
+			g.Cells[(g.CursorR+n)*g.Cols:(g.Bottom+1)*g.Cols],
+		)
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for r := g.Bottom - n + 1; r <= g.Bottom; r++ {
+		row := g.Cells[r*g.Cols : (r+1)*g.Cols]
+		for i := range row {
+			row[i] = blank
+		}
+	}
+	g.CursorC = 0
+}
+
+// InsertChars implements CSI Ps @ (ICH): insert n blanks at the cursor,
+// shifting existing cells right within the row; cells past the right
+// margin are discarded. Blanks use current SGR bg/attrs.
+func (g *Grid) InsertChars(n int) {
+	if n <= 0 || g.CursorR < 0 || g.CursorR >= g.Rows {
+		return
+	}
+	if g.CursorC < 0 || g.CursorC >= g.Cols {
+		return
+	}
+	width := g.Cols - g.CursorC
+	if n > width {
+		n = width
+	}
+	row := g.Cells[g.CursorR*g.Cols : (g.CursorR+1)*g.Cols]
+	if n < width {
+		copy(row[g.CursorC+n:], row[g.CursorC:g.Cols-n])
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for c := g.CursorC; c < g.CursorC+n; c++ {
+		row[c] = blank
+	}
+}
+
+// DeleteChars implements CSI Ps P (DCH): delete n cells at the cursor,
+// shifting cells from the right inward; blanks fill at the right edge.
+func (g *Grid) DeleteChars(n int) {
+	if n <= 0 || g.CursorR < 0 || g.CursorR >= g.Rows {
+		return
+	}
+	if g.CursorC < 0 || g.CursorC >= g.Cols {
+		return
+	}
+	width := g.Cols - g.CursorC
+	if n > width {
+		n = width
+	}
+	row := g.Cells[g.CursorR*g.Cols : (g.CursorR+1)*g.Cols]
+	if n < width {
+		copy(row[g.CursorC:], row[g.CursorC+n:g.Cols])
+	}
+	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
+	for c := g.Cols - n; c < g.Cols; c++ {
+		row[c] = blank
 	}
 }
 
@@ -530,4 +969,63 @@ func (g *Grid) ViewCellAt(r, c int) Cell {
 		return g.Scrollback[len(g.Scrollback)-off+r][c]
 	}
 	return g.Cells[(r-n)*g.Cols+c]
+}
+
+// EnterAlt swaps the active cell buffer with a fresh blank one and
+// stashes the main-screen state (cells, cursor, SGR, scroll region,
+// DECSC slot) into mainSaved. While alt is active, scrollback writes
+// are suppressed and ViewOffset is reset. No-op if already active.
+//
+// The DECSC save slot (g.saved) is also swapped so a DECSC/DECRC pair
+// inside the alt buffer can't clobber the main-buffer save. ?1049
+// callers typically SaveCursor *before* EnterAlt; that save lands in
+// g.saved at call time and is correctly stashed here.
+func (g *Grid) EnterAlt() {
+	if g.AltActive {
+		return
+	}
+	g.mainSaved = altSavedScreen{
+		cells:   g.Cells,
+		cursorR: g.CursorR,
+		cursorC: g.CursorC,
+		curFG:   g.CurFG,
+		curBG:   g.CurBG,
+		curAttrs: g.CurAttrs,
+		top:     g.Top,
+		bottom:  g.Bottom,
+		saved:   g.saved,
+	}
+	cells := make([]Cell, g.Rows*g.Cols)
+	blank := defaultCell()
+	for i := range cells {
+		cells[i] = blank
+	}
+	g.Cells = cells
+	g.CursorR, g.CursorC = 0, 0
+	g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+	g.Top, g.Bottom = 0, g.Rows-1
+	g.saved = savedCursor{}
+	g.AltActive = true
+	g.ResetView()
+	g.ClearSelection()
+}
+
+// ExitAlt restores the main-screen state captured by EnterAlt: cells,
+// cursor, SGR, scroll region, and DECSC slot. The alt buffer is dropped.
+// No-op if not currently in alt.
+func (g *Grid) ExitAlt() {
+	if !g.AltActive {
+		return
+	}
+	g.Cells = g.mainSaved.cells
+	g.CursorR, g.CursorC = g.mainSaved.cursorR, g.mainSaved.cursorC
+	g.CurFG = g.mainSaved.curFG
+	g.CurBG = g.mainSaved.curBG
+	g.CurAttrs = g.mainSaved.curAttrs
+	g.Top, g.Bottom = g.mainSaved.top, g.mainSaved.bottom
+	g.saved = g.mainSaved.saved
+	g.mainSaved = altSavedScreen{}
+	g.AltActive = false
+	g.ResetView()
+	g.ClearSelection()
 }

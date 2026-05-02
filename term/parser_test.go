@@ -399,3 +399,463 @@ func TestParser_DECPrivateResetBetweenSequences(t *testing.T) {
 		t.Errorf("SGR after DEC mode: fg=%#x", g.CurFG)
 	}
 }
+
+func TestParser_DECSTBM_SetAndReset(t *testing.T) {
+	g, p := newParserGrid(10, 4)
+	feed(t, g, p, []byte("\x1b[3;7r"))
+	if g.Top != 2 || g.Bottom != 6 {
+		t.Errorf("DECSTBM 3;7 → %d..%d, want 2..6", g.Top, g.Bottom)
+	}
+	if g.CursorR != 0 || g.CursorC != 0 {
+		t.Errorf("DECSTBM did not home cursor")
+	}
+	// Bare CSI r resets to full screen.
+	feed(t, g, p, []byte("\x1b[r"))
+	if g.Top != 0 || g.Bottom != 9 {
+		t.Errorf("bare DECSTBM reset failed: %d..%d", g.Top, g.Bottom)
+	}
+}
+
+func TestParser_IND_RI_NEL(t *testing.T) {
+	g, p := newParserGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		for c := range g.Cols {
+			g.At(i, c).Ch = ch
+		}
+	}
+	feed(t, g, p, []byte("\x1b[2;4r")) // region rows B..D
+	g.CursorR = 3                      // at Bottom
+	feed(t, g, p, []byte("\x1bD"))     // IND scrolls region
+	if g.At(1, 0).Ch != 'C' || g.At(2, 0).Ch != 'D' || g.At(3, 0).Ch != ' ' {
+		t.Errorf("IND scroll wrong: %q %q %q",
+			g.At(1, 0).Ch, g.At(2, 0).Ch, g.At(3, 0).Ch)
+	}
+	g.CursorR = 1 // at Top
+	feed(t, g, p, []byte("\x1bM"))
+	if g.At(1, 0).Ch != ' ' || g.At(2, 0).Ch != 'C' || g.At(3, 0).Ch != 'D' {
+		t.Errorf("RI scroll wrong: %q %q %q",
+			g.At(1, 0).Ch, g.At(2, 0).Ch, g.At(3, 0).Ch)
+	}
+	g.CursorR, g.CursorC = 1, 1
+	feed(t, g, p, []byte("\x1bE")) // NEL: CR + LF
+	if g.CursorC != 0 || g.CursorR != 2 {
+		t.Errorf("NEL cursor: %d,%d", g.CursorR, g.CursorC)
+	}
+}
+
+func TestParser_InsertDeleteLines(t *testing.T) {
+	g, p := newParserGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		for c := range g.Cols {
+			g.At(i, c).Ch = ch
+		}
+	}
+	feed(t, g, p, []byte("\x1b[2;4r")) // region B..D
+	g.CursorR = 2
+	feed(t, g, p, []byte("\x1b[L")) // IL 1 default
+	// expect rows: A B (blank) C E
+	want := []rune{'A', 'B', ' ', 'C', 'E'}
+	for i, w := range want {
+		if g.At(i, 0).Ch != w {
+			t.Errorf("after IL row %d = %q, want %q", i, g.At(i, 0).Ch, w)
+		}
+	}
+	// DL 2 at row 2 (still in region B..D): deletes rows 2 and 3, no
+	// rows below to shift up within region, fills with blank.
+	feed(t, g, p, []byte("\x1b[2M"))
+	want = []rune{'A', 'B', ' ', ' ', 'E'}
+	for i, w := range want {
+		if g.At(i, 0).Ch != w {
+			t.Errorf("after DL row %d = %q, want %q", i, g.At(i, 0).Ch, w)
+		}
+	}
+}
+
+func TestParser_InsertDeleteChars(t *testing.T) {
+	g, p := newParserGrid(1, 6)
+	for c := range g.Cols {
+		g.At(0, c).Ch = rune('a' + c)
+	}
+	g.CursorC = 2
+	feed(t, g, p, []byte("\x1b[2@")) // ICH 2
+	want := []rune{'a', 'b', ' ', ' ', 'c', 'd'}
+	for i, w := range want {
+		if g.At(0, i).Ch != w {
+			t.Errorf("after ICH col %d = %q, want %q", i, g.At(0, i).Ch, w)
+		}
+	}
+	g.CursorC = 0
+	feed(t, g, p, []byte("\x1b[3P")) // DCH 3 at col 0
+	// row was a b _ _ c d ; deleting 3 from col 0 → _ c d _ _ _
+	want = []rune{' ', 'c', 'd', ' ', ' ', ' '}
+	for i, w := range want {
+		if g.At(0, i).Ch != w {
+			t.Errorf("after DCH col %d = %q, want %q", i, g.At(0, i).Ch, w)
+		}
+	}
+}
+
+func TestParser_SU_SD(t *testing.T) {
+	g, p := newParserGrid(4, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D'} {
+		for c := range g.Cols {
+			g.At(i, c).Ch = ch
+		}
+	}
+	feed(t, g, p, []byte("\x1b[S")) // SU 1
+	want := []rune{'B', 'C', 'D', ' '}
+	for i, w := range want {
+		if g.At(i, 0).Ch != w {
+			t.Errorf("after SU row %d = %q, want %q", i, g.At(i, 0).Ch, w)
+		}
+	}
+	feed(t, g, p, []byte("\x1b[T")) // SD 1
+	want = []rune{' ', 'B', 'C', 'D'}
+	for i, w := range want {
+		if g.At(i, 0).Ch != w {
+			t.Errorf("after SD row %d = %q, want %q", i, g.At(i, 0).Ch, w)
+		}
+	}
+}
+
+func TestParser_DEC47_AltScreen(t *testing.T) {
+	g, p := newParserGrid(2, 3)
+	feed(t, g, p, []byte("hi"))
+	feed(t, g, p, []byte("\x1b[?47h"))
+	if !g.AltActive {
+		t.Fatal("?47h: AltActive should be true")
+	}
+	feed(t, g, p, []byte("\x1b[?47l"))
+	if g.AltActive {
+		t.Fatal("?47l: AltActive should be false")
+	}
+	if g.At(0, 0).Ch != 'h' || g.At(0, 1).Ch != 'i' {
+		t.Errorf("main not restored: %q%q", g.At(0, 0).Ch, g.At(0, 1).Ch)
+	}
+}
+
+func TestParser_DEC1047_AltScreen(t *testing.T) {
+	g, p := newParserGrid(2, 3)
+	feed(t, g, p, []byte("ab"))
+	feed(t, g, p, []byte("\x1b[?1047h"))
+	if !g.AltActive {
+		t.Fatal("?1047h: AltActive should be true")
+	}
+	feed(t, g, p, []byte("\x1b[?1047l"))
+	if g.AltActive {
+		t.Fatal("?1047l: AltActive should be false")
+	}
+	if g.At(0, 0).Ch != 'a' {
+		t.Errorf("main row 0 col 0 = %q, want a", g.At(0, 0).Ch)
+	}
+}
+
+func TestParser_DEC1049_SavesAndRestoresCursor(t *testing.T) {
+	g, p := newParserGrid(4, 6)
+	feed(t, g, p, []byte("hello\r\nworld"))
+	mainR, mainC := g.CursorR, g.CursorC
+	feed(t, g, p, []byte("\x1b[?1049h"))
+	if !g.AltActive {
+		t.Fatal("?1049h: AltActive should be true")
+	}
+	if g.CursorR != 0 || g.CursorC != 0 {
+		t.Errorf("alt entry: cursor not homed: %d,%d", g.CursorR, g.CursorC)
+	}
+	// Mutate alt-buffer cursor + DECSC slot to verify isolation.
+	feed(t, g, p, []byte("\x1b[3;3HALT")) // move + write
+	feed(t, g, p, []byte("\x1b[s"))       // alt-buffer save
+	feed(t, g, p, []byte("\x1b[?1049l"))
+	if g.AltActive {
+		t.Fatal("?1049l: AltActive should be false")
+	}
+	if g.CursorR != mainR || g.CursorC != mainC {
+		t.Errorf("?1049l: cursor not restored: got %d,%d want %d,%d",
+			g.CursorR, g.CursorC, mainR, mainC)
+	}
+	row1 := []rune{'w', 'o', 'r', 'l', 'd'}
+	for i, w := range row1 {
+		if g.At(1, i).Ch != w {
+			t.Errorf("main row 1 col %d = %q, want %q",
+				i, g.At(1, i).Ch, w)
+		}
+	}
+}
+
+func TestParser_DEC1049_SuppressesScrollback(t *testing.T) {
+	g, p := newParserGrid(2, 3)
+	g.ScrollbackCap = 50
+	feed(t, g, p, []byte("\x1b[?1049h"))
+	for i := 0; i < 8; i++ {
+		feed(t, g, p, []byte("x\r\n"))
+	}
+	if len(g.Scrollback) != 0 {
+		t.Errorf("scrollback grew under ?1049: %d rows",
+			len(g.Scrollback))
+	}
+	feed(t, g, p, []byte("\x1b[?1049l"))
+	for i := 0; i < 5; i++ {
+		feed(t, g, p, []byte("y\r\n"))
+	}
+	if len(g.Scrollback) == 0 {
+		t.Errorf("scrollback inert after ?1049l")
+	}
+}
+
+func TestParser_OSCTitle_BELTerminator(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var got string
+	p.SetTitleHandler(func(s string) { got = s })
+	feed(t, g, p, []byte("\x1b]0;hello world\x07"))
+	if got != "hello world" {
+		t.Errorf("title via BEL: %q", got)
+	}
+	if p.state != stGround {
+		t.Errorf("state not ground after BEL: %d", p.state)
+	}
+}
+
+func TestParser_OSCTitle_STTerminator(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var got string
+	p.SetTitleHandler(func(s string) { got = s })
+	feed(t, g, p, []byte("\x1b]2;tabby\x1b\\"))
+	if got != "tabby" {
+		t.Errorf("title via ST: %q", got)
+	}
+	if p.state != stGround {
+		t.Errorf("state not ground after ST: %d", p.state)
+	}
+}
+
+func TestParser_OSCTitle_Ps0And1And2(t *testing.T) {
+	for _, ps := range []string{"0", "1", "2"} {
+		g, p := newParserGrid(1, 5)
+		var got string
+		p.SetTitleHandler(func(s string) { got = s })
+		feed(t, g, p, []byte("\x1b]"+ps+";title-"+ps+"\x07"))
+		if got != "title-"+ps {
+			t.Errorf("Ps=%s: %q", ps, got)
+		}
+	}
+}
+
+func TestParser_OSCTitle_SplitAcrossFeeds(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var got string
+	p.SetTitleHandler(func(s string) { got = s })
+	feed(t, g, p, []byte("\x1b]0;he"))
+	feed(t, g, p, []byte("llo"))
+	feed(t, g, p, []byte("\x07"))
+	if got != "hello" {
+		t.Errorf("split-feed title: %q", got)
+	}
+}
+
+func TestParser_OSC7_SetsCwd(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1b]7;file://host/Users/me\x07"))
+	if g.Cwd != "file://host/Users/me" {
+		t.Errorf("Cwd: %q", g.Cwd)
+	}
+}
+
+func TestParser_OSC_UnknownPsDropped(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	titles := 0
+	p.SetTitleHandler(func(string) { titles++ })
+	feed(t, g, p, []byte("\x1b]52;c;Zm9v\x07")) // OSC 52 — not handled
+	if titles != 0 {
+		t.Errorf("OSC 52 fired title handler %d times", titles)
+	}
+	if g.Cwd != "" {
+		t.Errorf("OSC 52 leaked into Cwd: %q", g.Cwd)
+	}
+}
+
+func TestParser_OSC_NoSeparatorDropped(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	titles := 0
+	p.SetTitleHandler(func(string) { titles++ })
+	feed(t, g, p, []byte("\x1b]nopayload\x07"))
+	if titles != 0 {
+		t.Errorf("malformed OSC fired handler")
+	}
+}
+
+func TestParser_OSC_OverflowTruncated(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var got string
+	p.SetTitleHandler(func(s string) { got = s })
+	huge := make([]byte, 0, maxOSCBytes+200)
+	huge = append(huge, []byte("\x1b]0;")...)
+	for range maxOSCBytes + 100 {
+		huge = append(huge, 'A')
+	}
+	huge = append(huge, 0x07)
+	feed(t, g, p, huge)
+	// Payload truncated at cap; "0;" prefix consumes 2 bytes of the
+	// budget so title length is maxOSCBytes - 2.
+	if len(got) != maxOSCBytes-2 {
+		t.Errorf("truncated len=%d, want %d", len(got), maxOSCBytes-2)
+	}
+}
+
+func TestParser_OSC_AbortedByBareESC(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	titles := 0
+	p.SetTitleHandler(func(string) { titles++ })
+	// ESC followed by something other than '\' aborts the OSC; the
+	// trailing CSI must still be processed.
+	feed(t, g, p, []byte("\x1b]0;abc\x1b[31m"))
+	if titles != 0 {
+		t.Errorf("aborted OSC dispatched title")
+	}
+	if g.CurFG != paletteColor(1) {
+		t.Errorf("CSI after aborted OSC not applied: CurFG=%#x", g.CurFG)
+	}
+}
+
+func TestParser_DA1_Reply(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var replies [][]byte
+	p.SetReplyHandler(func(b []byte) {
+		replies = append(replies, append([]byte(nil), b...))
+	})
+	feed(t, g, p, []byte("\x1b[c"))
+	if len(replies) != 1 || !bytes.Equal(replies[0], []byte("\x1b[?1;2c")) {
+		t.Errorf("DA1 reply: %q", replies)
+	}
+}
+
+func TestParser_DA1_ExplicitZero(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	got := 0
+	p.SetReplyHandler(func([]byte) { got++ })
+	feed(t, g, p, []byte("\x1b[0c"))
+	if got != 1 {
+		t.Errorf("CSI 0 c reply count=%d", got)
+	}
+}
+
+func TestParser_DA1_NonZeroIgnored(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	got := 0
+	p.SetReplyHandler(func([]byte) { got++ })
+	feed(t, g, p, []byte("\x1b[1c"))
+	if got != 0 {
+		t.Errorf("CSI 1 c should not reply: %d", got)
+	}
+}
+
+func TestParser_DA1_PrivateIgnored(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	got := 0
+	p.SetReplyHandler(func([]byte) { got++ })
+	feed(t, g, p, []byte("\x1b[?c"))
+	if got != 0 {
+		t.Errorf("CSI ? c should not reply: %d", got)
+	}
+}
+
+func TestParser_MouseModes_Toggle(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1b[?1000;1006h"))
+	if !g.MouseTrack || !g.MouseSGR {
+		t.Errorf("?1000;1006h: track=%v sgr=%v", g.MouseTrack, g.MouseSGR)
+	}
+	feed(t, g, p, []byte("\x1b[?1002h"))
+	if !g.MouseTrackBtn {
+		t.Error("?1002h not set")
+	}
+	feed(t, g, p, []byte("\x1b[?1003h"))
+	if !g.MouseTrackAny {
+		t.Error("?1003h not set")
+	}
+	feed(t, g, p, []byte("\x1b[?1000;1002;1003;1006l"))
+	if g.MouseTrack || g.MouseTrackBtn || g.MouseTrackAny || g.MouseSGR {
+		t.Errorf("reset failed: track=%v btn=%v any=%v sgr=%v",
+			g.MouseTrack, g.MouseTrackBtn, g.MouseTrackAny, g.MouseSGR)
+	}
+}
+
+func TestParser_MouseReporting_Aggregate(t *testing.T) {
+	g, _ := newParserGrid(1, 5)
+	if g.MouseReporting() {
+		t.Error("default should be off")
+	}
+	g.MouseTrack = true
+	if !g.MouseReporting() {
+		t.Error("MouseTrack should imply reporting")
+	}
+	g.MouseTrack = false
+	g.MouseTrackAny = true
+	if !g.MouseReporting() {
+		t.Error("MouseTrackAny should imply reporting")
+	}
+}
+
+func TestParser_DECSCUSR_AllPs(t *testing.T) {
+	cases := []struct {
+		ps    int
+		shape CursorShape
+		blink bool
+	}{
+		{0, CursorBlock, true},
+		{1, CursorBlock, true},
+		{2, CursorBlock, false},
+		{3, CursorUnderline, true},
+		{4, CursorUnderline, false},
+		{5, CursorBar, true},
+		{6, CursorBar, false},
+		{99, CursorBlock, true}, // unknown → default
+	}
+	for _, c := range cases {
+		g, p := newParserGrid(1, 5)
+		seq := []byte{0x1b, '[', 0, ' ', 'q'} // template
+		// Build "CSI Ps SP q" with Ps as decimal.
+		seq = append([]byte("\x1b["), []byte(itoa(c.ps))...)
+		seq = append(seq, ' ', 'q')
+		feed(t, g, p, seq)
+		if g.CursorShape != c.shape || g.CursorBlink != c.blink {
+			t.Errorf("Ps=%d: shape=%d blink=%v, want shape=%d blink=%v",
+				c.ps, g.CursorShape, g.CursorBlink, c.shape, c.blink)
+		}
+	}
+}
+
+func TestParser_DECSCUSR_RequiresSpaceIntermediate(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	g.CursorShape = CursorBar
+	g.CursorBlink = false
+	// Same final byte 'q' without the space intermediate: must not
+	// touch DECSCUSR state.
+	feed(t, g, p, []byte("\x1b[2q"))
+	if g.CursorShape != CursorBar || g.CursorBlink != false {
+		t.Errorf("CSI 2 q (no SP) clobbered shape=%d blink=%v",
+			g.CursorShape, g.CursorBlink)
+	}
+}
+
+func TestParser_DECSCUSR_DefaultParam(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1b[ q")) // no Ps → 0 → blinking block
+	if g.CursorShape != CursorBlock || !g.CursorBlink {
+		t.Errorf("default DECSCUSR: shape=%d blink=%v",
+			g.CursorShape, g.CursorBlink)
+	}
+}
+
+// itoa is a tiny test helper to avoid importing strconv.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [12]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}

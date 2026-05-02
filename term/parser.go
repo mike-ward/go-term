@@ -8,7 +8,20 @@ const (
 	stGround parserState = iota
 	stEsc
 	stCSI
+	stOSC    // collecting OSC payload, waiting for BEL or ESC \
+	stOSCEsc // saw ESC inside OSC, waiting for terminating '\'
 )
+
+// maxOSCBytes caps the OSC payload size so a malicious or runaway
+// stream can't grow p.osc without bound. Real titles are tiny;
+// anything beyond this is truncated and the rest of the OSC is
+// silently swallowed up to its terminator.
+const maxOSCBytes = 4096
+
+// da1Reply is the Primary Device Attribute response: VT100 with
+// advanced video. Apps like fish probe with CSI c at startup and
+// stall briefly waiting for it.
+var da1Reply = []byte("\x1b[?1;2c")
 
 // maxCSIParams caps the SGR/CSI parameter list to bound memory use against
 // pathological streams like "\x1b[1;1;1;...m".
@@ -31,9 +44,30 @@ type Parser struct {
 	curP    int     // value being accumulated
 	hasP    bool    // any digit seen for curP
 	private bool    // DEC private mode: `?` prefix seen in current CSI
+	intermediate byte // last intermediate byte (0x20..0x2F) seen, 0 if none
 	utf     [4]byte // UTF-8 carry-over between Feed calls
 	utfLen  int
+
+	// osc accumulates the payload of the in-progress OSC (Operating
+	// System Command). Reset on entry to stOSC; capped at maxOSCBytes.
+	osc []byte
+
+	// onTitle, if non-nil, is invoked for OSC 0/1/2 (window title).
+	// onReply, if non-nil, is invoked when the parser needs to write
+	// bytes back toward the application (e.g. DA1 response). Both run
+	// while Grid.Mu is held — handlers must not re-enter the grid.
+	onTitle func(string)
+	onReply func([]byte)
 }
+
+// SetTitleHandler registers a callback for OSC 0/1/2. Pass nil to
+// disable. Called while Grid.Mu is held.
+func (p *Parser) SetTitleHandler(fn func(string)) { p.onTitle = fn }
+
+// SetReplyHandler registers a callback for parser-originated host
+// writes (DA1 today; future: cursor position reports, etc.). Called
+// while Grid.Mu is held.
+func (p *Parser) SetReplyHandler(fn func([]byte)) { p.onReply = fn }
 
 // NewParser binds a parser to a grid. Callers must hold g.Mu while calling
 // Feed.
@@ -95,11 +129,24 @@ func (p *Parser) Feed(b []byte) {
 				p.curP = 0
 				p.hasP = false
 				p.private = false
+				p.intermediate = 0
+			case ']': // OSC introducer
+				p.state = stOSC
+				p.osc = p.osc[:0]
 			case '7': // DECSC — save cursor + SGR
 				p.g.SaveCursor()
 				p.state = stGround
 			case '8': // DECRC — restore cursor + SGR
 				p.g.RestoreCursor()
+				p.state = stGround
+			case 'D': // IND — index (down + scroll-up at Bottom)
+				p.g.Newline()
+				p.state = stGround
+			case 'M': // RI — reverse index (up + scroll-down at Top)
+				p.g.ReverseIndex()
+				p.state = stGround
+			case 'E': // NEL — next line (CR + LF)
+				p.g.NextLine()
 				p.state = stGround
 			default:
 				// 2-byte ESC sequences: ignore.
@@ -131,11 +178,85 @@ func (p *Parser) Feed(b []byte) {
 				p.curP = 0
 				p.hasP = false
 				p.private = false
+				p.intermediate = 0
+			case c >= 0x20 && c <= 0x2F:
+				// Intermediate byte (e.g. SP for DECSCUSR " q"). Last
+				// one wins — multi-intermediate sequences are rare and
+				// none of the ones we honor use more than one.
+				p.intermediate = c
 			default:
-				// Intermediate or unsupported byte — keep going.
+				// Unsupported byte — keep going.
 			}
 			i++
+		case stOSC:
+			switch c {
+			case 0x07: // BEL — terminator
+				p.dispatchOSC()
+				p.state = stGround
+			case 0x1B: // ESC — possible start of ST (ESC \)
+				p.state = stOSCEsc
+			default:
+				if len(p.osc) < maxOSCBytes {
+					p.osc = append(p.osc, c)
+				}
+			}
+			i++
+		case stOSCEsc:
+			if c == '\\' { // ST terminator: ESC \
+				p.dispatchOSC()
+				p.state = stGround
+				i++
+			} else {
+				// Bare ESC inside OSC: abort the OSC, restart ESC
+				// processing on the current byte (don't consume it).
+				p.osc = p.osc[:0]
+				p.state = stEsc
+			}
 		}
+	}
+}
+
+// dispatchOSC parses the accumulated OSC payload as "Ps;Pt" and
+// dispatches recognized commands. Anything malformed or unknown is
+// silently dropped (xterm behavior). Called with g.Mu held.
+func (p *Parser) dispatchOSC() {
+	if len(p.osc) == 0 {
+		return
+	}
+	sep := -1
+	for i, b := range p.osc {
+		if b == ';' {
+			sep = i
+			break
+		}
+	}
+	if sep <= 0 {
+		return
+	}
+	ps := 0
+	for i := range sep {
+		c := p.osc[i]
+		if c < '0' || c > '9' {
+			return
+		}
+		ps = ps*10 + int(c-'0')
+		if ps > 1<<20 {
+			return
+		}
+	}
+	pt := string(p.osc[sep+1:])
+	switch ps {
+	case 0, 1, 2:
+		// 0 = icon name + window title, 1 = icon name, 2 = window
+		// title. Treat all three as title updates; widget surfaces
+		// via Cfg.OnTitle (defaulting to win.SetTitle).
+		if p.onTitle != nil {
+			p.onTitle(pt)
+		}
+	case 7:
+		// Working directory notification (iTerm/VTE convention).
+		// Payload is typically "file://host/path"; embedders parse.
+		p.g.Cwd = pt
 	}
 }
 
@@ -178,6 +299,39 @@ func (p *Parser) dispatchCSI(final byte) {
 		p.g.EraseInDisplay(p.param(0, 0))
 	case 'K':
 		p.g.EraseInLine(p.param(0, 0))
+	case 'r':
+		// DECSTBM — set top/bottom margins. Defaults: top=1,
+		// bottom=Rows. Convert to 0-based inclusive.
+		top := p.param(0, 1) - 1
+		bot := p.param(1, p.g.Rows) - 1
+		p.g.SetScrollRegion(top, bot)
+	case 'L':
+		p.g.InsertLines(p.param(0, 1))
+	case 'M':
+		p.g.DeleteLines(p.param(0, 1))
+	case '@':
+		p.g.InsertChars(p.param(0, 1))
+	case 'P':
+		p.g.DeleteChars(p.param(0, 1))
+	case 'S':
+		p.g.ScrollUp(p.param(0, 1))
+	case 'T':
+		p.g.ScrollDown(p.param(0, 1))
+	case 'c':
+		// DA1 — Primary Device Attributes. Reply only for the
+		// no-parameter or "0" form (the DEC private "?c" / DA2
+		// "> c" forms have intermediates we don't track and are
+		// ignored). fish probes this at startup.
+		if p.param(0, 0) == 0 && p.onReply != nil {
+			p.onReply(da1Reply)
+		}
+	case 'q':
+		// DECSCUSR — set cursor style + blink (CSI Ps SP q).
+		// Without the SP intermediate this is a different sequence
+		// (DECSCA / DECLL); ignore those.
+		if p.intermediate == ' ' {
+			p.g.ApplyDECSCUSR(p.param(0, 0))
+		}
 	default:
 		// Unknown CSI — drop. Includes scroll regions, mode set/reset,
 		// device status, etc.
@@ -192,8 +346,30 @@ func (p *Parser) applyDECMode(set bool) {
 		switch n {
 		case 25: // DECTCEM — text cursor enable
 			p.g.CursorVisible = set
+		case 47, 1047: // alt screen (no save/restore of cursor)
+			if set {
+				p.g.EnterAlt()
+			} else {
+				p.g.ExitAlt()
+			}
+		case 1049: // alt screen with cursor save/restore (xterm)
+			if set {
+				p.g.SaveCursor()
+				p.g.EnterAlt()
+			} else {
+				p.g.ExitAlt()
+				p.g.RestoreCursor()
+			}
 		case 2004: // bracketed paste mode
 			p.g.BracketedPaste = set
+		case 1000: // mouse: press/release
+			p.g.MouseTrack = set
+		case 1002: // mouse: press/release + drag
+			p.g.MouseTrackBtn = set
+		case 1003: // mouse: any motion
+			p.g.MouseTrackAny = set
+		case 1006: // mouse: SGR encoding
+			p.g.MouseSGR = set
 		}
 	}
 }

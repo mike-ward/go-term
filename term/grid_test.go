@@ -339,7 +339,7 @@ func TestGrid_ScrollUp(t *testing.T) {
 			g.At(r, c).Ch = rune('a' + r)
 		}
 	}
-	g.scrollUp()
+	g.scrollUpRegion(1)
 	if g.At(0, 0).Ch != 'b' || g.At(1, 0).Ch != 'c' {
 		t.Errorf("scrollUp shift wrong: %v %v", g.At(0, 0).Ch, g.At(1, 0).Ch)
 	}
@@ -359,9 +359,9 @@ func TestGrid_ScrollbackFillTrim(t *testing.T) {
 		}
 	}
 	// Three scrollUps push A, B, C into scrollback (cap=2 trims A).
-	g.scrollUp()
-	g.scrollUp()
-	g.scrollUp()
+	g.scrollUpRegion(1)
+	g.scrollUpRegion(1)
+	g.scrollUpRegion(1)
 	if len(g.Scrollback) != 2 {
 		t.Fatalf("len(Scrollback) = %d, want 2 (trim)", len(g.Scrollback))
 	}
@@ -372,7 +372,7 @@ func TestGrid_ScrollbackFillTrim(t *testing.T) {
 	// Cap=0 disables scrollback entirely.
 	g2 := NewGrid(2, 2)
 	g2.At(0, 0).Ch = 'X'
-	g2.scrollUp()
+	g2.scrollUpRegion(1)
 	if len(g2.Scrollback) != 0 {
 		t.Errorf("cap=0 must not retain rows: %d", len(g2.Scrollback))
 	}
@@ -383,7 +383,7 @@ func TestGrid_ScrollViewClamp(t *testing.T) {
 	g.ScrollbackCap = 10
 	// Push 4 rows into scrollback.
 	for range 4 {
-		g.scrollUp()
+		g.scrollUpRegion(1)
 	}
 	if len(g.Scrollback) != 4 {
 		t.Fatalf("setup: len=%d", len(g.Scrollback))
@@ -418,7 +418,7 @@ func TestGrid_ViewCellAt(t *testing.T) {
 	for c := range g.Cols {
 		g.At(0, c).Ch = 'L'
 	}
-	g.scrollUp()
+	g.scrollUpRegion(1)
 	// After scrollUp, live row 0 holds whatever was previously row 1
 	// (default cells); scrollback[0] holds 'L's.
 	g.ViewOffset = 1
@@ -521,7 +521,7 @@ func TestGrid_Resize_ReflowsScrollback(t *testing.T) {
 	for c, r := range "abcd" {
 		g.At(0, c).Ch = r
 	}
-	g.scrollUp()
+	g.scrollUpRegion(1)
 	if len(g.Scrollback) != 1 || len(g.Scrollback[0]) != 4 {
 		t.Fatalf("setup: scrollback=%v", g.Scrollback)
 	}
@@ -557,7 +557,7 @@ func TestGrid_SelectedText_AcrossScrollbackBoundary(t *testing.T) {
 	for c, r := range "abc" {
 		g.At(0, c).Ch = r
 	}
-	g.scrollUp()
+	g.scrollUpRegion(1)
 	// Live row 0 now = "xyz" (the formerly empty bottom shifted up).
 	for c, r := range "xyz" {
 		g.At(0, c).Ch = r
@@ -669,7 +669,7 @@ func TestGrid_ScrollView_SaturatingAdd(t *testing.T) {
 	g := NewGrid(2, 2)
 	g.ScrollbackCap = 10
 	for range 5 {
-		g.scrollUp()
+		g.scrollUpRegion(1)
 	}
 	if got := len(g.Scrollback); got != 5 {
 		t.Fatalf("setup: scrollback len=%d", got)
@@ -691,5 +691,601 @@ func TestGrid_ScrollView_SaturatingAdd(t *testing.T) {
 	g.ScrollView(2)
 	if g.ViewOffset != 2 {
 		t.Errorf("normal delta: got %d, want 2", g.ViewOffset)
+	}
+}
+
+// fillRow writes ch into every cell of row r. Test helper for region
+// scroll/insert/delete coverage where each row needs a unique marker.
+func fillRow(g *Grid, r int, ch rune) {
+	for c := range g.Cols {
+		g.At(r, c).Ch = ch
+	}
+}
+
+// rowChar returns the character at (r, 0) — sufficient since tests
+// fill rows with a single repeated rune.
+func rowChar(g *Grid, r int) rune { return g.At(r, 0).Ch }
+
+func TestGrid_SetScrollRegion(t *testing.T) {
+	g := NewGrid(10, 4)
+	g.SetScrollRegion(2, 5)
+	if g.Top != 2 || g.Bottom != 5 {
+		t.Errorf("region = %d..%d, want 2..5", g.Top, g.Bottom)
+	}
+	if g.CursorR != 0 || g.CursorC != 0 {
+		t.Errorf("cursor not homed: %d,%d", g.CursorR, g.CursorC)
+	}
+	// Invalid: top >= bottom resets to full.
+	g.SetScrollRegion(5, 5)
+	if g.Top != 0 || g.Bottom != g.Rows-1 {
+		t.Errorf("degenerate not reset: %d..%d", g.Top, g.Bottom)
+	}
+	// Out of bounds resets.
+	g.SetScrollRegion(-1, 3)
+	if g.Top != 0 || g.Bottom != g.Rows-1 {
+		t.Errorf("negative top not reset: %d..%d", g.Top, g.Bottom)
+	}
+	g.SetScrollRegion(0, g.Rows)
+	if g.Top != 0 || g.Bottom != g.Rows-1 {
+		t.Errorf("oversize bottom not reset: %d..%d", g.Top, g.Bottom)
+	}
+}
+
+func TestGrid_ScrollUpRegion_Partial(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3 // region rows B..D
+	g.ScrollbackCap = 100
+	g.scrollUpRegion(1)
+	want := []rune{'A', 'C', 'D', ' ', 'E'}
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+	// Partial region must not push to scrollback.
+	if len(g.Scrollback) != 0 {
+		t.Errorf("partial-region scroll polluted scrollback: %d", len(g.Scrollback))
+	}
+}
+
+func TestGrid_ScrollUpRegion_FullScreenScrollback(t *testing.T) {
+	g := NewGrid(3, 2)
+	g.ScrollbackCap = 10
+	for i, ch := range []rune{'A', 'B', 'C'} {
+		fillRow(g, i, ch)
+	}
+	// Default region == full screen.
+	g.scrollUpRegion(1)
+	if len(g.Scrollback) != 1 || g.Scrollback[0][0].Ch != 'A' {
+		t.Errorf("full-screen scroll didn't push: %+v", g.Scrollback)
+	}
+}
+
+func TestGrid_ScrollUpRegion_OverHeight(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.scrollUpRegion(99) // > region height clears region
+	want := []rune{'A', ' ', ' ', ' ', 'E'}
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestGrid_ScrollDownRegion_Partial(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.ScrollbackCap = 100
+	g.scrollDownRegion(1)
+	want := []rune{'A', ' ', 'B', 'C', 'E'}
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+	if len(g.Scrollback) != 0 {
+		t.Errorf("scrollDown polluted scrollback")
+	}
+}
+
+func TestGrid_NewlineAtRegionBottom(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR = 3 // at Bottom
+	g.Newline()
+	// Region scrolled up, cursor stays at Bottom.
+	if g.CursorR != 3 {
+		t.Errorf("cursor moved off Bottom: %d", g.CursorR)
+	}
+	if rowChar(g, 1) != 'C' || rowChar(g, 2) != 'D' || rowChar(g, 3) != ' ' {
+		t.Errorf("region rows wrong after Newline at Bottom")
+	}
+	if rowChar(g, 0) != 'A' || rowChar(g, 4) != 'E' {
+		t.Errorf("rows outside region disturbed")
+	}
+}
+
+func TestGrid_NewlineBelowRegionDoesNotScroll(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR = 4 // below Bottom; at last row
+	g.Newline()
+	if g.CursorR != 4 {
+		t.Errorf("cursor moved past last row: %d", g.CursorR)
+	}
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		if got := rowChar(g, i); got != ch {
+			t.Errorf("row %d disturbed: got %q", i, got)
+		}
+	}
+}
+
+func TestGrid_ReverseIndexAtTop(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR = 1 // at Top
+	g.ReverseIndex()
+	if g.CursorR != 1 {
+		t.Errorf("cursor moved: %d", g.CursorR)
+	}
+	want := []rune{'A', ' ', 'B', 'C', 'E'}
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestGrid_NextLine(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.CursorR, g.CursorC = 1, 3
+	g.NextLine()
+	if g.CursorR != 2 || g.CursorC != 0 {
+		t.Errorf("NextLine cursor: %d,%d", g.CursorR, g.CursorC)
+	}
+}
+
+func TestGrid_InsertLines(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR, g.CursorC = 2, 1
+	g.InsertLines(1)
+	want := []rune{'A', 'B', ' ', 'C', 'E'} // D pushed past Bottom, lost
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+	if g.CursorC != 0 {
+		t.Errorf("InsertLines must home cursor column: %d", g.CursorC)
+	}
+}
+
+func TestGrid_InsertLines_OutsideRegion(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR = 4 // below region
+	g.InsertLines(2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		if got := rowChar(g, i); got != ch {
+			t.Errorf("row %d disturbed by IL outside region: %q", i, got)
+		}
+	}
+}
+
+func TestGrid_DeleteLines(t *testing.T) {
+	g := NewGrid(5, 2)
+	for i, ch := range []rune{'A', 'B', 'C', 'D', 'E'} {
+		fillRow(g, i, ch)
+	}
+	g.Top, g.Bottom = 1, 3
+	g.CursorR = 1
+	g.DeleteLines(1)
+	want := []rune{'A', 'C', 'D', ' ', 'E'}
+	for i, w := range want {
+		if got := rowChar(g, i); got != w {
+			t.Errorf("row %d = %q, want %q", i, got, w)
+		}
+	}
+}
+
+func TestGrid_InsertChars(t *testing.T) {
+	g := NewGrid(2, 6)
+	for c := range g.Cols {
+		g.At(0, c).Ch = rune('a' + c)
+	}
+	g.CursorR, g.CursorC = 0, 2
+	g.InsertChars(2)
+	got := []rune{
+		g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch,
+		g.At(0, 3).Ch, g.At(0, 4).Ch, g.At(0, 5).Ch,
+	}
+	want := []rune{'a', 'b', ' ', ' ', 'c', 'd'}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("col %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestGrid_InsertChars_OverWidth(t *testing.T) {
+	g := NewGrid(1, 4)
+	for c := range g.Cols {
+		g.At(0, c).Ch = rune('a' + c)
+	}
+	g.CursorC = 1
+	g.InsertChars(99) // clears from CursorC to end
+	for c := 1; c < g.Cols; c++ {
+		if g.At(0, c).Ch != ' ' {
+			t.Errorf("col %d not cleared: %q", c, g.At(0, c).Ch)
+		}
+	}
+	if g.At(0, 0).Ch != 'a' {
+		t.Errorf("col 0 disturbed: %q", g.At(0, 0).Ch)
+	}
+}
+
+func TestGrid_DeleteChars(t *testing.T) {
+	g := NewGrid(1, 6)
+	for c := range g.Cols {
+		g.At(0, c).Ch = rune('a' + c)
+	}
+	g.CursorC = 2
+	g.DeleteChars(2)
+	got := []rune{
+		g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch,
+		g.At(0, 3).Ch, g.At(0, 4).Ch, g.At(0, 5).Ch,
+	}
+	want := []rune{'a', 'b', 'e', 'f', ' ', ' '}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("col %d = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestGrid_ResizeResetsRegion(t *testing.T) {
+	g := NewGrid(10, 4)
+	g.SetScrollRegion(2, 5)
+	g.Resize(8, 4)
+	if g.Top != 0 || g.Bottom != 7 {
+		t.Errorf("Resize did not reset region: %d..%d", g.Top, g.Bottom)
+	}
+}
+
+// rowText concatenates non-blank cells in a row for readable assertions.
+func rowText(g *Grid, r int) string {
+	var b []rune
+	for c := 0; c < g.Cols; c++ {
+		b = append(b, g.At(r, c).Ch)
+	}
+	return string(b)
+}
+
+func TestGrid_EnterAlt_BlanksAndSwaps(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.Put('m')
+	g.Put('a')
+	g.Put('i')
+	g.Put('n')
+	g.MoveCursor(1, 2)
+	g.CurAttrs = AttrBold
+	g.EnterAlt()
+	if !g.AltActive {
+		t.Fatal("AltActive should be true after EnterAlt")
+	}
+	if g.CursorR != 0 || g.CursorC != 0 {
+		t.Errorf("alt cursor not homed: %d,%d", g.CursorR, g.CursorC)
+	}
+	if g.CurAttrs != 0 || g.CurFG != DefaultColor || g.CurBG != DefaultColor {
+		t.Errorf("alt SGR not reset: attrs=%d fg=%#x bg=%#x",
+			g.CurAttrs, g.CurFG, g.CurBG)
+	}
+	for i, cell := range g.Cells {
+		if cell.Ch != ' ' {
+			t.Fatalf("alt cell %d not blank: %q", i, cell.Ch)
+		}
+	}
+}
+
+func TestGrid_EnterExitAlt_RestoresMain(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.Put('m')
+	g.Put('a')
+	g.Put('i')
+	g.Put('n')
+	g.SetScrollRegion(0, 1)
+	g.MoveCursor(2, 1)
+	g.CurAttrs = AttrUnderline
+	g.CurFG = paletteColor(3)
+
+	g.EnterAlt()
+	g.Put('A') // mutate alt buffer
+	g.MoveCursor(2, 3)
+
+	g.ExitAlt()
+	if g.AltActive {
+		t.Fatal("AltActive should be false after ExitAlt")
+	}
+	if got := rowText(g, 0); got != "main" {
+		t.Errorf("main row 0 = %q, want main", got)
+	}
+	if g.CursorR != 2 || g.CursorC != 1 {
+		t.Errorf("main cursor not restored: %d,%d", g.CursorR, g.CursorC)
+	}
+	if g.CurAttrs != AttrUnderline {
+		t.Errorf("main attrs not restored: %d", g.CurAttrs)
+	}
+	if g.CurFG != paletteColor(3) {
+		t.Errorf("main fg not restored: %#x", g.CurFG)
+	}
+	if g.Top != 0 || g.Bottom != 1 {
+		t.Errorf("main region not restored: %d..%d", g.Top, g.Bottom)
+	}
+}
+
+func TestGrid_EnterAlt_Idempotent(t *testing.T) {
+	g := NewGrid(2, 3)
+	g.Put('x')
+	g.EnterAlt()
+	g.Put('Y')
+	g.EnterAlt() // should be no-op; must not stash alt over alt
+	g.ExitAlt()
+	if g.AltActive {
+		t.Fatal("still alt after ExitAlt")
+	}
+	if g.At(0, 0).Ch != 'x' {
+		t.Errorf("main row 0 col 0 = %q, want x", g.At(0, 0).Ch)
+	}
+}
+
+func TestGrid_ExitAlt_NoOpWhenInactive(t *testing.T) {
+	g := NewGrid(2, 3)
+	g.Put('x')
+	g.ExitAlt() // no-op
+	if g.AltActive {
+		t.Fatal("ExitAlt flipped state from inactive")
+	}
+	if g.At(0, 0).Ch != 'x' {
+		t.Errorf("buffer corrupted by no-op ExitAlt")
+	}
+}
+
+func TestGrid_AltSuppressesScrollback(t *testing.T) {
+	g := NewGrid(2, 3)
+	g.ScrollbackCap = 100
+	g.EnterAlt()
+	for i := 0; i < 10; i++ {
+		g.Put('a' + rune(i))
+		g.Newline()
+	}
+	if len(g.Scrollback) != 0 {
+		t.Errorf("scrollback grew while alt active: %d rows",
+			len(g.Scrollback))
+	}
+	g.ExitAlt()
+	// Main scrollback writes still work after exit.
+	for i := 0; i < 5; i++ {
+		g.Put('m')
+		g.Newline()
+	}
+	if len(g.Scrollback) == 0 {
+		t.Errorf("scrollback not restored after ExitAlt")
+	}
+}
+
+func TestGrid_EnterAlt_ResetsView(t *testing.T) {
+	g := NewGrid(2, 3)
+	g.ScrollbackCap = 10
+	for i := 0; i < 4; i++ {
+		g.Put('a')
+		g.Newline()
+	}
+	g.ScrollView(2)
+	if g.ViewOffset == 0 {
+		t.Fatal("setup: ViewOffset should be > 0")
+	}
+	g.EnterAlt()
+	if g.ViewOffset != 0 {
+		t.Errorf("EnterAlt did not reset ViewOffset: %d", g.ViewOffset)
+	}
+}
+
+func TestGrid_AltResize_ReflowsMainBuffer(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.Put('a')
+	g.Put('b')
+	g.Put('c')
+	g.MoveCursor(1, 0)
+	g.Put('x')
+	g.EnterAlt()
+	g.Resize(3, 6) // grow cols while alt is active
+	g.ExitAlt()
+	if g.Cols != 6 {
+		t.Fatalf("Cols = %d, want 6", g.Cols)
+	}
+	if g.At(0, 0).Ch != 'a' || g.At(0, 1).Ch != 'b' || g.At(0, 2).Ch != 'c' {
+		t.Errorf("main row 0 lost on alt resize: %q%q%q",
+			g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch)
+	}
+	if g.At(1, 0).Ch != 'x' {
+		t.Errorf("main row 1 col 0 = %q, want x", g.At(1, 0).Ch)
+	}
+	if g.At(0, 5).Ch != ' ' {
+		t.Errorf("padding cell not blank: %q", g.At(0, 5).Ch)
+	}
+}
+
+func TestGrid_AltDECSC_DoesNotClobberMainSave(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.MoveCursor(2, 3)
+	g.CurAttrs = AttrBold
+	g.SaveCursor() // main save: (2,3,bold)
+	g.EnterAlt()
+	g.MoveCursor(0, 1)
+	g.CurAttrs = AttrUnderline
+	g.SaveCursor() // alt save (separate slot)
+	g.MoveCursor(1, 2)
+	g.RestoreCursor()
+	if g.CursorR != 0 || g.CursorC != 1 || g.CurAttrs != AttrUnderline {
+		t.Errorf("alt DECRC: cursor=%d,%d attrs=%d",
+			g.CursorR, g.CursorC, g.CurAttrs)
+	}
+	g.ExitAlt()
+	g.RestoreCursor()
+	if g.CursorR != 2 || g.CursorC != 3 || g.CurAttrs != AttrBold {
+		t.Errorf("main DECRC after alt round-trip: cursor=%d,%d attrs=%d",
+			g.CursorR, g.CursorC, g.CurAttrs)
+	}
+}
+
+func TestRuneWidth_ASCII(t *testing.T) {
+	cases := []struct {
+		r    rune
+		want int
+	}{
+		{' ', 1}, {'A', 1}, {'~', 1},
+		{0x00, 0}, {0x07, 0}, {0x1F, 0},
+	}
+	for _, c := range cases {
+		if got := runeWidth(c.r); got != c.want {
+			t.Errorf("runeWidth(%U)=%d want %d", c.r, got, c.want)
+		}
+	}
+}
+
+func TestRuneWidth_CJKAndEmoji(t *testing.T) {
+	cases := []struct {
+		r    rune
+		want int
+	}{
+		{'你', 2},
+		{'好', 2},
+		{0x1F600, 2}, // emoji
+		{'é', 1},     // U+00E9 — narrow Latin
+	}
+	for _, c := range cases {
+		if got := runeWidth(c.r); got != c.want {
+			t.Errorf("runeWidth(%U)=%d want %d", c.r, got, c.want)
+		}
+	}
+}
+
+func TestGrid_Put_WideAdvancesTwoColumns(t *testing.T) {
+	g := NewGrid(2, 8)
+	g.Put('你')
+	if g.CursorC != 2 {
+		t.Errorf("after wide put, cursor C=%d, want 2", g.CursorC)
+	}
+	if c := g.At(0, 0); c.Ch != '你' || c.Width != 2 {
+		t.Errorf("cell[0,0]: ch=%U width=%d", c.Ch, c.Width)
+	}
+	if c := g.At(0, 1); c.Ch != 0 || c.Width != 0 {
+		t.Errorf("cell[0,1] continuation: ch=%U width=%d", c.Ch, c.Width)
+	}
+}
+
+func TestGrid_Put_WideWrapsAtRightEdge(t *testing.T) {
+	g := NewGrid(2, 4)
+	g.Put('a')
+	g.Put('b')
+	g.Put('c')
+	// CursorC=3 (last col); a width-2 char must wrap to next row.
+	g.Put('你')
+	if g.CursorR != 1 || g.CursorC != 2 {
+		t.Errorf("post-wrap cursor: r=%d c=%d", g.CursorR, g.CursorC)
+	}
+	// Original col 3 must have been padded blank rather than left
+	// holding stale state.
+	if c := g.At(0, 3); c.Ch != ' ' || c.Width != 1 {
+		t.Errorf("padded cell[0,3]: ch=%U width=%d", c.Ch, c.Width)
+	}
+	if c := g.At(1, 0); c.Ch != '你' || c.Width != 2 {
+		t.Errorf("wrapped wide head: ch=%U width=%d", c.Ch, c.Width)
+	}
+}
+
+func TestGrid_Put_OverwriteWideHeadClearsContinuation(t *testing.T) {
+	g := NewGrid(1, 5)
+	g.Put('好')
+	g.MoveCursor(0, 0)
+	g.Put('x')
+	if c := g.At(0, 0); c.Ch != 'x' || c.Width != 1 {
+		t.Errorf("overwrote head: ch=%U width=%d", c.Ch, c.Width)
+	}
+	if c := g.At(0, 1); c.Ch != ' ' || c.Width != 1 {
+		t.Errorf("orphaned continuation: ch=%U width=%d", c.Ch, c.Width)
+	}
+}
+
+func TestGrid_Put_OverwriteContinuationClearsHead(t *testing.T) {
+	g := NewGrid(1, 5)
+	g.Put('好')
+	g.MoveCursor(0, 1)
+	g.Put('y')
+	if c := g.At(0, 1); c.Ch != 'y' || c.Width != 1 {
+		t.Errorf("overwrote continuation: ch=%U width=%d", c.Ch, c.Width)
+	}
+	if c := g.At(0, 0); c.Ch != ' ' || c.Width != 1 {
+		t.Errorf("orphaned head: ch=%U width=%d", c.Ch, c.Width)
+	}
+}
+
+func TestGrid_Put_DropsZeroWidth(t *testing.T) {
+	g := NewGrid(1, 5)
+	g.Put('a')
+	startC := g.CursorC
+	g.Put(0x0301) // combining acute accent
+	if g.CursorC != startC {
+		t.Errorf("zero-width char advanced cursor: %d → %d",
+			startC, g.CursorC)
+	}
+	if c := g.At(0, 0); c.Ch != 'a' {
+		t.Errorf("zero-width char clobbered prior cell: ch=%U", c.Ch)
+	}
+}
+
+func TestGrid_Put_WideThenNarrowLayout(t *testing.T) {
+	g := NewGrid(1, 8)
+	g.Put('你')
+	g.Put('好')
+	g.Put('!')
+	want := []struct {
+		ch rune
+		w  uint8
+	}{
+		{'你', 2}, {0, 0}, {'好', 2}, {0, 0}, {'!', 1},
+	}
+	for i, exp := range want {
+		c := g.At(0, i)
+		if c.Ch != exp.ch || c.Width != exp.w {
+			t.Errorf("col %d: ch=%U width=%d, want ch=%U width=%d",
+				i, c.Ch, c.Width, exp.ch, exp.w)
+		}
 	}
 }
