@@ -50,19 +50,24 @@ phases unlock advanced apps (tmux, mouse-aware editors) and polish.
 `38;2;r;g;b` (parser.go:209-227). Many CLI tools (`ls --color`, `bat`,
 `eza`, vim themes) look broken without it. Smallest wire-up.
 
-- [ ] `grid.go`: change `Cell.FG/BG` from `uint8` to packed `uint32`
-      carrying either palette index or RGB; add `Cell.Flags` bits
-      `FlagFGRGB`, `FlagBGRGB`. Keep `DefaultColor` sentinel.
-- [ ] `palette.go`: extend palette to 256 entries (xterm 16+216+24
-      standard table). `fg()`/`bg()` take new uint32 + flags and
-      return `gui.Color`.
-- [ ] `parser.go::applySGR`: branch 38/48 with `;5;n` and `;2;r;g;b`,
-      store into `Grid.CurFG/BG` + flags. Drop the existing "swallow"
-      path.
-- [ ] `widget.go::onDraw`: confirm no logic change — `palette.fg/bg`
-      resolves new encoding.
-- [ ] Update `grid_test.go` / `parser_test.go` / `palette_test.go`
-      for new color encoding.
+- [x] `grid.go`: `Cell.FG/BG` and `Grid.CurFG/CurBG` are now packed
+      `uint32` with high-byte tag (palette / RGB / Default). Plain
+      palette indices still encode as their numeric value so
+      `FG: 1`-style literals keep working. `DefaultColor` sentinel
+      preserved (now `0xFF000000`).
+- [x] `palette.go`: extended to 256 entries (xterm 16 + 6×6×6 cube +
+      24 grayscale). New `resolveFG`/`resolveBG` helpers decode the
+      packed encoding; `fg()`/`bg()` honor `AttrInverse`.
+- [x] `parser.go::applySGR`: 38/48 dispatch via `applyExtendedColor`
+      with `;5;n` and `;2;r;g;b` sub-forms; channel values clamped to
+      0..255. Swallow path dropped.
+- [x] `widget.go::onDraw`: no change — `fg`/`bg` resolve the new
+      encoding transparently.
+- [x] New tests: `TestParser_SGR256_*`, `TestParser_SGRTruecolor_*`,
+      `TestParser_SGR_UnknownExtendedSelectorConsumesRest`,
+      `TestPalette_256_Cube`, `TestPalette_256_Grayscale`,
+      `TestPalette_TruecolorRoundtrip`,
+      `TestPalette_TruecolorInverse`.
 
 **Demo test:**
 ```

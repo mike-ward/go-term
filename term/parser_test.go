@@ -180,6 +180,70 @@ func TestParser_SGR38_2Swallowed(t *testing.T) {
 	}
 }
 
+func TestParser_SGR256_AppliesPaletteIndex(t *testing.T) {
+	g, p := newParserGrid(1, 1)
+	feed(t, g, p, []byte("\x1b[38;5;200m"))
+	if got, want := g.CurFG, paletteColor(200); got != want {
+		t.Errorf("38;5;200 fg: got %#x want %#x", got, want)
+	}
+	feed(t, g, p, []byte("\x1b[48;5;17m"))
+	if got, want := g.CurBG, paletteColor(17); got != want {
+		t.Errorf("48;5;17 bg: got %#x want %#x", got, want)
+	}
+}
+
+func TestParser_SGR256_OutOfRangeClamps(t *testing.T) {
+	g, p := newParserGrid(1, 1)
+	feed(t, g, p, []byte("\x1b[38;5;9999m"))
+	if got, want := g.CurFG, paletteColor(255); got != want {
+		t.Errorf("clamped 256-color: got %#x want %#x", got, want)
+	}
+}
+
+func TestParser_SGRTruecolor_AppliesRGB(t *testing.T) {
+	g, p := newParserGrid(1, 1)
+	feed(t, g, p, []byte("\x1b[38;2;255;100;0m"))
+	if got, want := g.CurFG, rgbColor(255, 100, 0); got != want {
+		t.Errorf("38;2 fg: got %#x want %#x", got, want)
+	}
+	feed(t, g, p, []byte("\x1b[48;2;10;20;30m"))
+	if got, want := g.CurBG, rgbColor(10, 20, 30); got != want {
+		t.Errorf("48;2 bg: got %#x want %#x", got, want)
+	}
+}
+
+func TestParser_SGRTruecolor_ChannelsClamp(t *testing.T) {
+	g, p := newParserGrid(1, 1)
+	// CSI params are unsigned; oversize values must saturate at 255
+	// rather than overflow.
+	feed(t, g, p, []byte("\x1b[38;2;300;500;128m"))
+	if got, want := g.CurFG, rgbColor(255, 255, 128); got != want {
+		t.Errorf("clamped channels: got %#x want %#x", got, want)
+	}
+}
+
+func TestParser_SGR38_NoSelectorIsNoop(t *testing.T) {
+	// "\x1b[38m" — extended-color introducer with no sub-form
+	// selector. Must not change FG, must not panic.
+	g, p := newParserGrid(1, 1)
+	g.CurFG = paletteColor(7)
+	feed(t, g, p, []byte("\x1b[38m"))
+	if got, want := g.CurFG, paletteColor(7); got != want {
+		t.Errorf("bare 38 should not change FG: got %#x want %#x", got, want)
+	}
+}
+
+func TestParser_SGR_UnknownExtendedSelectorConsumesRest(t *testing.T) {
+	g, p := newParserGrid(1, 1)
+	g.CurFG = paletteColor(7)
+	// Selector "9" is not 5 or 2; remaining params should be dropped,
+	// leaving CurFG untouched.
+	feed(t, g, p, []byte("\x1b[38;9;1;2;3;4m"))
+	if got, want := g.CurFG, paletteColor(7); got != want {
+		t.Errorf("unknown selector should not change FG: got %#x want %#x", got, want)
+	}
+}
+
 func TestParser_SGR38_2Truncated(t *testing.T) {
 	g, p := newParserGrid(1, 1)
 	// only 2 of 4 follow-up params present — must not panic / read past end

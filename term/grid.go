@@ -30,14 +30,35 @@ func clampDim(n int) int {
 	return n
 }
 
-// Default palette index sentinel. SGR 39/49 reset to this.
-const DefaultColor uint8 = 255
+// Cell.FG and Cell.BG are packed uint32 values. The high byte is the
+// encoding tag:
+//
+//	0x00       — palette index, low byte 0..255 (xterm 256-color table)
+//	0x01       — direct RGB,   low 24 bits = R<<16 | G<<8 | B
+//	0xFF       — default-color sentinel (defer to defaultFG/defaultBG)
+//
+// SGR 39/49 reset to DefaultColor. Plain palette indices encode as
+// their numeric value (paletteColor(1) == 1) so equality comparisons
+// against small int literals keep working in tests.
+const (
+	colorPalette uint32 = 0x00 << 24
+	colorRGB     uint32 = 0x01 << 24
+	DefaultColor uint32 = 0xFF << 24
+)
+
+// paletteColor encodes a 256-color palette index.
+func paletteColor(i uint8) uint32 { return colorPalette | uint32(i) }
+
+// rgbColor encodes a 24-bit RGB triple.
+func rgbColor(r, g, b uint8) uint32 {
+	return colorRGB | uint32(r)<<16 | uint32(g)<<8 | uint32(b)
+}
 
 // Cell is one terminal grid cell.
 type Cell struct {
 	Ch    rune
-	FG    uint8 // ANSI palette index 0..15, or DefaultColor
-	BG    uint8
+	FG    uint32 // packed Color (palette index, RGB, or DefaultColor)
+	BG    uint32
 	Attrs uint8
 }
 
@@ -55,8 +76,8 @@ type Grid struct {
 	Cells    []Cell // row-major, len = Rows*Cols
 	CursorR  int
 	CursorC  int
-	CurFG    uint8
-	CurBG    uint8
+	CurFG    uint32 // packed Color
+	CurBG    uint32
 	CurAttrs uint8
 }
 
