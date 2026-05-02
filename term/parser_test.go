@@ -303,9 +303,99 @@ func TestParser_CSI_EraseInDisplayLine(t *testing.T) {
 func TestParser_CSI_UnknownDropped(t *testing.T) {
 	g, p := newParserGrid(1, 5)
 	g.Put('z')
-	feed(t, g, p, []byte("\x1b[?25h")) // hide cursor — unknown to parser
+	feed(t, g, p, []byte("\x1b[Z")) // CBT — unknown to dispatcher
 	if g.At(0, 0).Ch != 'z' || g.CursorC != 1 {
 		t.Errorf("unknown CSI mutated state: %v cursor=%d",
 			g.At(0, 0).Ch, g.CursorC)
+	}
+}
+
+func TestParser_CursorSaveRestore_ESC78(t *testing.T) {
+	g, p := newParserGrid(5, 10)
+	g.MoveCursor(2, 4)
+	feed(t, g, p, []byte("\x1b[31m")) // FG red
+	feed(t, g, p, []byte("\x1b7"))    // DECSC
+	g.MoveCursor(0, 0)
+	feed(t, g, p, []byte("\x1b[32m")) // FG green
+	feed(t, g, p, []byte("\x1b8"))    // DECRC
+	if g.CursorR != 2 || g.CursorC != 4 {
+		t.Errorf("cursor not restored: r=%d c=%d", g.CursorR, g.CursorC)
+	}
+	if g.CurFG != paletteColor(1) {
+		t.Errorf("FG not restored: %#x", g.CurFG)
+	}
+}
+
+func TestParser_CursorSaveRestore_CSIsu(t *testing.T) {
+	g, p := newParserGrid(5, 10)
+	g.MoveCursor(3, 7)
+	g.CurAttrs = AttrBold
+	feed(t, g, p, []byte("\x1b[s"))
+	g.MoveCursor(0, 0)
+	g.CurAttrs = 0
+	feed(t, g, p, []byte("\x1b[u"))
+	if g.CursorR != 3 || g.CursorC != 7 {
+		t.Errorf("CSI u: r=%d c=%d", g.CursorR, g.CursorC)
+	}
+	if g.CurAttrs != AttrBold {
+		t.Errorf("CSI u attrs: %d", g.CurAttrs)
+	}
+}
+
+func TestParser_RestoreWithoutSaveResets(t *testing.T) {
+	g, p := newParserGrid(5, 10)
+	g.MoveCursor(2, 3)
+	g.CurFG = paletteColor(5)
+	g.CurAttrs = AttrUnderline
+	feed(t, g, p, []byte("\x1b8")) // DECRC, no prior save
+	if g.CursorR != 0 || g.CursorC != 0 {
+		t.Errorf("home: r=%d c=%d", g.CursorR, g.CursorC)
+	}
+	if g.CurFG != DefaultColor || g.CurAttrs != 0 {
+		t.Errorf("SGR not reset: fg=%#x attrs=%d", g.CurFG, g.CurAttrs)
+	}
+}
+
+func TestParser_DEC25_CursorVisibility(t *testing.T) {
+	g, p := newParserGrid(2, 5)
+	if !g.CursorVisible {
+		t.Fatal("default CursorVisible should be true")
+	}
+	feed(t, g, p, []byte("\x1b[?25l"))
+	if g.CursorVisible {
+		t.Errorf("?25l: still visible")
+	}
+	feed(t, g, p, []byte("\x1b[?25h"))
+	if !g.CursorVisible {
+		t.Errorf("?25h: still hidden")
+	}
+}
+
+func TestParser_DEC2004_BracketedPaste(t *testing.T) {
+	g, p := newParserGrid(2, 5)
+	if g.BracketedPaste {
+		t.Fatal("default should be off")
+	}
+	feed(t, g, p, []byte("\x1b[?2004h"))
+	if !g.BracketedPaste {
+		t.Errorf("?2004h: still off")
+	}
+	feed(t, g, p, []byte("\x1b[?2004l"))
+	if g.BracketedPaste {
+		t.Errorf("?2004l: still on")
+	}
+}
+
+func TestParser_DECPrivateResetBetweenSequences(t *testing.T) {
+	// Ensure the `?` prefix on one CSI doesn't leak into the next CSI,
+	// which would cause CSI 25 m (a no-op SGR) to be misread as DEC mode.
+	g, p := newParserGrid(2, 5)
+	feed(t, g, p, []byte("\x1b[?25l")) // hides cursor
+	feed(t, g, p, []byte("\x1b[31m"))  // plain SGR FG red
+	if g.CursorVisible {
+		t.Fatal("?25l should still be in effect")
+	}
+	if g.CurFG != paletteColor(1) {
+		t.Errorf("SGR after DEC mode: fg=%#x", g.CurFG)
 	}
 }

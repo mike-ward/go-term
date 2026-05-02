@@ -5,7 +5,10 @@
 // DrawCanvas.
 package term
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // Cell attribute bits.
 const (
@@ -18,6 +21,23 @@ const (
 // well below this; the cap exists so a runaway resize (huge canvas, NaN
 // metrics, malicious caller) can't allocate hundreds of megabytes.
 const MaxGridDim = 1024
+
+// MaxScrollbackCap bounds ScrollbackCap so a malicious or mistaken
+// Cfg.ScrollbackRows can't lead to multi-GB allocations as rows scroll.
+// At MaxGridDim cols and ~17 B/cell this is roughly 1.7 GB worst case;
+// callers should pick a value far below this.
+const MaxScrollbackCap = 100000
+
+// clampScrollback bounds n to [0, MaxScrollbackCap].
+func clampScrollback(n int) int {
+	if n < 0 {
+		return 0
+	}
+	if n > MaxScrollbackCap {
+		return MaxScrollbackCap
+	}
+	return n
+}
 
 // clampDim bounds a row or column count to [1, MaxGridDim].
 func clampDim(n int) int {
@@ -66,19 +86,141 @@ func defaultCell() Cell {
 	return Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor}
 }
 
+// savedCursor holds the snapshot taken by SaveCursor (DECSC / CSI s).
+// Stores position and SGR state per VT100 spec. Zero value means no
+// snapshot has been taken yet (valid == false).
+type savedCursor struct {
+	r, c   int
+	fg, bg uint32
+	attrs  uint8
+	valid  bool
+}
+
 // Grid is a fixed-size character grid. All public methods are safe for
 // concurrent callers via Mu; the parser writes under Mu, OnDraw reads
 // under Mu.
 type Grid struct {
-	Mu       sync.Mutex
-	Rows     int
-	Cols     int
-	Cells    []Cell // row-major, len = Rows*Cols
-	CursorR  int
-	CursorC  int
-	CurFG    uint32 // packed Color
-	CurBG    uint32
-	CurAttrs uint8
+	Mu            sync.Mutex
+	Rows          int
+	Cols          int
+	Cells         []Cell // row-major, len = Rows*Cols
+	CursorR       int
+	CursorC       int
+	CurFG         uint32 // packed Color
+	CurBG         uint32
+	CurAttrs      uint8
+	CursorVisible  bool // hidden via DEC ?25 l, shown via ?25 h
+	BracketedPaste bool // DEC ?2004 — wrap pasted text in markers
+	saved          savedCursor
+
+	// Scrollback ring of rows that have scrolled off the top. Newest
+	// row is the last element. Cap of 0 disables scrollback (rows are
+	// dropped on scrollUp). ViewOffset > 0 freezes the viewport at
+	// `ViewOffset` rows back from live; OnDraw renders accordingly.
+	Scrollback    [][]Cell
+	ScrollbackCap int
+	ViewOffset    int
+
+	// Selection state in viewport coordinates (not content coordinates):
+	// when ViewOffset changes mid-selection the highlighted cells follow
+	// the viewport, not the underlying text. SelActive == false means no
+	// selection (single-click position pre-drag). Anchor and Head may
+	// appear in any order; helpers normalize.
+	SelAnchor SelPos
+	SelHead   SelPos
+	SelActive bool
+}
+
+// SelPos identifies a viewport cell (row, col).
+type SelPos struct{ Row, Col int }
+
+// selOrder returns the selection bounds in forward order (start <= end).
+func (g *Grid) selOrder() (start, end SelPos) {
+	a, b := g.SelAnchor, g.SelHead
+	if b.Row < a.Row || (b.Row == a.Row && b.Col < a.Col) {
+		a, b = b, a
+	}
+	return a, b
+}
+
+// InSelection reports whether viewport (r, c) is inside the half-open
+// selection [start, end] (inclusive of end). False when SelActive is off.
+func (g *Grid) InSelection(r, c int) bool {
+	if !g.SelActive {
+		return false
+	}
+	s, e := g.selOrder()
+	if r < s.Row || r > e.Row {
+		return false
+	}
+	if r == s.Row && c < s.Col {
+		return false
+	}
+	if r == e.Row && c > e.Col {
+		return false
+	}
+	return true
+}
+
+// SelectedText extracts the selection as a UTF-8 string. Trailing
+// blanks per row are trimmed; row breaks emit '\n' (kitty convention).
+// Returns "" when nothing is selected. Coordinates outside the grid
+// (e.g. stale from a Resize-shrink) are clamped so the per-row cap is
+// never negative.
+func (g *Grid) SelectedText() string {
+	if !g.SelActive || g.Rows <= 0 || g.Cols <= 0 {
+		return ""
+	}
+	s, e := g.selOrder()
+	s.Row, s.Col = clamp(s.Row, 0, g.Rows-1), clamp(s.Col, 0, g.Cols-1)
+	e.Row, e.Col = clamp(e.Row, 0, g.Rows-1), clamp(e.Col, 0, g.Cols-1)
+	if s == e {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow((e.Row-s.Row+1)*g.Cols + (e.Row - s.Row))
+	for r := s.Row; r <= e.Row; r++ {
+		c0, c1 := 0, g.Cols-1
+		if r == s.Row {
+			c0 = s.Col
+		}
+		if r == e.Row {
+			c1 = e.Col
+		}
+		// Find the last non-blank in the row span so trailing spaces
+		// are dropped without a second pass.
+		end := c0 - 1
+		for c := c0; c <= c1; c++ {
+			if g.ViewCellAt(r, c).Ch != ' ' {
+				end = c
+			}
+		}
+		for c := c0; c <= end; c++ {
+			b.WriteRune(g.ViewCellAt(r, c).Ch)
+		}
+		if r < e.Row {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// clamp bounds v to [lo, hi]. lo <= hi assumed.
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// ClearSelection drops any active selection.
+func (g *Grid) ClearSelection() {
+	g.SelActive = false
+	g.SelAnchor = SelPos{}
+	g.SelHead = SelPos{}
 }
 
 // NewGrid allocates a rows×cols grid filled with default cells.
@@ -86,11 +228,12 @@ func NewGrid(rows, cols int) *Grid {
 	rows = clampDim(rows)
 	cols = clampDim(cols)
 	g := &Grid{
-		Rows:  rows,
-		Cols:  cols,
-		Cells: make([]Cell, rows*cols),
-		CurFG: DefaultColor,
-		CurBG: DefaultColor,
+		Rows:          rows,
+		Cols:          cols,
+		Cells:         make([]Cell, rows*cols),
+		CurFG:         DefaultColor,
+		CurBG:         DefaultColor,
+		CursorVisible: true,
 	}
 	for i := range g.Cells {
 		g.Cells[i] = defaultCell()
@@ -100,7 +243,9 @@ func NewGrid(rows, cols int) *Grid {
 
 // Resize reflows to new dims, copying the intersecting region from the
 // top-left corner. New space is filled with default cells. Cursor is
-// clamped.
+// clamped. Scrollback rows are reflowed to the new column width
+// (truncated when narrower, padded with default cells when wider) so
+// ViewCellAt does not need to special-case stale row widths.
 func (g *Grid) Resize(rows, cols int) {
 	rows = clampDim(rows)
 	cols = clampDim(cols)
@@ -116,6 +261,25 @@ func (g *Grid) Resize(rows, cols int) {
 	for r := range rcopy {
 		copy(next[r*cols:r*cols+ccopy], g.Cells[r*g.Cols:r*g.Cols+ccopy])
 	}
+	if cols != g.Cols {
+		for i, row := range g.Scrollback {
+			switch {
+			case len(row) == cols:
+				// no change
+			case len(row) > cols:
+				// Shrink in place; backing array is retained and the
+				// suffix simply becomes unreachable.
+				g.Scrollback[i] = row[:cols]
+			default:
+				old := len(row)
+				row = append(row, make([]Cell, cols-old)...)
+				for j := old; j < cols; j++ {
+					row[j] = defaultCell()
+				}
+				g.Scrollback[i] = row
+			}
+		}
+	}
 	g.Rows = rows
 	g.Cols = cols
 	g.Cells = next
@@ -125,6 +289,10 @@ func (g *Grid) Resize(rows, cols int) {
 	if g.CursorC >= cols {
 		g.CursorC = cols - 1
 	}
+	// Selection coordinates were viewport-relative; the viewport
+	// dimensions just changed, so the highlight no longer maps to the
+	// content the user grabbed. Drop it rather than try to reflow.
+	g.ClearSelection()
 }
 
 // At returns a pointer to the cell at (r,c) or nil if out of range.
@@ -262,11 +430,104 @@ func (g *Grid) EraseInDisplay(mode int) {
 	}
 }
 
-// scrollUp drops the top row and clears the bottom.
+// SaveCursor snapshots cursor position and SGR state. Implements
+// DECSC (ESC 7) and CSI s. Subsequent SaveCursor calls overwrite.
+func (g *Grid) SaveCursor() {
+	g.saved = savedCursor{
+		r:     g.CursorR,
+		c:     g.CursorC,
+		fg:    g.CurFG,
+		bg:    g.CurBG,
+		attrs: g.CurAttrs,
+		valid: true,
+	}
+}
+
+// RestoreCursor restores the snapshot from SaveCursor. If no save has
+// occurred, homes the cursor and resets SGR per VT100 spec.
+func (g *Grid) RestoreCursor() {
+	if !g.saved.valid {
+		g.MoveCursor(0, 0)
+		g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+		return
+	}
+	g.MoveCursor(g.saved.r, g.saved.c)
+	g.CurFG = g.saved.fg
+	g.CurBG = g.saved.bg
+	g.CurAttrs = g.saved.attrs
+}
+
+// scrollUp drops the top row and clears the bottom. When ScrollbackCap
+// > 0 the dropped row is pushed to the scrollback ring; the ring is
+// trimmed by removing oldest entries once it exceeds the cap.
 func (g *Grid) scrollUp() {
+	if g.ScrollbackCap > 0 {
+		row := make([]Cell, g.Cols)
+		copy(row, g.Cells[:g.Cols])
+		g.Scrollback = append(g.Scrollback, row)
+		if extra := len(g.Scrollback) - g.ScrollbackCap; extra > 0 {
+			// Drop oldest entries; reslice rather than copy to keep
+			// the operation amortized O(1) when cap is reached.
+			g.Scrollback = g.Scrollback[extra:]
+		}
+	}
 	copy(g.Cells, g.Cells[g.Cols:])
 	last := g.Cells[(g.Rows-1)*g.Cols:]
 	for i := range last {
 		last[i] = defaultCell()
 	}
+}
+
+// ScrollView shifts the viewport by `delta` rows: positive = back into
+// scrollback (toward older content), negative = forward (toward live).
+// Result clamped to [0, len(Scrollback)]. Saturating add: a delta near
+// math.MinInt/MaxInt (e.g. derived from NaN/Inf wheel deltas) would
+// overflow ViewOffset+delta before clamp, so detect the wrap.
+func (g *Grid) ScrollView(delta int) {
+	max := len(g.Scrollback)
+	switch {
+	case delta > 0 && g.ViewOffset > max-delta:
+		g.ViewOffset = max
+	case delta < 0 && g.ViewOffset < -delta:
+		g.ViewOffset = 0
+	default:
+		g.ViewOffset = clampViewOffset(g.ViewOffset+delta, max)
+	}
+}
+
+// ResetView snaps the viewport back to the live grid.
+func (g *Grid) ResetView() { g.ViewOffset = 0 }
+
+// ScrollViewTop moves the viewport to the oldest scrollback row.
+func (g *Grid) ScrollViewTop() { g.ViewOffset = len(g.Scrollback) }
+
+// clampViewOffset bounds off to [0, max].
+func clampViewOffset(off, max int) int {
+	if off < 0 {
+		return 0
+	}
+	if off > max {
+		return max
+	}
+	return off
+}
+
+// ViewCellAt returns the cell visible at viewport position (r, c)
+// honoring ViewOffset. When the viewport row falls inside scrollback,
+// that row's stored cells are returned. Outside-range coords yield a
+// default cell (never panics). Resize keeps scrollback row widths in
+// sync with Cols, so no per-row width clamp is needed here.
+func (g *Grid) ViewCellAt(r, c int) Cell {
+	if r < 0 || r >= g.Rows || c < 0 || c >= g.Cols {
+		return defaultCell()
+	}
+	off := clampViewOffset(g.ViewOffset, len(g.Scrollback))
+	if off == 0 {
+		return g.Cells[r*g.Cols+c]
+	}
+	n := min(off, g.Rows)
+	if r < n {
+		return g.Scrollback[len(g.Scrollback)-off+r][c]
+	}
+	return g.Cells[(r-n)*g.Cols+c]
 }

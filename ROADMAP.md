@@ -84,15 +84,15 @@ printf '\x1b[38;5;82mGREEN256\x1b[0m\n'
 use `\x1b[?25l` to hide the cursor during redraws — without it,
 flicker.
 
-- [ ] `grid.go`: `SaveCursor()`, `RestoreCursor()` storing
+- [x] `grid.go`: `SaveCursor()`, `RestoreCursor()` storing
       `(CursorR, CursorC, CurFG, CurBG, CurAttrs)` in a `savedCursor`
       field. Add `CursorVisible bool` (default true).
-- [ ] `parser.go::dispatchCSI`: add `s` (save), `u` (restore). Add
+- [x] `parser.go::dispatchCSI`: add `s` (save), `u` (restore). Add
       ESC 7 / ESC 8 in `Feed` ESC dispatch. Add DEC private mode
       `?25 h/l`.
-- [ ] `widget.go::onDraw`: skip cursor block when
+- [x] `widget.go::onDraw`: skip cursor block when
       `g.CursorVisible == false`.
-- [ ] Tests for save/restore round-trip and `?25` toggling.
+- [x] Tests for save/restore round-trip and `?25` toggling.
 
 **Demo test:** `tput civis` then `tput cnorm`; press Ctrl+L while in
 shell.
@@ -104,20 +104,20 @@ shell.
 **Why:** without scrollback the terminal feels broken. Highest UX
 impact for the size of change.
 
-- [ ] `Cfg.ScrollbackRows int` (default 5000) plumbed into `New`.
-- [ ] `grid.go`: `Scrollback [][]Cell` with cap from Cfg. `scrollUp()`
+- [x] `Cfg.ScrollbackRows int` (default 5000) plumbed into `New`.
+- [x] `grid.go`: `Scrollback [][]Cell` with cap from Cfg. `scrollUp()`
       pushes the dropped top row, trims to cap. Add `ViewOffset int`
       and `ScrollView(delta int)` (clamped).
-- [ ] `widget.go::onDraw`: when `g.ViewOffset > 0`, render top
+- [x] `widget.go::onDraw`: when `g.ViewOffset > 0`, render top
       `min(rows, ViewOffset)` rows from scrollback (newest-last), then
       the rest from live cells. Hide cursor while offset > 0.
-- [ ] `widget.go`: `OnMouseScroll` handler → `g.ScrollView(±N)` +
+- [x] `widget.go`: `OnMouseScroll` handler → `g.ScrollView(±N)` +
       `win.QueueCommand` redraw. Reset `ViewOffset` to 0 on any
       keystroke that isn't a scrolling key.
-- [ ] `widget.go::onKeyDown`: PgUp/PgDn → `ScrollView(±rows-1)`,
+- [x] `widget.go::onKeyDown`: PgUp/PgDn → `ScrollView(±rows-1)`,
       Shift+Home/End → top/bottom of scrollback. Without Shift,
       behavior unchanged.
-- [ ] Tests: scrollback fill + trim + view-offset clamp.
+- [x] Tests: scrollback fill + trim + view-offset clamp.
 
 **Demo test:**
 ```
@@ -133,24 +133,24 @@ Scroll wheel up. PgUp/PgDn. Type a key — view snaps back.
 (window.go:464) and `OnClick`/`OnMouseMove` via `DrawCanvasCfg`.
 Decision: left-drag select + Cmd/Ctrl+C copy. No middle-click PRIMARY.
 
-- [ ] `grid.go`: selection state `SelStart, SelEnd struct{ Row, Col
+- [x] `grid.go`: selection state `SelStart, SelEnd struct{ Row, Col
       int }; SelActive bool`. `SelectedText() string` walks rows,
       newline at row boundaries, trim trailing blanks per row (kitty
       convention).
-- [ ] `widget.go`: `OnClick` (left, no mods) sets
+- [x] `widget.go`: `OnClick` (left, no mods) sets
       `SelStart=SelEnd=cell-at-pos`, `SelActive=false`.
-- [ ] `widget.go`: `OnMouseMove` while button down → update `SelEnd`,
+- [x] `widget.go`: `OnMouseMove` while button down → update `SelEnd`,
       `SelActive=true`.
-- [ ] `widget.go`: click release → if `SelActive`,
+- [x] `widget.go`: click release → if `SelActive`,
       `win.SetClipboard(g.SelectedText())`.
-- [ ] `widget.go::onDraw`: when cell is in selection, swap fg/bg
+- [x] `widget.go::onDraw`: when cell is in selection, swap fg/bg
       (inverse) before paint.
-- [ ] Helper `posToCell(x, y float32) (row, col int)` using
+- [x] Helper `posToCell(x, y float32) (row, col int)` using
       `cellW/cellH`.
-- [ ] `onKeyDown`: Cmd+C / Ctrl+Shift+C → copy current selection.
+- [x] `onKeyDown`: Cmd+C / Ctrl+Shift+C → copy current selection.
       Suppress propagation only when selection non-empty (Ctrl+C
       still SIGINTs the child otherwise).
-- [ ] Tests for `SelectedText` row/column ranges and trailing-blank
+- [x] Tests for `SelectedText` row/column ranges and trailing-blank
       trimming.
 
 **Demo test:** drag-select `pwd` output; paste in another app.
@@ -162,13 +162,13 @@ Decision: left-drag select + Cmd/Ctrl+C copy. No middle-click PRIMARY.
 **Why:** depends on Phase 4 for clipboard plumbing. Bracketed paste
 (DECSET 2004) prevents shell auto-execution of pasted newlines.
 
-- [ ] `parser.go`: track `BracketedPaste bool`; handle `?2004 h/l`
+- [x] `parser.go`: track `BracketedPaste bool`; handle `?2004 h/l`
       DEC private mode.
-- [ ] `widget.go`: Cmd+V / Ctrl+Shift+V in `onKeyDown` →
+- [x] `widget.go`: Cmd+V / Ctrl+Shift+V in `onKeyDown` →
       `s := win.GetClipboard()`; if `parser.BracketedPaste`, write
       `\x1b[200~` + s + `\x1b[201~` to PTY, else write raw.
-- [ ] Strip embedded `\x1b[201~` markers from `s` first (security).
-- [ ] Tests for marker stripping and toggle behavior.
+- [x] Strip embedded `\x1b[201~` markers from `s` first (security).
+- [x] Tests for marker stripping and toggle behavior.
 
 **Demo test:** copy a multi-line block, paste at zsh/bash prompt — no
 auto-execute.

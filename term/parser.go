@@ -25,13 +25,14 @@ const maxCSIParamValue = 1 << 20
 // truecolor (38/48 ;2;r;g;b) forms. All other escape sequences are
 // silently consumed so they don't print as garbage.
 type Parser struct {
-	g      *Grid
-	state  parserState
-	params []int   // SGR params accumulated in current CSI
-	curP   int     // value being accumulated
-	hasP   bool    // any digit seen for curP
-	utf    [4]byte // UTF-8 carry-over between Feed calls
-	utfLen int
+	g       *Grid
+	state   parserState
+	params  []int   // SGR params accumulated in current CSI
+	curP    int     // value being accumulated
+	hasP    bool    // any digit seen for curP
+	private bool    // DEC private mode: `?` prefix seen in current CSI
+	utf     [4]byte // UTF-8 carry-over between Feed calls
+	utfLen  int
 }
 
 // NewParser binds a parser to a grid. Callers must hold g.Mu while calling
@@ -93,6 +94,13 @@ func (p *Parser) Feed(b []byte) {
 				p.params = p.params[:0]
 				p.curP = 0
 				p.hasP = false
+				p.private = false
+			case '7': // DECSC — save cursor + SGR
+				p.g.SaveCursor()
+				p.state = stGround
+			case '8': // DECRC — restore cursor + SGR
+				p.g.RestoreCursor()
+				p.state = stGround
 			default:
 				// 2-byte ESC sequences: ignore.
 				p.state = stGround
@@ -100,6 +108,8 @@ func (p *Parser) Feed(b []byte) {
 			i++
 		case stCSI:
 			switch {
+			case c == '?' && !p.hasP && len(p.params) == 0:
+				p.private = true
 			case c >= '0' && c <= '9':
 				p.curP = p.curP*10 + int(c-'0')
 				if p.curP > maxCSIParamValue {
@@ -120,6 +130,7 @@ func (p *Parser) Feed(b []byte) {
 				p.state = stGround
 				p.curP = 0
 				p.hasP = false
+				p.private = false
 			default:
 				// Intermediate or unsupported byte — keep going.
 			}
@@ -129,9 +140,22 @@ func (p *Parser) Feed(b []byte) {
 }
 
 func (p *Parser) dispatchCSI(final byte) {
+	if p.private {
+		switch final {
+		case 'h':
+			p.applyDECMode(true)
+		case 'l':
+			p.applyDECMode(false)
+		}
+		return
+	}
 	switch final {
 	case 'm':
 		p.applySGR()
+	case 's':
+		p.g.SaveCursor()
+	case 'u':
+		p.g.RestoreCursor()
 	case 'A':
 		p.g.CursorUp(p.param(0, 1))
 	case 'B', 'e':
@@ -157,6 +181,20 @@ func (p *Parser) dispatchCSI(final byte) {
 	default:
 		// Unknown CSI — drop. Includes scroll regions, mode set/reset,
 		// device status, etc.
+	}
+}
+
+// applyDECMode handles DEC private mode set/reset (CSI ? Pn h / l).
+// Only the modes the widget honors are wired; unknown modes are
+// silently dropped so apps that probe many modes don't break.
+func (p *Parser) applyDECMode(set bool) {
+	for _, n := range p.params {
+		switch n {
+		case 25: // DECTCEM — text cursor enable
+			p.g.CursorVisible = set
+		case 2004: // bracketed paste mode
+			p.g.BracketedPaste = set
+		}
 	}
 }
 
