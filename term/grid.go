@@ -39,6 +39,9 @@ const (
 	AttrBold uint8 = 1 << iota
 	AttrUnderline
 	AttrInverse
+	AttrDim
+	AttrItalic
+	AttrStrikethrough
 )
 
 // CursorShape selects the cursor glyph: filled block, baseline

@@ -305,7 +305,7 @@ Depends on Phase 4 mouse wiring.
 - [x] Suppress mouse reports while `ViewOffset > 0` (scrollback
       view) — `mouseSnap.live` gate.
 - [x] Motion dedupe by cell so a still pointer under ?1003 doesn't
-      flood the PTY.
+      flood the PTY with identical coordinates each frame.
 - [x] Tests: `TestParser_MouseModes_Toggle`,
       `TestParser_MouseReporting_Aggregate`,
       `TestEncodeMouseSGR_Press`, `TestEncodeMouseSGR_Release`,
@@ -385,6 +385,126 @@ wide chars.
 
 ---
 
+## Phase 12 — Advanced Text Attributes (Italic, Dim, Strikethrough)
+
+**Why:** Standard in modern terminals. Dim and Italic are often used
+by syntax highlighters; Strikethrough by task managers.
+
+- [x] `grid.go`: Add `AttrDim`, `AttrItalic`, `AttrStrikethrough` to
+      `Cell.Attrs` bitset.
+- [x] `parser.go::applySGR`: Handle SGR 2 (Dim), 3 (Italic),
+      9 (Strikethrough) and their resets (22, 23, 29).
+- [x] `widget.go::onDraw`: Update `style()` to honor new attributes.
+      Draw strikethrough lines (manually via `dc.FilledRect` or
+      `TextStyle` if supported).
+- [x] Tests: SGR roundtrip for new attributes; verification of correct
+      bitmasking.
+
+**Demo test:**
+```
+printf '\x1b[3mITALIC\x1b[0m \x1b[2mDIM\x1b[0m \x1b[9mSTRIKE\x1b[0m\n'
+```
+
+---
+
+## Phase 13 — Logical Line Wrapping (Reflow)
+
+**Why:** Crucial for resizing. Simple cropping/padding feels broken.
+Modern terminals reflow text based on logical line boundaries.
+
+- [ ] `grid.go`: Add `Wrapped bool` to `Cell` or a per-row flag.
+      Set `Wrapped=true` in `Put` when an AutoWrap occurs.
+- [ ] `grid.go`: Rewrite `Resize` to perform a logical reflow. Walk
+      the buffer and scrollback, joining rows marked `Wrapped` and
+      re-wrapping to the new width.
+- [ ] `grid.go`: Update cursor positioning to follow the reflowed
+      content.
+- [ ] Tests: Growing and shrinking width with multi-line wrapped
+      output; verification that `ls` columns vs `cat` text reflow
+      differently (based on explicit newlines).
+
+**Demo test:** `cat` a long paragraph, narrow the window, then
+widen it. Text should flow like a responsive webpage.
+
+---
+
+## Phase 14 — OSC 52 (Clipboard) & OSC 8 (Hyperlinks)
+
+**Why:** standard way for remote/embedded apps to interact with the
+host. Hyperlinks are standard in modern CLIs.
+
+- [ ] `parser.go`: Handle OSC 52 (Base64 clipboard) and OSC 8 (URL).
+- [ ] `grid.go`: `Cell` needs to track hyperlink association. Use a
+      sidecar map `map[uint32]string` to store URLs, keyed by a
+      compact `LinkID` in the `Cell`.
+- [ ] `widget.go`: `onDraw` highlights active links on hover.
+      `onClick` opens URLs via OS default handler.
+- [ ] `widget.go`: OSC 52 integration with `win.SetClipboard` and
+      `win.GetClipboard` (with security prompts).
+- [ ] Tests: Base64 decoding, URL stashing/clearing, and hyperlink
+      hit-detection logic.
+
+**Demo test:** `ls --hyperlink=always` (on Linux) or a custom script
+emitting OSC 8.
+
+---
+
+## Phase 15 — Search in Scrollback
+
+**Why:** Finding specific output in a large history is critical for
+productivity.
+
+- [ ] `grid.go`: Add `Find(query string, start Pos, forward bool)`
+      helper to walk cells and scrollback.
+- [ ] `widget.go`: Add `SearchQuery` state and a basic search UI
+      (e.g., triggered by Cmd+F).
+- [ ] `widget.go::onDraw`: Highlight all occurrences of `SearchQuery`
+      in the visible viewport.
+- [ ] `onKeyDown`: Enter/Shift+Enter to jump to next/prev match.
+- [ ] Tests: Multi-row matches, case-insensitive search, and wrapping
+      search.
+
+**Demo test:** Cmd+F, type "error", matches are highlighted.
+
+---
+
+## Phase 16 — Performance: Coalesced Text & Caching
+
+**Why:** Large windows at high DPI can be slow if we `dc.Text` every
+cell.
+
+- [ ] `widget.go::onDraw`: Coalesce runs of cells with identical
+      SGR/Attrs/Links into single `dc.Text` calls.
+- [ ] `widget.go`: Enable `DrawCanvas(ID, Version)` to leverage
+      `go-gui`'s internal tessellation/render cache. Increment
+      `Version` only when the grid actually changes.
+- [ ] Profile and optimize `resolveCell`, `fg()`, and `bg()` hot paths.
+- [ ] Tests: Performance benchmark for full-screen redraws.
+
+**Demo test:** `cat` a large file in a maximized window; verify
+smooth scrolling.
+
+---
+
+## Phase 17 — Persistent Selection
+
+**Why:** selection should stick to the content, not the viewport
+pixels, so it survives scrolling and resizing.
+
+- [ ] `grid.go`: Move `SelAnchor` and `SelHead` from viewport-relative
+      coordinates to content-relative (Row = scrollback index or
+      live row index).
+- [ ] `grid.go`: Update `InSelection` and `SelectedText` to walk
+      content rows.
+- [ ] `grid.go`: Update `Resize` (Phase 13) to reflow selection
+      bounds along with the text.
+- [ ] Tests: Select text, scroll, verify highlight stays with text;
+      select text, resize, verify selection remains correct.
+
+**Demo test:** select a word, scroll up, word stays highlighted.
+
+---
+
 ## Critical files
 
 All edits stay in:
@@ -430,9 +550,6 @@ phase's surface into `term/<feature>.go` (e.g. `term/scrollback.go`).
 Per CLAUDE.md "Out-of-scope" list, defer:
 - Sixel / kitty graphics protocol
 - IME / dead keys
-- OSC 52 clipboard (security; selection copy in Phase 4 covers UX)
-- OSC 8 hyperlinks
-- Windows / ConPTY
 - GPU-accelerated rendering
 
 ## Resolved decisions

@@ -9,6 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/mike-ward/go-glyph"
 	"github.com/mike-ward/go-gui/gui"
 )
 
@@ -512,7 +513,23 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			}
 			cs := style
 			cs.Color = fg(cell)
-			cs.Underline = cell.Attrs&AttrUnderline != 0
+			if cell.Attrs != 0 {
+				if cell.Attrs&AttrDim != 0 {
+					col := cs.Color
+					cs.Color = gui.RGB(col.R/2, col.G/2, col.B/2)
+				}
+				bold, italic := cell.Attrs&AttrBold != 0, cell.Attrs&AttrItalic != 0
+				switch {
+				case bold && italic:
+					cs.Typeface = glyph.TypefaceBoldItalic
+				case bold:
+					cs.Typeface = glyph.TypefaceBold
+				case italic:
+					cs.Typeface = glyph.TypefaceItalic
+				}
+				cs.Underline = cell.Attrs&AttrUnderline != 0
+				cs.Strikethrough = cell.Attrs&AttrStrikethrough != 0
+			}
 			dc.Text(float32(c)*t.cellW, float32(r)*t.cellH,
 				runeString(cell.Ch), cs)
 		}

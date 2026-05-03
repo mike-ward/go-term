@@ -1143,3 +1143,54 @@ func TestParser_CursorSaveRestore_PreservesAutoWrapOriginInsert(t *testing.T) {
 	}
 }
 
+func TestParser_SGR_NewAttrs_Set(t *testing.T) {
+	tests := []struct {
+		name string
+		seq  string
+		want uint8
+	}{
+		{"dim", "\x1b[2m", AttrDim},
+		{"italic", "\x1b[3m", AttrItalic},
+		{"strikethrough", "\x1b[9m", AttrStrikethrough},
+		{"bold+dim", "\x1b[1m\x1b[2m", AttrBold | AttrDim},
+		{"bold+italic", "\x1b[1m\x1b[3m", AttrBold | AttrItalic},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, p := newParserGrid(1, 1)
+			feed(t, g, p, []byte(tt.seq))
+			if g.CurAttrs&tt.want != tt.want {
+				t.Errorf("attrs=%08b want %08b set", g.CurAttrs, tt.want)
+			}
+		})
+	}
+}
+
+func TestParser_SGR_NewAttrs_Clear(t *testing.T) {
+	tests := []struct {
+		name     string
+		setSeq   string
+		clearSeq string
+		bits     uint8
+	}{
+		{"dim via 22", "\x1b[2m", "\x1b[22m", AttrDim},
+		{"bold+dim via 22", "\x1b[1m\x1b[2m", "\x1b[22m", AttrBold | AttrDim},
+		{"italic via 23", "\x1b[3m", "\x1b[23m", AttrItalic},
+		{"strikethrough via 29", "\x1b[9m", "\x1b[29m", AttrStrikethrough},
+		{"all via SGR 0", "\x1b[1m\x1b[2m\x1b[3m\x1b[9m", "\x1b[0m", AttrBold | AttrDim | AttrItalic | AttrStrikethrough},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g, p := newParserGrid(1, 1)
+			feed(t, g, p, []byte(tt.setSeq))
+			if g.CurAttrs&tt.bits != tt.bits {
+				t.Errorf("after set: attrs=%08b want %08b set", g.CurAttrs, tt.bits)
+			}
+			feed(t, g, p, []byte(tt.clearSeq))
+			if g.CurAttrs&tt.bits != 0 {
+				t.Errorf("after clear: attrs=%08b want %08b clear", g.CurAttrs, tt.bits)
+			}
+		})
+	}
+}
+

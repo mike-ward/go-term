@@ -800,16 +800,26 @@ func (p *Parser) applySGR() {
 			g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
 		case n == 1:
 			g.CurAttrs |= AttrBold
+		case n == 2:
+			g.CurAttrs |= AttrDim
+		case n == 3:
+			g.CurAttrs |= AttrItalic
 		case n == 4:
 			g.CurAttrs |= AttrUnderline
 		case n == 7:
 			g.CurAttrs |= AttrInverse
+		case n == 9:
+			g.CurAttrs |= AttrStrikethrough
 		case n == 22:
-			g.CurAttrs &^= AttrBold
+			g.CurAttrs &^= AttrBold | AttrDim
+		case n == 23:
+			g.CurAttrs &^= AttrItalic
 		case n == 24:
 			g.CurAttrs &^= AttrUnderline
 		case n == 27:
 			g.CurAttrs &^= AttrInverse
+		case n == 29:
+			g.CurAttrs &^= AttrStrikethrough
 		case n >= 30 && n <= 37:
 			g.CurFG = paletteColor(uint8(n - 30))
 		case n == 39:
