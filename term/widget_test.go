@@ -301,12 +301,12 @@ func TestTerm_WriteBytes_UsesWriteHost(t *testing.T) {
 func TestCursorBlinks_HonorsGridDefault(t *testing.T) {
 	g := NewGrid(1, 5)
 	tm := &Term{grid: g}
-	if !tm.cursorBlinks() {
-		t.Error("default cursor should blink")
-	}
-	g.CursorBlink = false
 	if tm.cursorBlinks() {
-		t.Error("steady cursor should not blink")
+		t.Error("default cursor should be steady")
+	}
+	g.CursorBlink = true
+	if !tm.cursorBlinks() {
+		t.Error("blinking cursor should blink")
 	}
 }
 

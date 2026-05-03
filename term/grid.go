@@ -201,6 +201,7 @@ type savedCursor struct {
 // clobber the main-buffer save).
 type altSavedScreen struct {
 	cells            []Cell
+	rowWrapped       []bool
 	cursorR, cursorC int
 	curFG, curBG     uint32
 	curAttrs         uint8
@@ -236,7 +237,7 @@ type Grid struct {
 	AppKeypad      bool // DECNKM — application keypad mode
 
 	// Cursor shape + blink. Set via DECSCUSR (CSI Ps SP q). Default is
-	// blinking block (Ps=0/1). Embedders can override blink via
+	// a steady block. Embedders can override blink via
 	// Cfg.CursorBlink without overriding shape.
 	CursorShape CursorShape
 	CursorBlink bool
@@ -267,9 +268,17 @@ type Grid struct {
 	// row is the last element. Cap of 0 disables scrollback (rows are
 	// dropped on scrollUp). ViewOffset > 0 freezes the viewport at
 	// `ViewOffset` rows back from live; OnDraw renders accordingly.
-	Scrollback    [][]Cell
-	ScrollbackCap int
-	ViewOffset    int
+	Scrollback       [][]Cell
+	ScrollbackWrapped []bool // parallel to Scrollback; true = row was soft-wrapped
+	ScrollbackCap    int
+	ViewOffset       int
+
+	// RowWrapped[r] is true when row r ended with an autowrap (the cursor
+	// reached the right margin and wrapped onto row r+1). During Resize,
+	// runs of wrapped rows are joined into a logical line and re-wrapped
+	// at the new width. Reset to false whenever a row is filled with blank
+	// cells (erase, insert, scroll).
+	RowWrapped []bool // len = Rows, parallel to live cell buffer
 
 	// Alt-screen state. EnterAlt swaps g.Cells with a fresh blank buffer
 	// and stashes main-screen state in mainSaved; ExitAlt restores it.
@@ -396,12 +405,13 @@ func NewGrid(rows, cols int) *Grid {
 		Rows:          rows,
 		Cols:          cols,
 		Cells:         make([]Cell, rows*cols),
+		RowWrapped:    make([]bool, rows),
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
 		AutoWrap:      true,
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
-		CursorBlink:   true,
+		CursorBlink:   false,
 		Top:           0,
 		Bottom:        rows - 1,
 	}
@@ -431,69 +441,374 @@ func reflowBuffer(src []Cell, oldRows, oldCols, newRows, newCols int) []Cell {
 	return next
 }
 
-// Resize reflows to new dims, copying the intersecting region from the
-// top-left corner. New space is filled with default cells. Cursor is
-// clamped. Scrollback rows are reflowed to the new column width
-// (truncated when narrower, padded with default cells when wider) so
-// ViewCellAt does not need to special-case stale row widths. When alt
-// is active, the saved main buffer is reflowed too so ExitAlt restores
-// to the new dims.
+// physRow is used internally by the logical reflow pipeline.
+// wrapped == true means this row ended with an autowrap and the next
+// row is its soft-wrapped continuation.
+type physRow struct {
+	cells   []Cell
+	wrapped bool
+}
+
+// isDefaultBlank reports whether c is an untouched default blank cell —
+// i.e., no content was ever written to it. Used by logicalReflow to trim
+// trailing padding from the last physical row of a logical line.
+func isDefaultBlank(c Cell) bool {
+	return c.Ch == ' ' && c.FG == DefaultColor && c.BG == DefaultColor &&
+		c.Attrs == 0 && c.Width == 1
+}
+
+// rewrapLine re-wraps a flat slice of cells (the content of one logical
+// line, with continuation cells already stripped) into physical rows of
+// newCols columns. All rows except the last are marked wrapped=true.
+// An empty input produces a single blank row.
+func rewrapLine(cells []Cell, newCols int) []physRow {
+	if len(cells) == 0 {
+		blank := make([]Cell, newCols)
+		for i := range blank {
+			blank[i] = defaultCell()
+		}
+		return []physRow{{cells: blank, wrapped: false}}
+	}
+
+	var rows []physRow
+	cur := make([]Cell, 0, newCols)
+
+	for i := 0; i < len(cells); {
+		c := cells[i]
+		// Skip continuation cells — they are regenerated with their wide head.
+		if c.Width == 0 && c.Ch == 0 {
+			i++
+			continue
+		}
+		w := 1
+		if c.Width == 2 {
+			w = 2
+		}
+		// Would this glyph overflow the current row?
+		if len(cur)+w > newCols {
+			// Pad to full width and flush as a wrapped row.
+			for len(cur) < newCols {
+				cur = append(cur, defaultCell())
+			}
+			rows = append(rows, physRow{cells: cur, wrapped: true})
+			cur = make([]Cell, 0, newCols)
+		}
+		cur = append(cur, c)
+		if w == 2 {
+			// Re-emit continuation cell.
+			cur = append(cur, Cell{Ch: 0, FG: c.FG, BG: c.BG, Attrs: c.Attrs, Width: 0})
+		}
+		i++
+	}
+
+	// Final (or only) row — not wrapped.
+	for len(cur) < newCols {
+		cur = append(cur, defaultCell())
+	}
+	rows = append(rows, physRow{cells: cur, wrapped: false})
+	return rows
+}
+
+// logicalReflow joins soft-wrapped physical rows into logical lines,
+// re-wraps them at newCols, and returns the new cell buffer, wrap flags,
+// scrollback, and cursor position. Hard newlines (wrapped==false) are
+// never joined across.
+//
+// Parameters:
+//   - cells/rowWrapped: live cell buffer and per-row wrap flags (oldRows×oldCols)
+//   - scrollback/sbWrapped: scrollback ring and its wrap flags
+//   - oldRows, oldCols: current grid dims
+//   - newRows, newCols: target dims
+//   - cursorR, cursorC: cursor in the live buffer
+//   - scrollbackCap: maximum scrollback rows (0 = unlimited trim handled by caller)
+func logicalReflow(
+	cells []Cell, rowWrapped []bool,
+	scrollback [][]Cell, sbWrapped []bool,
+	oldRows, oldCols, newRows, newCols int,
+	cursorR, cursorC int,
+	scrollbackCap int,
+) (newCells []Cell, newRowWrapped []bool, newScrollback [][]Cell, newSbWrapped []bool, newCursorR, newCursorC int) {
+
+	// --- Build flat physical-row list (scrollback + live) ---
+	nSB := len(scrollback)
+	total := nSB + oldRows
+	phys := make([]physRow, total)
+	for i, row := range scrollback {
+		w := false
+		if i < len(sbWrapped) {
+			w = sbWrapped[i]
+		}
+		phys[i] = physRow{cells: row, wrapped: w}
+	}
+	for r := 0; r < oldRows; r++ {
+		row := make([]Cell, oldCols)
+		copy(row, cells[r*oldCols:(r+1)*oldCols])
+		w := false
+		if r < len(rowWrapped) {
+			w = rowWrapped[r]
+		}
+		phys[nSB+r] = physRow{cells: row, wrapped: w}
+	}
+
+	cursorPhys := nSB + cursorR // cursor's index in phys[]
+
+	// --- Identify logical lines and the one containing the cursor ---
+	type logLine struct {
+		start, end int // inclusive indices into phys[]
+	}
+	var lines []logLine
+	lineStart := 0
+	cursorLineIdx := 0
+	cursorLineFound := false
+	for i, pr := range phys {
+		if !pr.wrapped {
+			ll := logLine{lineStart, i}
+			if !cursorLineFound && cursorPhys >= lineStart && cursorPhys <= i {
+				cursorLineIdx = len(lines)
+				cursorLineFound = true
+			}
+			lines = append(lines, ll)
+			lineStart = i + 1
+		}
+	}
+	// Unclosed line at the end (shouldn't happen — last live row wrapped==false,
+	// but guard defensively).
+	if lineStart < len(phys) {
+		if !cursorLineFound && cursorPhys >= lineStart {
+			cursorLineIdx = len(lines)
+			cursorLineFound = true
+		}
+		lines = append(lines, logLine{lineStart, len(phys) - 1})
+	}
+	if !cursorLineFound && len(lines) > 0 {
+		cursorLineIdx = len(lines) - 1
+	}
+
+	// Cursor's display-column offset within its logical line.
+	// Each preceding wrapped physical row contributes oldCols columns.
+	// A pending-wrap cursor sits one column past the right margin after a
+	// glyph was written in the last cell; keep it anchored to that last
+	// cell instead of treating it as content beyond the row.
+	var cursorLogCol int
+	if len(lines) > 0 && cursorLineIdx < len(lines) {
+		ll := lines[cursorLineIdx]
+		effectiveCursorC := cursorC
+		if effectiveCursorC >= oldCols {
+			effectiveCursorC = oldCols - 1
+		}
+		if effectiveCursorC < 0 {
+			effectiveCursorC = 0
+		}
+		cursorLogCol = (cursorPhys-ll.start)*oldCols + effectiveCursorC
+	}
+
+	// --- Re-wrap all logical lines ---
+	var allNew []physRow
+	cursorNewPhysStart := 0 // index into allNew where cursor's logical line starts
+	var cursorLineRewrapped []physRow
+
+	for li, ll := range lines {
+		// Collect cells for this logical line. Trim trailing default
+		// blanks from the last physical row to avoid padding from creating
+		// spurious extra physical rows after re-wrap. Only preserve cells
+		// up to and including the cursor column when the cursor is within
+		// the row bounds (cursorC < len(row)). When cursorC >= len(row)
+		// (pending-wrap state past the right margin), don't preserve blanks
+		// — the cursor position will be clamped to the rewrapped line's end.
+		var lineCells []Cell
+		for pi := ll.start; pi <= ll.end; pi++ {
+			row := phys[pi].cells
+			trimTo := len(row)
+			if pi < ll.end && phys[pi].wrapped {
+				// Wide-char autowrap pads the final column blank before the
+				// glyph is emitted at column 0 of the next row. Drop that
+				// synthetic padding so logical reflow rejoins the glyph.
+				next := phys[pi+1].cells
+				if len(next) > 0 && next[0].Width == 2 {
+					for trimTo > 0 && isDefaultBlank(row[trimTo-1]) {
+						trimTo--
+					}
+				}
+			}
+			if pi == ll.end {
+				for trimTo > 0 && isDefaultBlank(row[trimTo-1]) {
+					trimTo--
+				}
+				// Preserve cells for cursor only when it is within the row.
+				if pi == cursorPhys && cursorC < len(row) && cursorC+1 > trimTo {
+					trimTo = cursorC + 1
+				}
+			}
+			lineCells = append(lineCells, row[:trimTo]...)
+		}
+
+		rewrapped := rewrapLine(lineCells, newCols)
+		if li == cursorLineIdx {
+			cursorNewPhysStart = len(allNew)
+			cursorLineRewrapped = rewrapped
+		}
+		allNew = append(allNew, rewrapped...)
+	}
+
+	// --- Cursor position in new layout ---
+	// Clamp cursorLogCol to within the actual rewrapped content of the cursor
+	// line so out-of-bounds column positions (e.g. pending-wrap state where
+	// cursorC == oldCols) don't produce a newCursorPhys past the line's end.
+	rowOffset := 0
+	colOffset := 0
+	if newCols > 0 && len(cursorLineRewrapped) > 0 {
+		maxLogCol := len(cursorLineRewrapped)*newCols - 1
+		if maxLogCol < 0 {
+			maxLogCol = 0
+		}
+		effective := cursorLogCol
+		if effective > maxLogCol {
+			effective = maxLogCol
+		}
+		rowOffset = effective / newCols
+		colOffset = effective % newCols
+		if rowOffset >= len(cursorLineRewrapped) {
+			rowOffset = len(cursorLineRewrapped) - 1
+		}
+	}
+	newCursorPhys := cursorNewPhysStart + rowOffset
+
+	// --- Split into scrollback + live ---
+	// Anchor the live buffer so the cursor ends up near the bottom of the
+	// screen (at row newRows-1). This keeps content visible instead of
+	// pushing it into scrollback when the cursor is near the top of the
+	// old screen. Clamp to [0, len(allNew)-newRows] so we never read
+	// past the end of allNew.
+	maxStart := len(allNew) - newRows
+	if maxStart < 0 {
+		maxStart = 0
+	}
+	liveStart := newCursorPhys - (newRows - 1)
+	if liveStart > maxStart {
+		liveStart = maxStart
+	}
+	if liveStart < 0 {
+		liveStart = 0
+	}
+
+	// Scrollback = allNew[0..liveStart-1]
+	newScrollback = make([][]Cell, 0, liveStart)
+	newSbWrapped = make([]bool, 0, liveStart)
+	for _, pr := range allNew[:liveStart] {
+		newScrollback = append(newScrollback, pr.cells)
+		newSbWrapped = append(newSbWrapped, pr.wrapped)
+	}
+	if scrollbackCap > 0 && len(newScrollback) > scrollbackCap {
+		trim := len(newScrollback) - scrollbackCap
+		newScrollback = newScrollback[trim:]
+		newSbWrapped = newSbWrapped[trim:]
+	}
+
+	// Live buffer = allNew[liveStart..end]
+	newCells = make([]Cell, newRows*newCols)
+	for i := range newCells {
+		newCells[i] = defaultCell()
+	}
+	newRowWrapped = make([]bool, newRows)
+	liveRows := allNew[liveStart:]
+	for r, pr := range liveRows {
+		if r >= newRows {
+			break
+		}
+		copy(newCells[r*newCols:(r+1)*newCols], pr.cells)
+		newRowWrapped[r] = pr.wrapped
+	}
+
+	// Cursor row in the live buffer.
+	newCursorR = newCursorPhys - liveStart
+	newCursorC = colOffset
+	if newCursorR < 0 {
+		newCursorR = 0
+	}
+	if newCursorR >= newRows {
+		newCursorR = newRows - 1
+	}
+	if newCursorC < 0 {
+		newCursorC = 0
+	}
+	if newCursorC >= newCols {
+		newCursorC = newCols - 1
+	}
+	return
+}
+
+// Resize reflows to new dims using logical line wrapping. Rows that ended
+// with an autowrap (RowWrapped[r]==true) are joined with their successor
+// into a single logical line and re-wrapped at the new column width, so
+// terminal output reflowed like a modern terminal instead of cropping.
+// Cursor position is tracked through the reflow. Rows separated by an
+// explicit newline (RowWrapped[r]==false) are never joined.
+//
+// When alt-screen is active the alt buffer is reflowed with simple
+// crop/pad (full-screen apps control every cell), while the saved main
+// buffer receives logical reflow.
+//
+// The scroll region is reset after resize; apps re-issue DECSTBM after
+// SIGWINCH. Selection is dropped. ViewOffset is reset to the live view.
 func (g *Grid) Resize(rows, cols int) {
 	rows = clampDim(rows)
 	cols = clampDim(cols)
 	if rows == g.Rows && cols == g.Cols {
 		return
 	}
-	next := reflowBuffer(g.Cells, g.Rows, g.Cols, rows, cols)
-	if g.AltActive && len(g.mainSaved.cells) == g.Rows*g.Cols {
-		g.mainSaved.cells = reflowBuffer(
-			g.mainSaved.cells, g.Rows, g.Cols, rows, cols,
-		)
-		if g.mainSaved.cursorR >= rows {
-			g.mainSaved.cursorR = rows - 1
-		}
-		if g.mainSaved.cursorC >= cols {
-			g.mainSaved.cursorC = cols - 1
-		}
-		g.mainSaved.top = 0
-		g.mainSaved.bottom = rows - 1
-	}
-	if cols != g.Cols {
-		for i, row := range g.Scrollback {
-			switch {
-			case len(row) == cols:
-				// no change
-			case len(row) > cols:
-				// Shrink in place; backing array is retained and the
-				// suffix simply becomes unreachable.
-				g.Scrollback[i] = row[:cols]
-			default:
-				old := len(row)
-				row = append(row, make([]Cell, cols-old)...)
-				for j := old; j < cols; j++ {
-					row[j] = defaultCell()
-				}
-				g.Scrollback[i] = row
+
+	if g.AltActive {
+		// Alt buffer: simple crop/pad reflow (full-screen app controls cells).
+		g.Cells = reflowBuffer(g.Cells, g.Rows, g.Cols, rows, cols)
+		newRW := make([]bool, rows)
+		copy(newRW, g.RowWrapped)
+		g.RowWrapped = newRW
+
+		// Main (saved) buffer: logical reflow with cursor tracking.
+		if len(g.mainSaved.cells) == g.Rows*g.Cols {
+			savedRW := g.mainSaved.rowWrapped
+			if len(savedRW) != g.Rows {
+				savedRW = make([]bool, g.Rows)
 			}
+			newCells, newRW2, newSB, newSBW, newCR, newCC := logicalReflow(
+				g.mainSaved.cells, savedRW,
+				g.Scrollback, g.ScrollbackWrapped,
+				g.Rows, g.Cols, rows, cols,
+				g.mainSaved.cursorR, g.mainSaved.cursorC,
+				g.ScrollbackCap,
+			)
+			g.mainSaved.cells = newCells
+			g.mainSaved.rowWrapped = newRW2
+			g.Scrollback = newSB
+			g.ScrollbackWrapped = newSBW
+			g.mainSaved.cursorR = newCR
+			g.mainSaved.cursorC = newCC
+			g.mainSaved.top = 0
+			g.mainSaved.bottom = rows - 1
 		}
+	} else {
+		newCells, newRW, newSB, newSBW, newCR, newCC := logicalReflow(
+			g.Cells, g.RowWrapped,
+			g.Scrollback, g.ScrollbackWrapped,
+			g.Rows, g.Cols, rows, cols,
+			g.CursorR, g.CursorC,
+			g.ScrollbackCap,
+		)
+		g.Cells = newCells
+		g.RowWrapped = newRW
+		g.Scrollback = newSB
+		g.ScrollbackWrapped = newSBW
+		g.CursorR = newCR
+		g.CursorC = newCC
 	}
+
 	g.Rows = rows
 	g.Cols = cols
-	g.Cells = next
-	if g.CursorR >= rows {
-		g.CursorR = rows - 1
-	}
-	if g.CursorC >= cols {
-		g.CursorC = cols - 1
-	}
-	// Reset scroll region to full screen on resize. Reflowing a custom
-	// region across a row-count change is ambiguous (which app-relative
-	// rows survive?), so drop it; apps re-issue DECSTBM after SIGWINCH.
+	// Reset scroll region to full screen on resize; apps re-issue DECSTBM
+	// after SIGWINCH. ViewOffset reset: scrollback row indices changed.
 	g.Top = 0
 	g.Bottom = rows - 1
-	// Selection coordinates were viewport-relative; the viewport
-	// dimensions just changed, so the highlight no longer maps to the
-	// content the user grabbed. Drop it rather than try to reflow.
+	g.ViewOffset = 0
 	g.ClearSelection()
 }
 
@@ -524,6 +839,7 @@ func (g *Grid) Put(ch rune) {
 			w = 1
 		}
 	} else if g.CursorC >= g.Cols {
+		g.RowWrapped[g.CursorR] = true
 		g.Newline()
 		g.CursorC = 0
 	}
@@ -534,6 +850,7 @@ func (g *Grid) Put(ch rune) {
 		if c := g.At(g.CursorR, g.CursorC); c != nil {
 			*c = blankCell(g.CurFG, g.CurBG, g.CurAttrs)
 		}
+		g.RowWrapped[g.CursorR] = true
 		g.Newline()
 		g.CursorC = 0
 	}
@@ -829,9 +1146,11 @@ func (g *Grid) scrollUpRegion(n int) {
 			row := make([]Cell, g.Cols)
 			copy(row, g.Cells[(g.Top+r)*g.Cols:(g.Top+r+1)*g.Cols])
 			g.Scrollback = append(g.Scrollback, row)
+			g.ScrollbackWrapped = append(g.ScrollbackWrapped, g.RowWrapped[g.Top+r])
 		}
 		if extra := len(g.Scrollback) - g.ScrollbackCap; extra > 0 {
 			g.Scrollback = g.Scrollback[extra:]
+			g.ScrollbackWrapped = g.ScrollbackWrapped[extra:]
 		}
 	}
 	// Shift surviving rows up.
@@ -840,13 +1159,15 @@ func (g *Grid) scrollUpRegion(n int) {
 			g.Cells[g.Top*g.Cols:(g.Bottom+1)*g.Cols],
 			g.Cells[(g.Top+n)*g.Cols:(g.Bottom+1)*g.Cols],
 		)
+		copy(g.RowWrapped[g.Top:g.Bottom+1-n], g.RowWrapped[g.Top+n:g.Bottom+1])
 	}
 	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
-	for r := g.Bottom - n + 1; r <= g.Bottom; r++ {
+	for r := g.Bottom + 1 - n; r <= g.Bottom; r++ {
 		row := g.Cells[r*g.Cols : (r+1)*g.Cols]
 		for i := range row {
 			row[i] = blank
 		}
+		g.RowWrapped[r] = false
 	}
 }
 
@@ -869,6 +1190,7 @@ func (g *Grid) scrollDownRegion(n int) {
 				g.Cells[r*g.Cols:(r+1)*g.Cols],
 				g.Cells[(r-n)*g.Cols:(r-n+1)*g.Cols],
 			)
+			g.RowWrapped[r] = g.RowWrapped[r-n]
 		}
 	}
 	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
@@ -877,6 +1199,7 @@ func (g *Grid) scrollDownRegion(n int) {
 		for i := range row {
 			row[i] = blank
 		}
+		g.RowWrapped[r] = false
 	}
 }
 
@@ -927,6 +1250,7 @@ func (g *Grid) InsertLines(n int) {
 				g.Cells[r*g.Cols:(r+1)*g.Cols],
 				g.Cells[(r-n)*g.Cols:(r-n+1)*g.Cols],
 			)
+			g.RowWrapped[r] = g.RowWrapped[r-n]
 		}
 	}
 	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
@@ -935,6 +1259,7 @@ func (g *Grid) InsertLines(n int) {
 		for i := range row {
 			row[i] = blank
 		}
+		g.RowWrapped[r] = false
 	}
 	g.CursorC = 0
 }
@@ -958,6 +1283,7 @@ func (g *Grid) DeleteLines(n int) {
 			g.Cells[g.CursorR*g.Cols:(g.Bottom+1)*g.Cols],
 			g.Cells[(g.CursorR+n)*g.Cols:(g.Bottom+1)*g.Cols],
 		)
+		copy(g.RowWrapped[g.CursorR:g.Bottom+1-n], g.RowWrapped[g.CursorR+n:g.Bottom+1])
 	}
 	blank := blankCell(g.CurFG, g.CurBG, g.CurAttrs)
 	for r := g.Bottom - n + 1; r <= g.Bottom; r++ {
@@ -965,6 +1291,7 @@ func (g *Grid) DeleteLines(n int) {
 		for i := range row {
 			row[i] = blank
 		}
+		g.RowWrapped[r] = false
 	}
 	g.CursorC = 0
 }
@@ -1075,6 +1402,7 @@ func (g *Grid) EnterAlt() {
 	}
 	g.mainSaved = altSavedScreen{
 		cells:      g.Cells,
+		rowWrapped: g.RowWrapped,
 		cursorR:    g.CursorR,
 		cursorC:    g.CursorC,
 		curFG:      g.CurFG,
@@ -1093,6 +1421,7 @@ func (g *Grid) EnterAlt() {
 		cells[i] = blank
 	}
 	g.Cells = cells
+	g.RowWrapped = make([]bool, g.Rows)
 	g.CursorR, g.CursorC = 0, 0
 	g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
 	g.AutoWrap = true
@@ -1113,6 +1442,7 @@ func (g *Grid) ExitAlt() {
 		return
 	}
 	g.Cells = g.mainSaved.cells
+	g.RowWrapped = g.mainSaved.rowWrapped
 	g.CursorR, g.CursorC = g.mainSaved.cursorR, g.mainSaved.cursorC
 	g.CurFG = g.mainSaved.curFG
 	g.CurBG = g.mainSaved.curBG

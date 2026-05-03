@@ -515,38 +515,51 @@ func TestGrid_SelectedText_InactiveOrEmpty(t *testing.T) {
 }
 
 func TestGrid_Resize_ReflowsScrollback(t *testing.T) {
+	// Phase 13: logical reflow joins soft-wrapped row halves back together
+	// when the window grows. This test uses Put so autowrap tracking fires.
 	g := NewGrid(2, 4)
-	g.ScrollbackCap = 5
-	// Fill row 0 with 'a','b','c','d' then scroll into scrollback.
-	for c, r := range "abcd" {
-		g.At(0, c).Ch = r
+	g.ScrollbackCap = 10
+	// Write 'abcd' via Put so it fills the row but does NOT trigger autowrap
+	// (the wrap check fires on the NEXT Put, not after CursorC reaches Cols).
+	for _, r := range "abcd" {
+		g.Put(r)
 	}
+	// Scroll row off the top into scrollback; this also pushes RowWrapped[0].
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) != 1 || len(g.Scrollback[0]) != 4 {
-		t.Fatalf("setup: scrollback=%v", g.Scrollback)
+	if len(g.Scrollback) != 1 {
+		t.Fatalf("setup: scrollback len %d, want 1", len(g.Scrollback))
 	}
-	// Shrink columns: stored row must be truncated.
+
+	// Shrink to 2 cols: 'abcd' is one logical line and re-wraps as ['ab','cd'].
+	// Since the cursor is on a blank row below the content, liveStart anchors
+	// the cursor near the bottom, so the split puts 'ab' in scrollback and
+	// 'cd' in the live buffer.
 	g.Resize(2, 2)
+	if len(g.Scrollback) == 0 {
+		t.Fatalf("shrink: scrollback empty, want at least 1 row")
+	}
 	if len(g.Scrollback[0]) != 2 {
-		t.Errorf("shrink: row width %d, want 2", len(g.Scrollback[0]))
+		t.Errorf("shrink: scrollback[0] width %d, want 2", len(g.Scrollback[0]))
 	}
 	if g.Scrollback[0][0].Ch != 'a' || g.Scrollback[0][1].Ch != 'b' {
-		t.Errorf("shrink lost content: %v %v",
+		t.Errorf("shrink: scrollback[0] = %v %v, want a b",
 			g.Scrollback[0][0].Ch, g.Scrollback[0][1].Ch)
 	}
-	// Grow columns: stored row must be padded with default cells.
+	if g.At(0, 0).Ch != 'c' || g.At(0, 1).Ch != 'd' {
+		t.Errorf("shrink: live[0] = %v %v, want c d",
+			g.At(0, 0).Ch, g.At(0, 1).Ch)
+	}
+
+	// Grow to 5 cols: the soft-wrapped halves ['ab'(wrapped), 'cd'] rejoin into
+	// the single logical line 'abcd' and appear in the live buffer.
 	g.Resize(2, 5)
-	if len(g.Scrollback[0]) != 5 {
-		t.Errorf("grow: row width %d, want 5", len(g.Scrollback[0]))
+	if g.At(0, 0).Ch != 'a' || g.At(0, 1).Ch != 'b' ||
+		g.At(0, 2).Ch != 'c' || g.At(0, 3).Ch != 'd' {
+		t.Errorf("grow: live[0] = %v%v%v%v, want abcd",
+			g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch, g.At(0, 3).Ch)
 	}
-	if g.Scrollback[0][0].Ch != 'a' || g.Scrollback[0][1].Ch != 'b' {
-		t.Errorf("grow lost content: %+v", g.Scrollback[0])
-	}
-	for i := 2; i < 5; i++ {
-		c := g.Scrollback[0][i]
-		if c.Ch != ' ' || c.FG != DefaultColor || c.BG != DefaultColor {
-			t.Errorf("grow padding cell %d not default: %+v", i, c)
-		}
+	if c := g.At(0, 4); c.Ch != ' ' || c.FG != DefaultColor || c.BG != DefaultColor {
+		t.Errorf("grow: live[0][4] not default blank: %+v", *c)
 	}
 }
 
@@ -1339,5 +1352,241 @@ func TestGrid_Put_WideThenNarrowLayout(t *testing.T) {
 			t.Errorf("col %d: ch=%U width=%d, want ch=%U width=%d",
 				i, c.Ch, c.Width, exp.ch, exp.w)
 		}
+	}
+}
+
+// --- Phase 13: Logical line wrapping (reflow) tests ---
+
+func TestGrid_Put_SetsWrappedFlag(t *testing.T) {
+	g := NewGrid(3, 4)
+	// Fill row 0 to right margin; the NEXT Put triggers autowrap.
+	for _, r := range "abcd" {
+		g.Put(r)
+	}
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] set before autowrap trigger")
+	}
+	// This Put sees CursorC >= Cols, sets wrap flag, then writes 'e' on row 1.
+	g.Put('e')
+	if !g.RowWrapped[0] {
+		t.Error("RowWrapped[0] not set after autowrap")
+	}
+	if g.RowWrapped[1] {
+		t.Error("RowWrapped[1] should be false after one more char")
+	}
+}
+
+func TestGrid_Put_ExplicitNewlineNoWrappedFlag(t *testing.T) {
+	g := NewGrid(3, 10)
+	g.Put('a')
+	g.Newline()
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false after explicit Newline")
+	}
+}
+
+func TestGrid_ScrollUp_ShiftsWrappedFlags(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.ScrollbackCap = 10
+	// Mark row 0 as wrapped.
+	g.RowWrapped[0] = true
+	g.RowWrapped[1] = false
+	g.RowWrapped[2] = false
+	g.scrollUpRegion(1)
+	// The wrapped flag from row 0 should now be in scrollback.
+	if len(g.ScrollbackWrapped) != 1 || !g.ScrollbackWrapped[0] {
+		t.Errorf("ScrollbackWrapped = %v, want [true]", g.ScrollbackWrapped)
+	}
+	// After shifting, row 0 gets the old row 1's flag (false).
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false after scroll up")
+	}
+}
+
+func TestGrid_ScrollUp_TrimsScrollbackWrapped(t *testing.T) {
+	g := NewGrid(2, 2)
+	g.ScrollbackCap = 2
+	for range 4 {
+		g.RowWrapped[0] = true
+		g.scrollUpRegion(1)
+	}
+	if len(g.ScrollbackWrapped) != len(g.Scrollback) {
+		t.Errorf("ScrollbackWrapped len %d != Scrollback len %d",
+			len(g.ScrollbackWrapped), len(g.Scrollback))
+	}
+}
+
+func TestGrid_ScrollDown_ShiftsWrappedFlags(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.RowWrapped[0] = true
+	g.RowWrapped[1] = false
+	g.RowWrapped[2] = false
+	g.scrollDownRegion(1)
+	// Row 0 is now blank (inserted) — flag must be false.
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false after scroll down (inserted row)")
+	}
+	// Old row 0 (wrapped=true) shifted to row 1.
+	if !g.RowWrapped[1] {
+		t.Error("RowWrapped[1] should be true (shifted from row 0)")
+	}
+}
+
+func TestGrid_InsertLines_ShiftsWrappedFlags(t *testing.T) {
+	g := NewGrid(4, 4)
+	g.RowWrapped[0] = true
+	g.RowWrapped[1] = false
+	g.MoveCursor(0, 0)
+	g.InsertLines(1)
+	// Row 0 is the new blank row.
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false (new blank row)")
+	}
+	// Old row 0 (wrapped=true) shifted to row 1.
+	if !g.RowWrapped[1] {
+		t.Error("RowWrapped[1] should be true (shifted from row 0)")
+	}
+}
+
+func TestGrid_DeleteLines_ShiftsWrappedFlags(t *testing.T) {
+	g := NewGrid(4, 4)
+	g.RowWrapped[0] = true // row 0 was soft-wrapped
+	g.RowWrapped[1] = false
+	g.MoveCursor(0, 0)
+	g.DeleteLines(1)
+	// Row 0 now has old row 1's flag.
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false (was row 1, not wrapped)")
+	}
+	// Last row is blank, flag must be false.
+	if g.RowWrapped[3] {
+		t.Error("RowWrapped[3] should be false (blank fill row)")
+	}
+}
+
+func TestGrid_Resize_Reflow_GrowWidth(t *testing.T) {
+	// Two 5-col rows form a single soft-wrapped logical line. Growing to
+	// 10 cols should join them back into one row.
+	g := NewGrid(3, 5)
+	for _, r := range "helloworld" {
+		g.Put(r)
+	}
+	// After "hello" (5 chars) the NEXT Put wraps: "world" goes to row 1.
+	if g.At(0, 0).Ch != 'h' || g.At(1, 0).Ch != 'w' {
+		t.Fatalf("setup: row0[0]=%c row1[0]=%c", g.At(0, 0).Ch, g.At(1, 0).Ch)
+	}
+	if !g.RowWrapped[0] {
+		t.Fatal("setup: RowWrapped[0] not set")
+	}
+
+	g.Resize(3, 10)
+
+	// "helloworld" should now appear on a single row.
+	want := "helloworld"
+	for i, r := range want {
+		if g.At(0, i).Ch != r {
+			t.Errorf("col %d: got %c, want %c", i, g.At(0, i).Ch, r)
+		}
+	}
+	if g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be false after join")
+	}
+}
+
+func TestGrid_Resize_Reflow_ShrinkWidth(t *testing.T) {
+	// A 10-char line on a 10-col terminal shrunk to 5 cols should produce
+	// two soft-wrapped physical rows.
+	g := NewGrid(3, 10)
+	for _, r := range "helloworld" {
+		g.Put(r)
+	}
+	// After 10 chars cursor is at (0,10) — pending wrap, no wrap yet.
+	g.Resize(3, 5)
+
+	if g.At(0, 0).Ch != 'h' || g.At(0, 4).Ch != 'o' {
+		t.Errorf("row0 = %c..%c, want h..o", g.At(0, 0).Ch, g.At(0, 4).Ch)
+	}
+	if g.At(1, 0).Ch != 'w' || g.At(1, 4).Ch != 'd' {
+		t.Errorf("row1 = %c..%c, want w..d", g.At(1, 0).Ch, g.At(1, 4).Ch)
+	}
+	if !g.RowWrapped[0] {
+		t.Error("RowWrapped[0] should be true (soft-wrap after shrink)")
+	}
+}
+
+func TestGrid_Resize_Reflow_ExplicitNewline(t *testing.T) {
+	// Two rows separated by explicit newline must NOT join on resize.
+	g := NewGrid(3, 5)
+	for _, r := range "hello" {
+		g.Put(r)
+	}
+	g.Newline()
+	g.CursorC = 0
+	for _, r := range "world" {
+		g.Put(r)
+	}
+	// RowWrapped[0] must be false (explicit newline, not autowrap).
+	if g.RowWrapped[0] {
+		t.Fatal("setup: RowWrapped[0] should be false")
+	}
+
+	g.Resize(3, 10)
+
+	// Row 0 must still be "hello", row 1 still "world" (no join).
+	for i, r := range "hello" {
+		if g.At(0, i).Ch != r {
+			t.Errorf("row0 col%d: got %c, want %c", i, g.At(0, i).Ch, r)
+		}
+	}
+	for i, r := range "world" {
+		if g.At(1, i).Ch != r {
+			t.Errorf("row1 col%d: got %c, want %c", i, g.At(1, i).Ch, r)
+		}
+	}
+}
+
+func TestGrid_Resize_Reflow_CursorTracking(t *testing.T) {
+	// Cursor should follow its logical column after reflow.
+	// Write "abcde" (5 chars) on a 5-col terminal; cursor ends at (0,5).
+	// Shrink to 3 cols: "abc" on row 0, "de" on row 1. Cursor was at
+	// logical col 4 ('e'), so after reflow: row 1, col 1.
+	g := NewGrid(3, 5)
+	for _, r := range "abcde" {
+		g.Put(r)
+	}
+	// Cursor at (0, 5) — pending wrap.
+	g.Resize(3, 3)
+	if g.CursorR != 1 || g.CursorC != 1 {
+		t.Errorf("cursor = (%d,%d), want (1,1)", g.CursorR, g.CursorC)
+	}
+}
+
+func TestGrid_Resize_Reflow_WideChar(t *testing.T) {
+	// Wide char (width 2) that starts at the last column of a row forces a
+	// wrap to the next row in the new layout; the continuation cell must
+	// follow immediately.
+	g := NewGrid(2, 4)
+	// Write 3 normal chars then a wide char; the wide char wraps at col 3.
+	for _, r := range "abc" {
+		g.Put(r)
+	}
+	g.Put('你') // width 2 — Put pads col3 and wraps to row 1.
+	if g.At(0, 0).Ch != 'a' {
+		t.Fatalf("setup: At(0,0)=%c, want a", g.At(0, 0).Ch)
+	}
+	if !g.RowWrapped[0] {
+		t.Fatal("setup: RowWrapped[0] not set")
+	}
+
+	// Grow to 6 cols: "abc你" (total display width 5) fits on one row.
+	g.Resize(2, 6)
+	if g.At(0, 0).Ch != 'a' || g.At(0, 1).Ch != 'b' || g.At(0, 2).Ch != 'c' {
+		t.Errorf("chars: a=%c b=%c c=%c", g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch)
+	}
+	if g.At(0, 3).Ch != '你' || g.At(0, 3).Width != 2 {
+		t.Errorf("wide char: ch=%c width=%d, want 你 width 2", g.At(0, 3).Ch, g.At(0, 3).Width)
+	}
+	if g.At(0, 4).Width != 0 {
+		t.Errorf("continuation cell width=%d, want 0", g.At(0, 4).Width)
 	}
 }

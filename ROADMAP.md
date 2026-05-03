@@ -412,14 +412,14 @@ printf '\x1b[3mITALIC\x1b[0m \x1b[2mDIM\x1b[0m \x1b[9mSTRIKE\x1b[0m\n'
 **Why:** Crucial for resizing. Simple cropping/padding feels broken.
 Modern terminals reflow text based on logical line boundaries.
 
-- [ ] `grid.go`: Add `Wrapped bool` to `Cell` or a per-row flag.
+- [x] `grid.go`: Add `Wrapped bool` to `Cell` or a per-row flag.
       Set `Wrapped=true` in `Put` when an AutoWrap occurs.
-- [ ] `grid.go`: Rewrite `Resize` to perform a logical reflow. Walk
+- [x] `grid.go`: Rewrite `Resize` to perform a logical reflow. Walk
       the buffer and scrollback, joining rows marked `Wrapped` and
       re-wrapping to the new width.
-- [ ] `grid.go`: Update cursor positioning to follow the reflowed
+- [x] `grid.go`: Update cursor positioning to follow the reflowed
       content.
-- [ ] Tests: Growing and shrinking width with multi-line wrapped
+- [x] Tests: Growing and shrinking width with multi-line wrapped
       output; verification that `ls` columns vs `cat` text reflow
       differently (based on explicit newlines).
 

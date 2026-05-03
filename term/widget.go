@@ -161,8 +161,8 @@ type Cfg struct {
 
 	// CursorBlink, if non-nil, overrides the application's DECSCUSR
 	// blink request. Use *true to force blinking on, *false to force
-	// steady. Leave nil to honor whatever the shell asks for (default
-	// blink for a brand-new grid).
+	// steady. Leave nil to honor whatever the shell asks for (steady
+	// by default for a brand-new grid).
 	CursorBlink *bool
 }
 
