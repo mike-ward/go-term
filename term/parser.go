@@ -1,13 +1,19 @@
 package term
 
-import "unicode/utf8"
+import (
+	"strconv"
+	"unicode/utf8"
+)
 
 type parserState uint8
 
 const (
 	stGround parserState = iota
 	stEsc
+	stEscInter
 	stCSI
+	stDCS
+	stDCSEsc
 	stOSC    // collecting OSC payload, waiting for BEL or ESC \
 	stOSCEsc // saw ESC inside OSC, waiting for terminating '\'
 )
@@ -38,19 +44,21 @@ const maxCSIParamValue = 1 << 20
 // truecolor (38/48 ;2;r;g;b) forms. All other escape sequences are
 // silently consumed so they don't print as garbage.
 type Parser struct {
-	g       *Grid
-	state   parserState
-	params  []int   // SGR params accumulated in current CSI
-	curP    int     // value being accumulated
-	hasP    bool    // any digit seen for curP
-	private bool    // DEC private mode: `?` prefix seen in current CSI
-	intermediate byte // last intermediate byte (0x20..0x2F) seen, 0 if none
-	utf     [4]byte // UTF-8 carry-over between Feed calls
-	utfLen  int
+	g            *Grid
+	state        parserState
+	params       []int   // SGR params accumulated in current CSI
+	curP         int     // value being accumulated
+	hasP         bool    // any digit seen for curP
+	leader       byte    // optional CSI private leader: one of < = > ?
+	intermediate byte    // last intermediate byte (0x20..0x2F) seen, 0 if none
+	escInter     byte    // ESC intermediate introducer like '(' in ESC(B
+	utf          [4]byte // UTF-8 carry-over between Feed calls
+	utfLen       int
 
 	// osc accumulates the payload of the in-progress OSC (Operating
 	// System Command). Reset on entry to stOSC; capped at maxOSCBytes.
 	osc []byte
+	dcs []byte
 
 	// onTitle, if non-nil, is invoked for OSC 0/1/2 (window title).
 	// onReply, if non-nil, is invoked when the parser needs to write
@@ -128,11 +136,14 @@ func (p *Parser) Feed(b []byte) {
 				p.params = p.params[:0]
 				p.curP = 0
 				p.hasP = false
-				p.private = false
+				p.leader = 0
 				p.intermediate = 0
 			case ']': // OSC introducer
 				p.state = stOSC
 				p.osc = p.osc[:0]
+			case 'P': // DCS introducer
+				p.state = stDCS
+				p.dcs = p.dcs[:0]
 			case '7': // DECSC — save cursor + SGR
 				p.g.SaveCursor()
 				p.state = stGround
@@ -148,15 +159,39 @@ func (p *Parser) Feed(b []byte) {
 			case 'E': // NEL — next line (CR + LF)
 				p.g.NextLine()
 				p.state = stGround
+			case '=': // DECPAM — application keypad
+				p.g.AppKeypad = true
+				p.state = stGround
+			case '>': // DECPNM — numeric keypad
+				p.g.AppKeypad = false
+				p.state = stGround
+			case '(', ')', '*', '+', '-', '.', '/':
+				// Character-set / other ESC-intermediate sequences such
+				// as ESC ( B are common in TUIs. We don't implement the
+				// designation, but must swallow the final byte so it
+				// doesn't render as a literal 'B'.
+				p.escInter = c
+				p.state = stEscInter
 			default:
 				// 2-byte ESC sequences: ignore.
 				p.state = stGround
 			}
 			i++
+		case stEscInter:
+			// Swallow the final byte of an ESC intermediate sequence
+			// like ESC ( B, then return to ground.
+			p.escInter = 0
+			p.state = stGround
+			i++
 		case stCSI:
 			switch {
-			case c == '?' && !p.hasP && len(p.params) == 0:
-				p.private = true
+			case c >= '<' && c <= '?' && p.leader == 0 && !p.hasP && len(p.params) == 0:
+				// CSI private leader bytes (0x3C..0x3F) select
+				// non-standard/xterm families such as DEC private
+				// modes (`?`) and modifyOtherKeys (`>`). Record the
+				// leader so we don't later misread `>4;1m` as plain
+				// SGR 4;1m.
+				p.leader = c
 			case c >= '0' && c <= '9':
 				p.curP = p.curP*10 + int(c-'0')
 				if p.curP > maxCSIParamValue {
@@ -177,7 +212,7 @@ func (p *Parser) Feed(b []byte) {
 				p.state = stGround
 				p.curP = 0
 				p.hasP = false
-				p.private = false
+				p.leader = 0
 				p.intermediate = 0
 			case c >= 0x20 && c <= 0x2F:
 				// Intermediate byte (e.g. SP for DECSCUSR " q"). Last
@@ -188,6 +223,25 @@ func (p *Parser) Feed(b []byte) {
 				// Unsupported byte — keep going.
 			}
 			i++
+		case stDCS:
+			switch c {
+			case 0x1B:
+				p.state = stDCSEsc
+			default:
+				if len(p.dcs) < maxOSCBytes {
+					p.dcs = append(p.dcs, c)
+				}
+			}
+			i++
+		case stDCSEsc:
+			if c == '\\' {
+				p.dispatchDCS()
+				p.state = stGround
+				i++
+			} else {
+				p.dcs = p.dcs[:0]
+				p.state = stEsc
+			}
 		case stOSC:
 			switch c {
 			case 0x07: // BEL — terminator
@@ -214,6 +268,69 @@ func (p *Parser) Feed(b []byte) {
 			}
 		}
 	}
+}
+
+func encodeHexBytes(s string) []byte {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, 0, len(s)*2)
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		out = append(out, hexdigits[b>>4], hexdigits[b&0x0F])
+	}
+	return out
+}
+
+func decodeHexBytes(b []byte) (string, bool) {
+	if len(b)%2 != 0 {
+		return "", false
+	}
+	out := make([]byte, len(b)/2)
+	for i := 0; i < len(b); i += 2 {
+		hi := fromHexNibble(b[i])
+		lo := fromHexNibble(b[i+1])
+		if hi < 0 || lo < 0 {
+			return "", false
+		}
+		out[i/2] = byte(hi<<4 | lo)
+	}
+	return string(out), true
+}
+
+func fromHexNibble(b byte) int {
+	switch {
+	case b >= '0' && b <= '9':
+		return int(b - '0')
+	case b >= 'a' && b <= 'f':
+		return int(b-'a') + 10
+	case b >= 'A' && b <= 'F':
+		return int(b-'A') + 10
+	default:
+		return -1
+	}
+}
+
+// maxXTGETTCAPParts caps the number of capability names in one XTGETTCAP
+// query so a pathological DCS (4096 semicolons) can't force a large
+// allocation or iteration. Real apps query 1–3 caps at a time.
+const maxXTGETTCAPParts = 32
+
+func splitSemis(b []byte) [][]byte {
+	if len(b) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, 4)
+	start := 0
+	for i, c := range b {
+		if c == ';' {
+			if len(out) >= maxXTGETTCAPParts {
+				return out
+			}
+			out = append(out, b[start:i])
+			start = i + 1
+		}
+	}
+	out = append(out, b[start:])
+	return out
 }
 
 // dispatchOSC parses the accumulated OSC payload as "Ps;Pt" and
@@ -260,17 +377,215 @@ func (p *Parser) dispatchOSC() {
 	}
 }
 
+func appendReply(out []byte, body []byte) []byte {
+	out = append(out, '\x1b', 'P')
+	out = append(out, body...)
+	out = append(out, '\x1b', '\\')
+	return out
+}
+
+func (p *Parser) currentSGRString() string {
+	if p.g.CurFG == DefaultColor && p.g.CurBG == DefaultColor && p.g.CurAttrs == 0 {
+		return "0m"
+	}
+	params := make([]byte, 0, 32)
+	appendParam := func(s string) {
+		if len(params) > 0 {
+			params = append(params, ';')
+		}
+		params = append(params, s...)
+	}
+	if p.g.CurAttrs&AttrBold != 0 {
+		appendParam("1")
+	}
+	if p.g.CurAttrs&AttrUnderline != 0 {
+		appendParam("4")
+	}
+	if p.g.CurAttrs&AttrInverse != 0 {
+		appendParam("7")
+	}
+	switch p.g.CurFG >> 24 {
+	case 0x00:
+		v := int(p.g.CurFG & 0xFF)
+		switch {
+		case v <= 7:
+			appendParam(strconv.Itoa(v + 30))
+		case v <= 15:
+			appendParam(strconv.Itoa(v - 8 + 90))
+		default:
+			appendParam("38")
+			appendParam("5")
+			appendParam(strconv.Itoa(v))
+		}
+	case 0x01:
+		appendParam("38")
+		appendParam("2")
+		appendParam(strconv.Itoa(int((p.g.CurFG >> 16) & 0xFF)))
+		appendParam(strconv.Itoa(int((p.g.CurFG >> 8) & 0xFF)))
+		appendParam(strconv.Itoa(int(p.g.CurFG & 0xFF)))
+	}
+	switch p.g.CurBG >> 24 {
+	case 0x00:
+		v := int(p.g.CurBG & 0xFF)
+		switch {
+		case v <= 7:
+			appendParam(strconv.Itoa(v + 40))
+		case v <= 15:
+			appendParam(strconv.Itoa(v - 8 + 100))
+		default:
+			appendParam("48")
+			appendParam("5")
+			appendParam(strconv.Itoa(v))
+		}
+	case 0x01:
+		appendParam("48")
+		appendParam("2")
+		appendParam(strconv.Itoa(int((p.g.CurBG >> 16) & 0xFF)))
+		appendParam(strconv.Itoa(int((p.g.CurBG >> 8) & 0xFF)))
+		appendParam(strconv.Itoa(int(p.g.CurBG & 0xFF)))
+	}
+	if len(params) == 0 {
+		return "0m"
+	}
+	return string(params) + "m"
+}
+
+func (p *Parser) replyDECRQSS(body []byte) {
+	if p.onReply == nil {
+		return
+	}
+	// Valid DECRQSS bodies are "m", "r", " q" — max 2 bytes. Reject
+	// longer bodies early so we never convert a 4 KB body to a string.
+	if len(body) > 4 {
+		p.onReply(appendReply(nil, []byte("0$r")))
+		return
+	}
+	out := make([]byte, 0, 32)
+	switch string(body) {
+	case "m":
+		out = appendReply(out, append([]byte("1$r"), []byte(p.currentSGRString())...))
+	case "r":
+		top := p.g.Top + 1
+		bot := p.g.Bottom + 1
+		out = appendReply(out, []byte("1$r"+strconv.Itoa(top)+";"+strconv.Itoa(bot)+"r"))
+	case " q":
+		out = appendReply(out, []byte("1$r"+strconv.Itoa(p.g.DECSCUSRParam())+" q"))
+	default:
+		out = appendReply(out, []byte("0$r"))
+	}
+	p.onReply(out)
+}
+
+func xtgettcapValue(name string) (string, bool) {
+	switch name {
+	case "TN", "name":
+		return "xterm-256color", true
+	case "Co", "colors":
+		return "256", true
+	case "RGB":
+		return "8/8/8", true
+	case "kcuu1":
+		return "\x1b[A", true
+	case "kcud1":
+		return "\x1b[B", true
+	case "kcub1":
+		return "\x1b[D", true
+	case "kcuf1":
+		return "\x1b[C", true
+	case "khome":
+		return "\x1b[H", true
+	case "kend":
+		return "\x1b[F", true
+	case "kich1":
+		return "\x1b[2~", true
+	case "kdch1":
+		return "\x1b[3~", true
+	case "kpp":
+		return "\x1b[5~", true
+	case "knp":
+		return "\x1b[6~", true
+	case "indn":
+		return "\x1b[%p1%dS", true
+	case "query-os-name":
+		return "\x1b]0;?\x07", true
+	case "smkx":
+		return "\x1b[?1h\x1b=", true
+	case "rmkx":
+		return "\x1b[?1l\x1b>", true
+	default:
+		return "", false
+	}
+}
+
+func (p *Parser) replyXTGETTCAP(body []byte) {
+	if p.onReply == nil {
+		return
+	}
+	parts := splitSemis(body)
+	if len(parts) == 0 {
+		p.onReply(appendReply(nil, []byte("0+r")))
+		return
+	}
+	payload := make([]byte, 0, len(body)+32)
+	payload = append(payload, "1+r"...)
+	for i, part := range parts {
+		name, ok := decodeHexBytes(part)
+		if !ok {
+			p.onReply(appendReply(nil, append([]byte("0+r"), part...)))
+			return
+		}
+		value, ok := xtgettcapValue(name)
+		if !ok {
+			p.onReply(appendReply(nil, append([]byte("0+r"), part...)))
+			return
+		}
+		if i > 0 {
+			payload = append(payload, ';')
+		}
+		payload = append(payload, part...)
+		payload = append(payload, '=')
+		payload = append(payload, encodeHexBytes(value)...)
+	}
+	p.onReply(appendReply(nil, payload))
+}
+
+func (p *Parser) dispatchDCS() {
+	if len(p.dcs) < 2 {
+		return
+	}
+	switch {
+	case p.dcs[0] == '$' && p.dcs[1] == 'q':
+		p.replyDECRQSS(p.dcs[2:])
+	case p.dcs[0] == '+' && p.dcs[1] == 'q':
+		p.replyXTGETTCAP(p.dcs[2:])
+	case p.g.SyncOutput && len(p.dcs) >= 3 && p.dcs[0] == '=' && p.dcs[2] == 's':
+		switch p.dcs[1] {
+		case '1':
+			p.g.SyncActive = true
+		case '2':
+			p.g.SyncActive = false
+		}
+	}
+}
+
 func (p *Parser) dispatchCSI(final byte) {
-	if p.private {
-		switch final {
-		case 'h':
-			p.applyDECMode(true)
-		case 'l':
-			p.applyDECMode(false)
+	if p.leader != 0 {
+		switch p.leader {
+		case '?':
+			switch final {
+			case 'h':
+				p.applyDECMode(true)
+			case 'l':
+				p.applyDECMode(false)
+			}
 		}
 		return
 	}
 	switch final {
+	case 'h':
+		p.applyMode(true)
+	case 'l':
+		p.applyMode(false)
 	case 'm':
 		p.applySGR()
 	case 's':
@@ -286,15 +601,17 @@ func (p *Parser) dispatchCSI(final byte) {
 	case 'D':
 		p.g.CursorBack(p.param(0, 1))
 	case 'E':
-		p.g.MoveCursor(p.g.CursorR+p.param(0, 1), 0)
+		p.g.CursorDown(p.param(0, 1))
+		p.g.MoveCursor(p.g.CursorR, 0)
 	case 'F':
-		p.g.MoveCursor(p.g.CursorR-p.param(0, 1), 0)
+		p.g.CursorUp(p.param(0, 1))
+		p.g.MoveCursor(p.g.CursorR, 0)
 	case 'G', '`':
 		p.g.MoveCursor(p.g.CursorR, p.param(0, 1)-1)
 	case 'd':
-		p.g.MoveCursor(p.param(0, 1)-1, p.g.CursorC)
+		p.g.MoveCursorOrigin(p.param(0, 1)-1, p.g.CursorC)
 	case 'H', 'f':
-		p.g.MoveCursor(p.param(0, 1)-1, p.param(1, 1)-1)
+		p.g.MoveCursorOrigin(p.param(0, 1)-1, p.param(1, 1)-1)
 	case 'J':
 		p.g.EraseInDisplay(p.param(0, 0))
 	case 'K':
@@ -324,6 +641,12 @@ func (p *Parser) dispatchCSI(final byte) {
 		// ignored). fish probes this at startup.
 		if p.param(0, 0) == 0 && p.onReply != nil {
 			p.onReply(da1Reply)
+		}
+	case 'n':
+		// DSR / CPR.
+		if p.param(0, 0) == 6 && p.onReply != nil {
+			row, col := p.g.CursorR+1, p.g.CursorC+1
+			p.onReply([]byte("\x1b[" + strconv.Itoa(row) + ";" + strconv.Itoa(col) + "R"))
 		}
 	case 'q':
 		// DECSCUSR — set cursor style + blink (CSI Ps SP q).
@@ -362,6 +685,26 @@ func (p *Parser) applyDECMode(set bool) {
 			}
 		case 2004: // bracketed paste mode
 			p.g.BracketedPaste = set
+		case 1004: // focus in/out reports
+			p.g.FocusReporting = set
+		case 2026: // synchronized updates mode
+			p.g.SyncOutput = set
+			if !set {
+				p.g.SyncActive = false
+			}
+		case 7: // DECAWM — autowrap at right margin
+			p.g.AutoWrap = set
+		case 6: // DECOM — origin mode
+			p.g.OriginMode = set
+			if set && p.g.regionValid() {
+				p.g.CursorR, p.g.CursorC = p.g.Top, 0
+			} else if !set {
+				p.g.CursorR, p.g.CursorC = 0, 0
+			}
+		case 1: // DECCKM — application cursor keys
+			p.g.AppCursorKeys = set
+		case 66: // DECNKM — application keypad
+			p.g.AppKeypad = set
 		case 1000: // mouse: press/release
 			p.g.MouseTrack = set
 		case 1002: // mouse: press/release + drag
@@ -370,6 +713,15 @@ func (p *Parser) applyDECMode(set bool) {
 			p.g.MouseTrackAny = set
 		case 1006: // mouse: SGR encoding
 			p.g.MouseSGR = set
+		}
+	}
+}
+
+func (p *Parser) applyMode(set bool) {
+	for _, n := range p.params {
+		switch n {
+		case 4: // IRM — insert/replace mode
+			p.g.InsertMode = set
 		}
 	}
 }

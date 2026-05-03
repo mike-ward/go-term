@@ -2,6 +2,7 @@ package term
 
 import (
 	"bytes"
+	"strconv"
 	"testing"
 )
 
@@ -31,7 +32,7 @@ func TestParser_C0Bytes(t *testing.T) {
 	}
 	g.CursorC = 0
 	feed(t, g, p, []byte{0x09}) // TAB
-	if g.CursorC != 4 { // clamps to Cols-1=4 since 8>5
+	if g.CursorC != 4 {         // clamps to Cols-1=4 since 8>5
 		t.Errorf("TAB: %d", g.CursorC)
 	}
 	feed(t, g, p, []byte{0x0D}) // CR
@@ -89,8 +90,19 @@ func TestParser_ESCNonBracketIgnored(t *testing.T) {
 	if g.CursorC != 0 {
 		t.Errorf("ESC ( should be swallowed: cursor=%d", g.CursorC)
 	}
-	if p.state != stGround {
-		t.Errorf("state not back to ground: %d", p.state)
+	if p.state != stEscInter {
+		t.Errorf("state should await ESC intermediate final: %d", p.state)
+	}
+}
+
+func TestParser_ESCCharsetDesignationSwallowed(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1b(BX"))
+	if got := g.At(0, 0).Ch; got != 'X' {
+		t.Fatalf("ESC(B leaked into grid: got %q want %q", got, 'X')
+	}
+	if g.CursorC != 1 {
+		t.Fatalf("cursor after ESC(BX = %d, want 1", g.CursorC)
 	}
 }
 
@@ -270,7 +282,7 @@ func TestParser_CSI_CursorMoves(t *testing.T) {
 		t.Errorf("B: %d", g.CursorR)
 	}
 	feed(t, g, p, []byte("\x1b[2C")) // forward 2
-	if g.CursorC != 4 { // clamped at last col
+	if g.CursorC != 4 {              // clamped at last col
 		t.Errorf("C: %d", g.CursorC)
 	}
 	feed(t, g, p, []byte("\x1b[2D")) // back 2
@@ -386,6 +398,93 @@ func TestParser_DEC2004_BracketedPaste(t *testing.T) {
 	}
 }
 
+func TestParser_DEC7_AutoWrap(t *testing.T) {
+	g, p := newParserGrid(1, 3)
+	if !g.AutoWrap {
+		t.Fatal("default autowrap should be on")
+	}
+	feed(t, g, p, []byte("\x1b[?7l"))
+	if g.AutoWrap {
+		t.Fatal("?7l should disable autowrap")
+	}
+	feed(t, g, p, []byte("abcd"))
+	if got := string([]rune{g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch}); got != "abd" {
+		t.Fatalf("nowrap overwrite = %q, want %q", got, "abd")
+	}
+	if g.CursorC != 2 {
+		t.Fatalf("nowrap cursor = %d, want 2", g.CursorC)
+	}
+	feed(t, g, p, []byte("\x1b[?7h"))
+	if !g.AutoWrap {
+		t.Fatal("?7h should enable autowrap")
+	}
+}
+
+func TestParser_DEC6_OriginMode(t *testing.T) {
+	g, p := newParserGrid(6, 5)
+	feed(t, g, p, []byte("\x1b[2;5r"))
+	feed(t, g, p, []byte("\x1b[?6h"))
+	if !g.OriginMode {
+		t.Fatal("?6h should enable origin mode")
+	}
+	if g.CursorR != 1 || g.CursorC != 0 {
+		t.Fatalf("origin home = %d,%d, want 1,0", g.CursorR, g.CursorC)
+	}
+	feed(t, g, p, []byte("\x1b[2;3H"))
+	if g.CursorR != 2 || g.CursorC != 2 {
+		t.Fatalf("origin CUP = %d,%d, want 2,2", g.CursorR, g.CursorC)
+	}
+	feed(t, g, p, []byte("\x1b[99B"))
+	if g.CursorR != 4 {
+		t.Fatalf("origin CUD clamp = %d, want 4", g.CursorR)
+	}
+	feed(t, g, p, []byte("\x1b[?6l"))
+	if g.OriginMode {
+		t.Fatal("?6l should disable origin mode")
+	}
+}
+
+func TestParser_CSI4_InsertMode(t *testing.T) {
+	g, p := newParserGrid(1, 4)
+	feed(t, g, p, []byte("abcd"))
+	g.CursorR, g.CursorC = 0, 1
+	feed(t, g, p, []byte("\x1b[4h"))
+	if !g.InsertMode {
+		t.Fatal("CSI 4 h should enable insert mode")
+	}
+	feed(t, g, p, []byte("X"))
+	got := string([]rune{g.At(0, 0).Ch, g.At(0, 1).Ch, g.At(0, 2).Ch, g.At(0, 3).Ch})
+	if got != "aXbc" {
+		t.Fatalf("IRM row = %q, want %q", got, "aXbc")
+	}
+	feed(t, g, p, []byte("\x1b[4l"))
+	if g.InsertMode {
+		t.Fatal("CSI 4 l should disable insert mode")
+	}
+}
+
+func TestParser_DECMode_FocusSyncCursorKeypad(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1b[?1004;2026;1h\x1b="))
+	if !g.FocusReporting || !g.SyncOutput || !g.AppCursorKeys || !g.AppKeypad {
+		t.Fatalf("mode set failed: focus=%v sync=%v ckm=%v keypad=%v",
+			g.FocusReporting, g.SyncOutput, g.AppCursorKeys, g.AppKeypad)
+	}
+	feed(t, g, p, []byte("\x1bP=1s\x1b\\"))
+	if !g.SyncActive {
+		t.Fatal("sync begin not set")
+	}
+	feed(t, g, p, []byte("\x1bP=2s\x1b\\"))
+	if g.SyncActive {
+		t.Fatal("sync end not cleared")
+	}
+	feed(t, g, p, []byte("\x1b[?1004;2026;1l\x1b>"))
+	if g.FocusReporting || g.SyncOutput || g.SyncActive || g.AppCursorKeys || g.AppKeypad {
+		t.Fatalf("mode reset failed: focus=%v sync=%v active=%v ckm=%v keypad=%v",
+			g.FocusReporting, g.SyncOutput, g.SyncActive, g.AppCursorKeys, g.AppKeypad)
+	}
+}
+
 func TestParser_DECPrivateResetBetweenSequences(t *testing.T) {
 	// Ensure the `?` prefix on one CSI doesn't leak into the next CSI,
 	// which would cause CSI 25 m (a no-op SGR) to be misread as DEC mode.
@@ -397,6 +496,23 @@ func TestParser_DECPrivateResetBetweenSequences(t *testing.T) {
 	}
 	if g.CurFG != paletteColor(1) {
 		t.Errorf("SGR after DEC mode: fg=%#x", g.CurFG)
+	}
+}
+
+func TestParser_NonDECPrivateLeaderDoesNotFallThroughToSGR(t *testing.T) {
+	// fish emits xterm-private CSI > 4 ; 1 m during startup. Treating
+	// that as plain SGR 4;1m leaves subsequent erased blanks underlined.
+	g, p := newParserGrid(2, 5)
+	feed(t, g, p, []byte("\x1b[>4;1m"))
+	if g.CurAttrs != 0 {
+		t.Fatalf("CSI > 4;1m changed attrs: %#x", g.CurAttrs)
+	}
+	feed(t, g, p, []byte("\x1b[K"))
+	for c := range g.Cols {
+		cell := g.At(0, c)
+		if cell.Attrs != 0 {
+			t.Fatalf("erased cell %d kept attrs %#x", c, cell.Attrs)
+		}
 	}
 }
 
@@ -757,6 +873,64 @@ func TestParser_DA1_PrivateIgnored(t *testing.T) {
 	}
 }
 
+func TestParser_CPRReply(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	g.CursorR, g.CursorC = 2, 5
+	var replies [][]byte
+	p.SetReplyHandler(func(b []byte) {
+		replies = append(replies, append([]byte(nil), b...))
+	})
+	feed(t, g, p, []byte("\x1b[6n"))
+	if len(replies) != 1 || string(replies[0]) != "\x1b[3;6R" {
+		t.Fatalf("CPR reply = %q", replies)
+	}
+}
+
+func TestParser_DCS_UnknownSwallowed(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	feed(t, g, p, []byte("\x1bPignored\x1b\\X"))
+	if got := g.At(0, 0).Ch; got != 'X' {
+		t.Fatalf("DCS leaked into grid: got %q want X", got)
+	}
+}
+
+func TestParser_DECRQSS_Replies(t *testing.T) {
+	g, p := newParserGrid(6, 8)
+	g.CurAttrs = AttrBold | AttrUnderline
+	g.CurFG = paletteColor(2)
+	g.Top, g.Bottom = 1, 4
+	g.ApplyDECSCUSR(6)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP$qm\x1b\\"))
+	feed(t, g, p, []byte("\x1bP$qr\x1b\\"))
+	feed(t, g, p, []byte("\x1bP$q q\x1b\\"))
+	want := []string{
+		"\x1bP1$r1;4;32m\x1b\\",
+		"\x1bP1$r2;5r\x1b\\",
+		"\x1bP1$r6 q\x1b\\",
+	}
+	if len(replies) != len(want) {
+		t.Fatalf("DECRQSS reply count = %d, want %d", len(replies), len(want))
+	}
+	for i := range want {
+		if replies[i] != want[i] {
+			t.Fatalf("reply[%d] = %q, want %q", i, replies[i], want[i])
+		}
+	}
+}
+
+func TestParser_XTGETTCAP_Reply(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP+q544e;6b63757531\x1b\\")) // TN ; kcuu1
+	want := "\x1bP1+r544e=787465726d2d323536636f6c6f72;6b63757531=1b5b41\x1b\\"
+	if len(replies) != 1 || replies[0] != want {
+		t.Fatalf("XTGETTCAP = %q, want %q", replies, want)
+	}
+}
+
 func TestParser_MouseModes_Toggle(t *testing.T) {
 	g, p := newParserGrid(1, 5)
 	feed(t, g, p, []byte("\x1b[?1000;1006h"))
@@ -811,9 +985,8 @@ func TestParser_DECSCUSR_AllPs(t *testing.T) {
 	}
 	for _, c := range cases {
 		g, p := newParserGrid(1, 5)
-		seq := []byte{0x1b, '[', 0, ' ', 'q'} // template
 		// Build "CSI Ps SP q" with Ps as decimal.
-		seq = append([]byte("\x1b["), []byte(itoa(c.ps))...)
+		seq := append([]byte("\x1b["), []byte(strconv.Itoa(c.ps))...)
 		seq = append(seq, ' ', 'q')
 		feed(t, g, p, seq)
 		if g.CursorShape != c.shape || g.CursorBlink != c.blink {
@@ -845,17 +1018,128 @@ func TestParser_DECSCUSR_DefaultParam(t *testing.T) {
 	}
 }
 
-// itoa is a tiny test helper to avoid importing strconv.
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+func TestCurrentSGRString_AllDefault(t *testing.T) {
+	_, p := newParserGrid(1, 5)
+	if got := p.currentSGRString(); got != "0m" {
+		t.Errorf("all-default = %q, want %q", got, "0m")
 	}
-	var b [12]byte
-	i := len(b)
-	for n > 0 {
-		i--
-		b[i] = byte('0' + n%10)
-		n /= 10
-	}
-	return string(b[i:])
 }
+
+func TestCurrentSGRString_AttrInverse(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	g.CurAttrs = AttrInverse
+	if got := p.currentSGRString(); got != "7m" {
+		t.Errorf("inverse = %q, want %q", got, "7m")
+	}
+}
+
+func TestCurrentSGRString_BrightPalette(t *testing.T) {
+	cases := []struct {
+		fg   uint32
+		want string
+	}{
+		{paletteColor(8), "90m"},
+		{paletteColor(15), "97m"},
+	}
+	for _, c := range cases {
+		g, p := newParserGrid(1, 5)
+		g.CurFG = c.fg
+		if got := p.currentSGRString(); got != c.want {
+			t.Errorf("fg=%#x: got %q, want %q", c.fg, got, c.want)
+		}
+	}
+}
+
+func TestCurrentSGRString_TruecolorFGBG(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	g.CurFG = rgbColor(255, 100, 0)
+	g.CurBG = rgbColor(0, 128, 255)
+	want := "38;2;255;100;0;48;2;0;128;255m"
+	if got := p.currentSGRString(); got != want {
+		t.Errorf("truecolor = %q, want %q", got, want)
+	}
+}
+
+func TestParser_XTGETTCAP_UnknownCapReturnsHexName(t *testing.T) {
+	// "unknown" hex-encoded = "756e6b6e6f776e"
+	g, p := newParserGrid(1, 5)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP+q756e6b6e6f776e\x1b\\"))
+	want := "\x1bP0+r756e6b6e6f776e\x1b\\"
+	if len(replies) != 1 || replies[0] != want {
+		t.Fatalf("unknown cap reply = %q, want %q", replies, want)
+	}
+}
+
+func TestParser_XTGETTCAP_InvalidHexReturnsErrorWithPart(t *testing.T) {
+	// "54e" is 3 bytes (odd) — decodeHexBytes must reject it
+	g, p := newParserGrid(1, 5)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP+q54e\x1b\\"))
+	want := "\x1bP0+r54e\x1b\\"
+	if len(replies) != 1 || replies[0] != want {
+		t.Fatalf("invalid hex reply = %q, want %q", replies, want)
+	}
+}
+
+func TestParser_XTGETTCAP_EmptyBodyReturnsError(t *testing.T) {
+	g, p := newParserGrid(1, 5)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP+q\x1b\\"))
+	want := "\x1bP0+r\x1b\\"
+	if len(replies) != 1 || replies[0] != want {
+		t.Fatalf("empty body reply = %q, want %q", replies, want)
+	}
+}
+
+func TestSplitSemis_CapsAtMax(t *testing.T) {
+	// 41 fields separated by 40 semicolons — must be capped at maxXTGETTCAPParts
+	var b []byte
+	for i := 0; i < 41; i++ {
+		if i > 0 {
+			b = append(b, ';')
+		}
+		b = append(b, 'x')
+	}
+	parts := splitSemis(b)
+	if len(parts) > maxXTGETTCAPParts {
+		t.Errorf("splitSemis returned %d parts, want ≤%d", len(parts), maxXTGETTCAPParts)
+	}
+}
+
+func TestParser_DECRQSS_LongBodyReturnsNotOk(t *testing.T) {
+	// 6-byte body exceeds the 4-byte early-exit guard
+	g, p := newParserGrid(1, 5)
+	var replies []string
+	p.SetReplyHandler(func(b []byte) { replies = append(replies, string(b)) })
+	feed(t, g, p, []byte("\x1bP$qfoobar\x1b\\"))
+	want := "\x1bP0$r\x1b\\"
+	if len(replies) != 1 || replies[0] != want {
+		t.Fatalf("long body DECRQSS = %q, want %q", replies, want)
+	}
+}
+
+func TestParser_CursorSaveRestore_PreservesAutoWrapOriginInsert(t *testing.T) {
+	g, p := newParserGrid(5, 8)
+	g.AutoWrap = false
+	g.OriginMode = true
+	g.InsertMode = true
+	feed(t, g, p, []byte("\x1b7")) // DECSC
+	g.AutoWrap = true
+	g.OriginMode = false
+	g.InsertMode = false
+	feed(t, g, p, []byte("\x1b8")) // DECRC
+	if g.AutoWrap {
+		t.Error("AutoWrap should be restored to false")
+	}
+	if !g.OriginMode {
+		t.Error("OriginMode should be restored to true")
+	}
+	if !g.InsertMode {
+		t.Error("InsertMode should be restored to true")
+	}
+}
+

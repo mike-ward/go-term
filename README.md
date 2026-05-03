@@ -133,8 +133,14 @@ go test -race ./...
 go vet ./...
 ```
 
-The widget itself is GUI-only and cannot be validated headless — verify
-visually by running `cmd/demo`.
+For emulator behavior beyond unit tests, this repo now uses a replay
+suite that feeds realistic byte streams into the parser and asserts the
+final screen state, cursor position, OSC side effects, and host replies.
+See [docs/terminal-verification.md](docs/terminal-verification.md).
+
+The widget itself is still GUI-bound, so final verification should also
+include `cmd/demo` for resize, redraw, selection, paste, and application
+compatibility checks.
 
 ## License
 

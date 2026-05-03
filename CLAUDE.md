@@ -21,6 +21,12 @@ macOS + Linux only.
 # Run the demo window
 cd cmd/demo && go run .
 
+# Run the full test suite
+go test ./...
+
+# Run the replay-style emulator checks only
+go test ./term -run EmulatorReplay
+
 # Build everything
 go build ./...
 
@@ -31,10 +37,11 @@ go vet ./...
 go mod tidy
 ```
 
-There are no tests yet. The widget is GUI-only and cannot be validated
-from a headless shell — verify visually by running `cmd/demo` and trying
-`ls`, `cat`, ANSI color output, and window resize (then `stty size` in
-the embedded shell).
+There are automated tests for the grid, parser, PTY, widget helpers,
+and replay-style emulator behavior. The widget itself is still partly
+GUI-bound, so keep validating visually by running `cmd/demo` and trying
+`ls`, `cat`, ANSI color output, window resize, selection/copy, and
+full-screen apps such as `vim` or `less`.
 
 ## Local replace dependency
 

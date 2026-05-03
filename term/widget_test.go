@@ -1,6 +1,7 @@
 package term
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -231,6 +232,70 @@ func TestMouseSGRBaseButton_KnownButtons(t *testing.T) {
 				c.btn, got, ok, c.want, c.ok)
 		}
 	}
+}
+
+func newTestTermCapture() (*Term, *[]byte) {
+	buf := make([]byte, 0, 64)
+	t := &Term{grid: NewGrid(4, 8), lastMouseR: -1, lastMouseC: -1}
+	t.writeHost = func(b []byte) error {
+		buf = append(buf, b...)
+		return nil
+	}
+	return t, &buf
+}
+
+func TestTerm_OnWindowEvent_NoReportWhenFocusOff(t *testing.T) {
+	term, buf := newTestTermCapture()
+	// FocusReporting defaults to false
+	term.onWindowEvent(&gui.Event{Type: gui.EventFocused})
+	term.onWindowEvent(&gui.Event{Type: gui.EventUnfocused})
+	if got := string(*buf); got != "" {
+		t.Fatalf("focus off: got %q, want empty", got)
+	}
+}
+
+func TestTerm_OnWindowEvent_NilEventNoPanic(t *testing.T) {
+	term := &Term{grid: NewGrid(1, 5), writeHost: func([]byte) error { return nil }}
+	term.onWindowEvent(nil) // must not panic
+}
+
+func TestTerm_OnKeyDown_AppCursor(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.AppCursorKeys = true
+	e := &gui.Event{KeyCode: gui.KeyUp}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1bOA" {
+		t.Fatalf("app cursor = %q, want %q", got, "\x1bOA")
+	}
+	if !e.IsHandled {
+		t.Fatal("event should be handled")
+	}
+}
+
+func TestTerm_OnKeyDown_AppKeypad(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.AppKeypad = true
+	e := &gui.Event{KeyCode: gui.KeyKP1}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1bOq" {
+		t.Fatalf("app keypad = %q, want %q", got, "\x1bOq")
+	}
+}
+
+func TestTerm_OnWindowEvent_FocusReporting(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.FocusReporting = true
+	term.onWindowEvent(&gui.Event{Type: gui.EventFocused})
+	term.onWindowEvent(&gui.Event{Type: gui.EventUnfocused})
+	if got := string(*buf); got != "\x1b[I\x1b[O" {
+		t.Fatalf("focus reports = %q, want %q", got, "\x1b[I\x1b[O")
+	}
+}
+
+func TestTerm_WriteBytes_UsesWriteHost(t *testing.T) {
+	term := &Term{}
+	term.writeHost = func([]byte) error { return errors.New("boom") }
+	term.writeBytes([]byte("x"))
 }
 
 func TestCursorBlinks_HonorsGridDefault(t *testing.T) {

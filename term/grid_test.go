@@ -1141,6 +1141,58 @@ func TestGrid_AltResize_ReflowsMainBuffer(t *testing.T) {
 	}
 }
 
+func TestGrid_DECSCUSRParam_RoundTrip(t *testing.T) {
+	cases := []struct{ ps, want int }{
+		{1, 1}, {2, 2}, {3, 3}, {4, 4}, {5, 5}, {6, 6},
+	}
+	for _, c := range cases {
+		g := NewGrid(1, 5)
+		g.ApplyDECSCUSR(c.ps)
+		if got := g.DECSCUSRParam(); got != c.want {
+			t.Errorf("ApplyDECSCUSR(%d) → DECSCUSRParam() = %d, want %d", c.ps, got, c.want)
+		}
+	}
+}
+
+func TestGrid_AltScreen_PreservesInsertOriginWrap(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.AutoWrap = false
+	g.OriginMode = true
+	g.InsertMode = true
+
+	g.EnterAlt()
+	if !g.AutoWrap {
+		t.Error("alt screen should reset AutoWrap to true")
+	}
+	if g.OriginMode {
+		t.Error("alt screen should reset OriginMode to false")
+	}
+	if g.InsertMode {
+		t.Error("alt screen should reset InsertMode to false")
+	}
+
+	g.ExitAlt()
+	if g.AutoWrap {
+		t.Error("AutoWrap should be restored to false after ExitAlt")
+	}
+	if !g.OriginMode {
+		t.Error("OriginMode should be restored to true after ExitAlt")
+	}
+	if !g.InsertMode {
+		t.Error("InsertMode should be restored to true after ExitAlt")
+	}
+}
+
+func TestGrid_MoveCursorOrigin_WhenOriginModeOff(t *testing.T) {
+	g := NewGrid(5, 8)
+	g.SetScrollRegion(1, 3)
+	// OriginMode defaults to false — MoveCursorOrigin must delegate to MoveCursor
+	g.MoveCursorOrigin(2, 3)
+	if g.CursorR != 2 || g.CursorC != 3 {
+		t.Errorf("cursor = %d,%d, want 2,3", g.CursorR, g.CursorC)
+	}
+}
+
 func TestGrid_AltDECSC_DoesNotClobberMainSave(t *testing.T) {
 	g := NewGrid(3, 4)
 	g.MoveCursor(2, 3)

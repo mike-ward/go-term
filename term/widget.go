@@ -215,6 +215,15 @@ type Term struct {
 	// blinkDone signals the blink ticker goroutine to exit. Closed by
 	// Close.
 	blinkDone chan struct{}
+
+	// writeHost forwards bytes to the PTY. Tests replace this with a
+	// buffer sink so key/focus behavior can be asserted without a live PTY.
+	writeHost func([]byte) error
+}
+
+type keyModes struct {
+	appCursor bool
+	appKeypad bool
 }
 
 // New starts a shell in a PTY and returns a Term widget. The reader
@@ -246,8 +255,19 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		cursorEpoch: time.Now(),
 		blinkDone:   make(chan struct{}),
 	}
+	t.writeHost = func(b []byte) error {
+		_, err := t.pty.Write(b)
+		return err
+	}
 	t.parser.SetTitleHandler(t.onParserTitle)
 	t.parser.SetReplyHandler(t.onParserReply)
+	prevOnEvent := w.OnEvent
+	w.OnEvent = func(e *gui.Event, w *gui.Window) {
+		t.onWindowEvent(e)
+		if prevOnEvent != nil {
+			prevOnEvent(e, w)
+		}
+	}
 	w.SetIDFocus(focusID)
 	go t.readLoop()
 	go t.blinkLoop()
@@ -308,8 +328,32 @@ func (t *Term) onParserTitle(title string) {
 // to the PTY. Called under Grid.Mu; pty.Write is independent of that
 // lock so this is safe.
 func (t *Term) onParserReply(b []byte) {
-	if _, err := t.pty.Write(b); err != nil {
+	if err := t.writeHost(b); err != nil {
 		log.Printf("term: pty reply: %v", err)
+	}
+}
+
+func (t *Term) onWindowEvent(e *gui.Event) {
+	if e == nil {
+		return
+	}
+	var report []byte
+	t.grid.Mu.Lock()
+	focus := t.grid.FocusReporting
+	t.grid.Mu.Unlock()
+	if !focus {
+		return
+	}
+	switch e.Type {
+	case gui.EventFocused:
+		report = []byte("\x1b[I")
+	case gui.EventUnfocused:
+		report = []byte("\x1b[O")
+	default:
+		return
+	}
+	if err := t.writeHost(report); err != nil {
+		log.Printf("term: pty focus report: %v", err)
 	}
 }
 
@@ -371,10 +415,13 @@ func (t *Term) readLoop() {
 		if n > 0 {
 			t.grid.Mu.Lock()
 			t.parser.Feed(buf[:n])
+			redraw := !t.grid.SyncOutput || !t.grid.SyncActive
 			t.grid.Mu.Unlock()
-			t.win.QueueCommand(func(w *gui.Window) {
-				w.UpdateWindow()
-			})
+			if redraw {
+				t.win.QueueCommand(func(w *gui.Window) {
+					w.UpdateWindow()
+				})
+			}
 		}
 		if err != nil {
 			return
@@ -549,9 +596,7 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 	var buf [4]byte
 	n := utf8.EncodeRune(buf[:], r)
 	if n > 0 {
-		if _, err := t.pty.Write(buf[:n]); err != nil {
-			log.Printf("term: pty write: %v", err)
-		}
+		t.writeBytes(buf[:n])
 	}
 	e.IsHandled = true
 }
@@ -634,8 +679,14 @@ func (m mouseSnap) shouldReport() bool { return m.report && m.sgr && m.live }
 func (t *Term) writeMouse(cb, col, row int, press bool) {
 	var buf [24]byte
 	out := encodeMouseSGR(buf[:0], cb, col, row, press)
-	if _, err := t.pty.Write(out); err != nil {
+	if err := t.writeHost(out); err != nil {
 		log.Printf("term: pty mouse: %v", err)
+	}
+}
+
+func (t *Term) writeBytes(out []byte) {
+	if err := t.writeHost(out); err != nil {
+		log.Printf("term: pty write: %v", err)
 	}
 }
 
@@ -742,17 +793,10 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.dragging = false
-	t.grid.Mu.Lock()
-	active := t.grid.SelActive
-	text := ""
-	if active {
-		text = t.grid.SelectedText()
-	} else {
+	if !t.copySelection(w) {
+		t.grid.Mu.Lock()
 		t.grid.ClearSelection()
-	}
-	t.grid.Mu.Unlock()
-	if active && text != "" {
-		w.SetClipboard(text)
+		t.grid.Mu.Unlock()
 	}
 	w.UpdateWindow()
 	e.IsHandled = true
@@ -787,7 +831,7 @@ func (t *Term) pasteFromClipboard(w *gui.Window) {
 	if bracketed {
 		payload = pasteStart + clean + pasteEnd
 	}
-	if _, err := t.pty.Write([]byte(payload)); err != nil {
+	if err := t.writeHost([]byte(payload)); err != nil {
 		log.Printf("term: pty paste: %v", err)
 	}
 }
@@ -835,6 +879,54 @@ func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	e.IsHandled = true
 }
 
+func (t *Term) keyModes() keyModes {
+	t.grid.Mu.Lock()
+	defer t.grid.Mu.Unlock()
+	return keyModes{
+		appCursor: t.grid.AppCursorKeys,
+		appKeypad: t.grid.AppKeypad,
+	}
+}
+
+func keypadSeq(k gui.KeyCode) []byte {
+	switch k {
+	case gui.KeyKP0:
+		return []byte("\x1bOp")
+	case gui.KeyKP1:
+		return []byte("\x1bOq")
+	case gui.KeyKP2:
+		return []byte("\x1bOr")
+	case gui.KeyKP3:
+		return []byte("\x1bOs")
+	case gui.KeyKP4:
+		return []byte("\x1bOt")
+	case gui.KeyKP5:
+		return []byte("\x1bOu")
+	case gui.KeyKP6:
+		return []byte("\x1bOv")
+	case gui.KeyKP7:
+		return []byte("\x1bOw")
+	case gui.KeyKP8:
+		return []byte("\x1bOx")
+	case gui.KeyKP9:
+		return []byte("\x1bOy")
+	case gui.KeyKPDecimal:
+		return []byte("\x1bOn")
+	case gui.KeyKPDivide:
+		return []byte("\x1bOo")
+	case gui.KeyKPMultiply:
+		return []byte("\x1bOj")
+	case gui.KeyKPSubtract:
+		return []byte("\x1bOm")
+	case gui.KeyKPAdd:
+		return []byte("\x1bOk")
+	case gui.KeyKPEqual:
+		return []byte("\x1bOX")
+	default:
+		return nil
+	}
+}
+
 // onKeyDown receives non-character keys (arrows, Enter, Backspace,
 // Ctrl+letter combinations, etc.) and emits the corresponding terminal
 // byte sequence. Scrollback navigation keys (PgUp/PgDn, Shift+Home/End)
@@ -844,6 +936,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	shift := e.Modifiers.Has(gui.ModShift)
 	cmd := e.Modifiers.Has(gui.ModSuper)
 	ctrl := e.Modifiers.Has(gui.ModCtrl)
+	modes := t.keyModes()
 
 	// Copy: Cmd+C (macOS) or Ctrl+Shift+C. Only suppress when there
 	// is a non-empty selection so plain Ctrl+C still SIGINTs the child.
@@ -895,7 +988,11 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	var out []byte
 	switch e.KeyCode {
 	case gui.KeyEnter, gui.KeyKPEnter:
-		out = []byte{'\r'}
+		if modes.appKeypad && e.KeyCode == gui.KeyKPEnter {
+			out = []byte("\x1bOM")
+		} else {
+			out = []byte{'\r'}
+		}
 	case gui.KeyBackspace:
 		out = []byte{0x7F}
 	case gui.KeyTab:
@@ -903,20 +1000,50 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	case gui.KeyEscape:
 		out = []byte{0x1B}
 	case gui.KeyUp:
-		out = []byte("\x1b[A")
+		if modes.appCursor {
+			out = []byte("\x1bOA")
+		} else {
+			out = []byte("\x1b[A")
+		}
 	case gui.KeyDown:
-		out = []byte("\x1b[B")
+		if modes.appCursor {
+			out = []byte("\x1bOB")
+		} else {
+			out = []byte("\x1b[B")
+		}
 	case gui.KeyRight:
-		out = []byte("\x1b[C")
+		if modes.appCursor {
+			out = []byte("\x1bOC")
+		} else {
+			out = []byte("\x1b[C")
+		}
 	case gui.KeyLeft:
-		out = []byte("\x1b[D")
+		if modes.appCursor {
+			out = []byte("\x1bOD")
+		} else {
+			out = []byte("\x1b[D")
+		}
 	case gui.KeyHome:
-		out = []byte("\x1b[H")
+		if modes.appCursor {
+			out = []byte("\x1bOH")
+		} else {
+			out = []byte("\x1b[H")
+		}
 	case gui.KeyEnd:
-		out = []byte("\x1b[F")
+		if modes.appCursor {
+			out = []byte("\x1bOF")
+		} else {
+			out = []byte("\x1b[F")
+		}
 	case gui.KeyDelete:
 		out = []byte("\x1b[3~")
 	default:
+		if modes.appKeypad {
+			out = keypadSeq(e.KeyCode)
+			if len(out) > 0 {
+				break
+			}
+		}
 		// Ctrl+letter → control byte. Letter keys are KeyA..KeyZ.
 		if e.Modifiers.Has(gui.ModCtrl) &&
 			e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
@@ -927,9 +1054,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.snapToLive()
-	if _, err := t.pty.Write(out); err != nil {
-		log.Printf("term: pty write: %v", err)
-	}
+	t.writeBytes(out)
 	e.IsHandled = true
 }
 
@@ -960,4 +1085,3 @@ func (t *Term) scrollToBottom(w *gui.Window) {
 	t.grid.Mu.Unlock()
 	w.UpdateWindow()
 }
-

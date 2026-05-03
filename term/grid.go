@@ -73,6 +73,27 @@ func (g *Grid) ApplyDECSCUSR(ps int) {
 	}
 }
 
+// DECSCUSRParam returns the current cursor-style parameter for DECRQSS.
+func (g *Grid) DECSCUSRParam() int {
+	switch g.CursorShape {
+	case CursorUnderline:
+		if g.CursorBlink {
+			return 3
+		}
+		return 4
+	case CursorBar:
+		if g.CursorBlink {
+			return 5
+		}
+		return 6
+	default:
+		if g.CursorBlink {
+			return 1
+		}
+		return 2
+	}
+}
+
 // MaxGridDim caps each dimension of the cell buffer. Real terminals stay
 // well below this; the cap exists so a runaway resize (huge canvas, NaN
 // metrics, malicious caller) can't allocate hundreds of megabytes.
@@ -162,10 +183,13 @@ func blankCell(fg, bg uint32, attrs uint8) Cell {
 // Stores position and SGR state per VT100 spec. Zero value means no
 // snapshot has been taken yet (valid == false).
 type savedCursor struct {
-	r, c   int
-	fg, bg uint32
-	attrs  uint8
-	valid  bool
+	r, c       int
+	fg, bg     uint32
+	attrs      uint8
+	autoWrap   bool
+	originMode bool
+	insertMode bool
+	valid      bool
 }
 
 // altSavedScreen captures everything needed to restore the main screen
@@ -177,6 +201,9 @@ type altSavedScreen struct {
 	cursorR, cursorC int
 	curFG, curBG     uint32
 	curAttrs         uint8
+	autoWrap         bool
+	originMode       bool
+	insertMode       bool
 	top, bottom      int
 	saved            savedCursor
 }
@@ -185,17 +212,25 @@ type altSavedScreen struct {
 // concurrent callers via Mu; the parser writes under Mu, OnDraw reads
 // under Mu.
 type Grid struct {
-	Mu            sync.Mutex
-	Rows          int
-	Cols          int
-	Cells         []Cell // row-major, len = Rows*Cols
-	CursorR       int
-	CursorC       int
-	CurFG         uint32 // packed Color
-	CurBG         uint32
-	CurAttrs      uint8
+	Mu             sync.Mutex
+	Rows           int
+	Cols           int
+	Cells          []Cell // row-major, len = Rows*Cols
+	CursorR        int
+	CursorC        int
+	CurFG          uint32 // packed Color
+	CurBG          uint32
+	CurAttrs       uint8
+	AutoWrap       bool // DEC ?7 — autowrap at right margin
+	OriginMode     bool // DEC ?6 — CUP/HVP/VPA relative to scroll region
+	InsertMode     bool // CSI 4 h/l — insert vs replace on Put
 	CursorVisible  bool // hidden via DEC ?25 l, shown via ?25 h
 	BracketedPaste bool // DEC ?2004 — wrap pasted text in markers
+	FocusReporting bool // DEC ?1004 — report focus in/out to host
+	SyncOutput     bool // DEC ?2026 — allow synchronized updates
+	SyncActive     bool // currently inside a synchronized update block
+	AppCursorKeys  bool // DEC ?1 — application cursor key mode
+	AppKeypad      bool // DECNKM — application keypad mode
 
 	// Cursor shape + blink. Set via DECSCUSR (CSI Ps SP q). Default is
 	// blinking block (Ps=0/1). Embedders can override blink via
@@ -360,6 +395,7 @@ func NewGrid(rows, cols int) *Grid {
 		Cells:         make([]Cell, rows*cols),
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
+		AutoWrap:      true,
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
 		CursorBlink:   true,
@@ -477,14 +513,21 @@ func (g *Grid) Put(ch rune) {
 	if w == 0 {
 		return
 	}
-	if g.CursorC >= g.Cols {
+	if !g.AutoWrap {
+		if g.CursorC >= g.Cols {
+			g.CursorC = g.Cols - 1
+		}
+		if w == 2 && g.CursorC+1 >= g.Cols {
+			w = 1
+		}
+	} else if g.CursorC >= g.Cols {
 		g.Newline()
 		g.CursorC = 0
 	}
 	// Wide-char would overflow the right margin: pad the trailing
 	// column blank, wrap, then place the wide char at column 0. The
 	// blank pad inherits current SGR so background runs stay coherent.
-	if w == 2 && g.CursorC+1 >= g.Cols {
+	if g.AutoWrap && w == 2 && g.CursorC+1 >= g.Cols {
 		if c := g.At(g.CursorR, g.CursorC); c != nil {
 			*c = blankCell(g.CurFG, g.CurBG, g.CurAttrs)
 		}
@@ -493,6 +536,9 @@ func (g *Grid) Put(ch rune) {
 	}
 	// About to overwrite a cell that's part of an existing wide pair?
 	// Clear the orphaned partner so we don't leave a stale glyph.
+	if g.InsertMode {
+		g.InsertChars(w)
+	}
 	g.eraseWideAt(g.CursorR, g.CursorC)
 	if w == 2 {
 		g.eraseWideAt(g.CursorR, g.CursorC+1)
@@ -512,6 +558,9 @@ func (g *Grid) Put(ch rune) {
 		}
 	}
 	g.CursorC += w
+	if !g.AutoWrap && g.CursorC >= g.Cols {
+		g.CursorC = g.Cols - 1
+	}
 }
 
 // eraseWideAt sanitizes the wide-char pair (if any) covering (r,c) so
@@ -616,9 +665,46 @@ func (g *Grid) MoveCursor(r, c int) {
 	g.CursorR, g.CursorC = r, c
 }
 
+// MoveCursorOrigin applies DECOM semantics: r is relative to Top when
+// OriginMode is enabled, and the row is clamped to the active scroll
+// region. Column handling remains full-width.
+func (g *Grid) MoveCursorOrigin(r, c int) {
+	if !g.OriginMode || !g.regionValid() {
+		g.MoveCursor(r, c)
+		return
+	}
+	r += g.Top
+	if r < g.Top {
+		r = g.Top
+	}
+	if r > g.Bottom {
+		r = g.Bottom
+	}
+	if c < 0 {
+		c = 0
+	}
+	if c >= g.Cols {
+		c = g.Cols - 1
+	}
+	g.CursorR, g.CursorC = r, c
+}
+
 // CursorUp/Down/Forward/Back move the cursor by n cells, clamped.
-func (g *Grid) CursorUp(n int)      { g.MoveCursor(g.CursorR-n, g.CursorC) }
-func (g *Grid) CursorDown(n int)    { g.MoveCursor(g.CursorR+n, g.CursorC) }
+func (g *Grid) CursorUp(n int) {
+	r := g.CursorR - n
+	if g.OriginMode && g.regionValid() && g.CursorR >= g.Top && g.CursorR <= g.Bottom && r < g.Top {
+		r = g.Top
+	}
+	g.MoveCursor(r, g.CursorC)
+}
+
+func (g *Grid) CursorDown(n int) {
+	r := g.CursorR + n
+	if g.OriginMode && g.regionValid() && g.CursorR >= g.Top && g.CursorR <= g.Bottom && r > g.Bottom {
+		r = g.Bottom
+	}
+	g.MoveCursor(r, g.CursorC)
+}
 func (g *Grid) CursorForward(n int) { g.MoveCursor(g.CursorR, g.CursorC+n) }
 func (g *Grid) CursorBack(n int)    { g.MoveCursor(g.CursorR, g.CursorC-n) }
 
@@ -677,12 +763,15 @@ func (g *Grid) EraseInDisplay(mode int) {
 // DECSC (ESC 7) and CSI s. Subsequent SaveCursor calls overwrite.
 func (g *Grid) SaveCursor() {
 	g.saved = savedCursor{
-		r:     g.CursorR,
-		c:     g.CursorC,
-		fg:    g.CurFG,
-		bg:    g.CurBG,
-		attrs: g.CurAttrs,
-		valid: true,
+		r:          g.CursorR,
+		c:          g.CursorC,
+		fg:         g.CurFG,
+		bg:         g.CurBG,
+		attrs:      g.CurAttrs,
+		autoWrap:   g.AutoWrap,
+		originMode: g.OriginMode,
+		insertMode: g.InsertMode,
+		valid:      true,
 	}
 }
 
@@ -698,6 +787,9 @@ func (g *Grid) RestoreCursor() {
 	g.CurFG = g.saved.fg
 	g.CurBG = g.saved.bg
 	g.CurAttrs = g.saved.attrs
+	g.AutoWrap = g.saved.autoWrap
+	g.OriginMode = g.saved.originMode
+	g.InsertMode = g.saved.insertMode
 }
 
 // regionValid reports whether Top/Bottom describe a usable region.
@@ -790,12 +882,16 @@ func (g *Grid) scrollDownRegion(n int) {
 // out of bounds) reset to full screen. Cursor is homed to (0, 0)
 // per DEC convention.
 func (g *Grid) SetScrollRegion(top, bottom int) {
-	if top < 0 || bottom >= g.Rows || top > bottom {
+	if top < 0 || bottom >= g.Rows || top >= bottom {
 		g.Top = 0
 		g.Bottom = g.Rows - 1
 	} else {
 		g.Top = top
 		g.Bottom = bottom
+	}
+	if g.OriginMode && g.regionValid() {
+		g.CursorR, g.CursorC = g.Top, 0
+		return
 	}
 	g.CursorR, g.CursorC = 0, 0
 }
@@ -930,7 +1026,7 @@ func (g *Grid) ScrollView(delta int) {
 	case delta < 0 && g.ViewOffset < -delta:
 		g.ViewOffset = 0
 	default:
-		g.ViewOffset = clampViewOffset(g.ViewOffset+delta, max)
+		g.ViewOffset = clamp(g.ViewOffset+delta, 0, max)
 	}
 }
 
@@ -940,16 +1036,6 @@ func (g *Grid) ResetView() { g.ViewOffset = 0 }
 // ScrollViewTop moves the viewport to the oldest scrollback row.
 func (g *Grid) ScrollViewTop() { g.ViewOffset = len(g.Scrollback) }
 
-// clampViewOffset bounds off to [0, max].
-func clampViewOffset(off, max int) int {
-	if off < 0 {
-		return 0
-	}
-	if off > max {
-		return max
-	}
-	return off
-}
 
 // ViewCellAt returns the cell visible at viewport position (r, c)
 // honoring ViewOffset. When the viewport row falls inside scrollback,
@@ -960,7 +1046,7 @@ func (g *Grid) ViewCellAt(r, c int) Cell {
 	if r < 0 || r >= g.Rows || c < 0 || c >= g.Cols {
 		return defaultCell()
 	}
-	off := clampViewOffset(g.ViewOffset, len(g.Scrollback))
+	off := clamp(g.ViewOffset, 0, len(g.Scrollback))
 	if off == 0 {
 		return g.Cells[r*g.Cols+c]
 	}
@@ -985,15 +1071,18 @@ func (g *Grid) EnterAlt() {
 		return
 	}
 	g.mainSaved = altSavedScreen{
-		cells:   g.Cells,
-		cursorR: g.CursorR,
-		cursorC: g.CursorC,
-		curFG:   g.CurFG,
-		curBG:   g.CurBG,
-		curAttrs: g.CurAttrs,
-		top:     g.Top,
-		bottom:  g.Bottom,
-		saved:   g.saved,
+		cells:      g.Cells,
+		cursorR:    g.CursorR,
+		cursorC:    g.CursorC,
+		curFG:      g.CurFG,
+		curBG:      g.CurBG,
+		curAttrs:   g.CurAttrs,
+		autoWrap:   g.AutoWrap,
+		originMode: g.OriginMode,
+		insertMode: g.InsertMode,
+		top:        g.Top,
+		bottom:     g.Bottom,
+		saved:      g.saved,
 	}
 	cells := make([]Cell, g.Rows*g.Cols)
 	blank := defaultCell()
@@ -1003,6 +1092,9 @@ func (g *Grid) EnterAlt() {
 	g.Cells = cells
 	g.CursorR, g.CursorC = 0, 0
 	g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+	g.AutoWrap = true
+	g.OriginMode = false
+	g.InsertMode = false
 	g.Top, g.Bottom = 0, g.Rows-1
 	g.saved = savedCursor{}
 	g.AltActive = true
@@ -1022,6 +1114,9 @@ func (g *Grid) ExitAlt() {
 	g.CurFG = g.mainSaved.curFG
 	g.CurBG = g.mainSaved.curBG
 	g.CurAttrs = g.mainSaved.curAttrs
+	g.AutoWrap = g.mainSaved.autoWrap
+	g.OriginMode = g.mainSaved.originMode
+	g.InsertMode = g.mainSaved.insertMode
 	g.Top, g.Bottom = g.mainSaved.top, g.mainSaved.bottom
 	g.saved = g.mainSaved.saved
 	g.mainSaved = altSavedScreen{}
