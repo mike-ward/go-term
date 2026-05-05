@@ -3,6 +3,8 @@ package term
 import (
 	"log"
 	"math"
+	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -206,6 +208,13 @@ type Term struct {
 	lastMouseR int
 	lastMouseC int
 
+	// hoverR/hoverC track the cell under the pointer for hyperlink
+	// hover highlighting. Updated in onMouseMove; read (unsynchronized)
+	// in onDraw. A benign data race: worst case is one stale frame.
+	// Set to (-1, -1) until the first mouse move.
+	hoverR int
+	hoverC int
+
 	// closed guards Close so multiple calls are safe.
 	closed atomic.Bool
 
@@ -220,6 +229,13 @@ type Term struct {
 	// writeHost forwards bytes to the PTY. Tests replace this with a
 	// buffer sink so key/focus behavior can be asserted without a live PTY.
 	writeHost func([]byte) error
+
+	// Search state. All fields accessed on the GUI goroutine only (onChar,
+	// onKeyDown, onDraw) — no lock required.
+	searchActive  bool
+	searchQuery   string
+	searchMatches []ContentPos // viewport matches refreshed each onDraw
+	searchIdx     int          // index of last jump target in searchMatches
 }
 
 type keyModes struct {
@@ -253,6 +269,8 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		win:         w,
 		lastMouseR:  -1,
 		lastMouseC:  -1,
+		hoverR:      -1,
+		hoverC:      -1,
 		cursorEpoch: time.Now(),
 		blinkDone:   make(chan struct{}),
 	}
@@ -262,6 +280,12 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 	}
 	t.parser.SetTitleHandler(t.onParserTitle)
 	t.parser.SetReplyHandler(t.onParserReply)
+	t.parser.SetClipboardHandler(func(data []byte) {
+		text := string(data)
+		t.win.QueueCommand(func(w *gui.Window) {
+			w.SetClipboard(text)
+		})
+	})
 	prevOnEvent := w.OnEvent
 	w.OnEvent = func(e *gui.Event, w *gui.Window) {
 		t.onWindowEvent(e)
@@ -464,13 +488,25 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		}
 	}
 
-	// Fast path: live viewport with no selection reads directly from
-	// the cell buffer, skipping ViewOffset / scrollback branches and
-	// per-cell InSelection work.
+	// Fast path: live viewport with no selection and no active search reads
+	// directly from the cell buffer, skipping ViewOffset / scrollback
+	// branches and per-cell InSelection / search-match work.
 	g := t.grid
 	rows, cols = g.Rows, g.Cols
-	live := g.ViewOffset == 0 && !g.SelActive
+	live := g.ViewOffset == 0 && !g.SelActive && !t.searchActive
 	cells := g.Cells
+
+	// Collect viewport search matches while holding Mu (ViewportMatches is
+	// cheap: at most Rows rows). Cache into t.searchMatches so searchJump
+	// can use the most-recent result without re-locking.
+	var vMatches []ContentPos
+	var qRunes []rune
+	if t.searchActive && t.searchQuery != "" {
+		vMatches = g.ViewportMatches(t.searchQuery)
+		qRunes = []rune(t.searchQuery)
+		t.searchMatches = vMatches
+	}
+
 	resolveCell := func(r, c int) Cell {
 		if live {
 			return cells[r*cols+c]
@@ -479,11 +515,31 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		if g.InSelection(r, c) {
 			cell.Attrs ^= AttrInverse
 		}
+		if len(qRunes) > 0 {
+			qLen := len(qRunes)
+			for _, m := range vMatches {
+				vr, ok := g.ContentRowToViewport(m.Row)
+				if ok && vr == r && c >= m.Col && c < m.Col+qLen {
+					cell.Attrs ^= AttrInverse
+					break
+				}
+			}
+		}
 		return cell
 	}
 
+	// When the search bar is active it owns the last row — skip that row in
+	// both cell passes so terminal text doesn't bleed through the overlay.
+	renderRows := rows
+	if t.searchActive {
+		renderRows = rows - 1
+		if renderRows < 0 {
+			renderRows = 0
+		}
+	}
+
 	// Background pass: coalesce runs of equal bg color per row.
-	for r := range rows {
+	for r := range renderRows {
 		runStart := 0
 		runColor := bg(resolveCell(r, 0))
 		for c := 1; c < cols; c++ {
@@ -502,13 +558,13 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	// Continuation cells (right half of a wide char) carry Width==0
 	// and a NUL rune — skip them entirely; the wide head's glyph
 	// renders into both columns at draw time.
-	for r := range rows {
+	for r := range renderRows {
 		for c := range cols {
 			cell := resolveCell(r, c)
 			if cell.Width == 0 && cell.Ch == 0 {
 				continue
 			}
-			if cell.Ch == ' ' && cell.Attrs == 0 {
+			if cell.Ch == ' ' && cell.Attrs == 0 && cell.LinkID == 0 {
 				continue
 			}
 			cs := style
@@ -530,6 +586,18 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 				cs.Underline = cell.Attrs&AttrUnderline != 0
 				cs.Strikethrough = cell.Attrs&AttrStrikethrough != 0
 			}
+			if cell.LinkID != 0 {
+				cs.Underline = true
+				// Hover: same link as the cell under the pointer gets
+				// brightened toward blue (xterm hyperlink convention).
+				hR, hC := t.hoverR, t.hoverC // benign unsynchronized read
+				if hR >= 0 && hC >= 0 {
+					if g.ViewCellAt(hR, hC).LinkID == cell.LinkID {
+						col := cs.Color
+						cs.Color = gui.RGB(col.R/2, col.G/2, 255)
+					}
+				}
+			}
 			dc.Text(float32(c)*t.cellW, float32(r)*t.cellH,
 				runeString(cell.Ch), cs)
 		}
@@ -547,6 +615,10 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		if cell := g.At(g.CursorR, cc); cell != nil {
 			t.drawCursor(dc, cc, g.CursorR, *cell, g.CursorShape, style)
 		}
+	}
+
+	if t.searchActive {
+		t.drawSearchBar(dc, rows, cols, style)
 	}
 	t.grid.Mu.Unlock()
 }
@@ -603,9 +675,32 @@ func (t *Term) fillRun(dc *gui.DrawContext, row, c0, c1 int, color gui.Color) {
 	dc.FilledRect(x, y, w, t.cellH, color)
 }
 
+// drawSearchBar paints a status bar over the bottom row of the canvas
+// showing the active search query. Called under Mu (inside onDraw).
+func (t *Term) drawSearchBar(dc *gui.DrawContext, rows, cols int, style gui.TextStyle) {
+	y := float32(rows-1) * t.cellH
+	noMatch := t.searchQuery != "" && len(t.searchMatches) == 0
+	bgColor := gui.RGB(40, 40, 90)
+	if noMatch {
+		bgColor = gui.RGB(90, 20, 20)
+	}
+	dc.FilledRect(0, y, float32(cols)*t.cellW, t.cellH, bgColor)
+	label := "Find: " + t.searchQuery + "▌"
+	cs := style
+	cs.Color = gui.RGB(220, 220, 220)
+	cs.Typeface = glyph.TypefaceRegular
+	dc.Text(0, y, label, cs)
+}
+
 // onChar receives printable character input from the OS.
 func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 	if e.CharCode == 0 {
+		return
+	}
+	if t.searchActive {
+		t.searchQuery += string(rune(e.CharCode))
+		e.IsHandled = true
+		t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
 		return
 	}
 	t.snapToLive()
@@ -776,6 +871,8 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		}
 	}
 	if !t.dragging || t.dragReport {
+		// Update hover for hyperlink highlighting even when not dragging.
+		t.updateHover(r, c, w)
 		return
 	}
 	t.grid.Mu.Lock()
@@ -784,7 +881,27 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		t.grid.SelActive = true
 	}
 	t.grid.Mu.Unlock()
-	w.UpdateWindow()
+	t.updateHover(r, c, w)
+}
+
+// updateHover updates t.hoverR/C and requests a redraw when entering or
+// leaving a hyperlinked cell run.
+func (t *Term) updateHover(r, c int, w *gui.Window) {
+	if r == t.hoverR && c == t.hoverC {
+		return
+	}
+	oldR, oldC := t.hoverR, t.hoverC
+	t.hoverR, t.hoverC = r, c
+	t.grid.Mu.Lock()
+	var prevLink, curLink uint16
+	if oldR >= 0 && oldC >= 0 {
+		prevLink = t.grid.ViewCellAt(oldR, oldC).LinkID
+	}
+	curLink = t.grid.ViewCellAt(r, c).LinkID
+	t.grid.Mu.Unlock()
+	if prevLink != 0 || curLink != 0 {
+		w.UpdateWindow()
+	}
 }
 
 // onMouseUp handles button-release. A drag started under reporting
@@ -810,6 +927,20 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.dragging = false
+	// Single click (no drag) with Cmd/Ctrl on a hyperlink → open URL.
+	if !t.grid.SelActive {
+		if e.Modifiers&gui.ModSuper != 0 || e.Modifiers&gui.ModCtrl != 0 {
+			t.grid.Mu.Lock()
+			cell := t.grid.ViewCellAt(r, c)
+			url := t.grid.LinkURL(cell.LinkID)
+			t.grid.Mu.Unlock()
+			if url != "" {
+				openURL(url)
+				e.IsHandled = true
+				return
+			}
+		}
+	}
 	if !t.copySelection(w) {
 		t.grid.Mu.Lock()
 		t.grid.ClearSelection()
@@ -817,6 +948,18 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	}
 	w.UpdateWindow()
 	e.IsHandled = true
+}
+
+// openURL opens url with the OS default browser/handler.
+func openURL(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	_ = cmd.Start()
 }
 
 // stripPasteEnd removes any embedded paste-end markers from s. Without
@@ -954,6 +1097,38 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	cmd := e.Modifiers.Has(gui.ModSuper)
 	ctrl := e.Modifiers.Has(gui.ModCtrl)
 	modes := t.keyModes()
+
+	// Search: Cmd+F opens the search bar.
+	if e.KeyCode == gui.KeyF && cmd {
+		t.searchActive = true
+		t.searchQuery = ""
+		t.searchMatches = nil
+		t.searchIdx = 0
+		e.IsHandled = true
+		w.UpdateWindow()
+		return
+	}
+
+	// While in search mode, intercept navigation and editing keys.
+	if t.searchActive {
+		switch e.KeyCode {
+		case gui.KeyEnter, gui.KeyKPEnter:
+			t.searchJump(!shift, w)
+		case gui.KeyBackspace:
+			if len(t.searchQuery) > 0 {
+				rr := []rune(t.searchQuery)
+				t.searchQuery = string(rr[:len(rr)-1])
+				w.UpdateWindow()
+			}
+		case gui.KeyEscape:
+			t.searchActive = false
+			t.searchQuery = ""
+			t.searchMatches = nil
+			w.UpdateWindow()
+		}
+		e.IsHandled = true
+		return
+	}
 
 	// Copy: Cmd+C (macOS) or Ctrl+Shift+C. Only suppress when there
 	// is a non-empty selection so plain Ctrl+C still SIGINTs the child.
@@ -1101,4 +1276,34 @@ func (t *Term) scrollToBottom(w *gui.Window) {
 	t.grid.ResetView()
 	t.grid.Mu.Unlock()
 	w.UpdateWindow()
+}
+
+// searchJump finds the next (forward=true) or previous (forward=false) match
+// for the current search query and scrolls the viewport to show it.
+func (t *Term) searchJump(forward bool, w *gui.Window) {
+	if t.searchQuery == "" {
+		return
+	}
+	g := t.grid
+	g.Mu.Lock()
+	sb := len(g.Scrollback)
+	var start ContentPos
+	if len(t.searchMatches) > 0 && t.searchIdx < len(t.searchMatches) {
+		start = t.searchMatches[t.searchIdx]
+	} else {
+		start = ContentPos{Row: sb - clamp(g.ViewOffset, 0, sb)}
+	}
+	pos, ok := g.Find(t.searchQuery, start, forward)
+	if ok {
+		liveRow := pos.Row - sb
+		if liveRow >= 0 {
+			g.ViewOffset = 0
+		} else {
+			g.ViewOffset = clamp(sb-pos.Row, 0, sb)
+		}
+	}
+	g.Mu.Unlock()
+	if ok {
+		w.UpdateWindow()
+	}
 }
