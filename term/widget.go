@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -226,6 +227,12 @@ type Term struct {
 	// Close.
 	blinkDone chan struct{}
 
+	// autoScrollDir drives the selection auto-scroll goroutine during a
+	// drag that extends outside the widget (-1 = toward live,
+	// +1 = into scrollback, 0 = no scroll). Written on the main
+	// thread; read in autoScrollLoop — atomic for safety.
+	autoScrollDir atomic.Int32
+
 	// drawVersion is incremented on every visual state change so that
 	// go-gui's DrawCanvas tessellation cache can skip OnDraw on unchanged
 	// frames. Reads happen on the main thread (View); writes happen on
@@ -236,12 +243,28 @@ type Term struct {
 	// buffer sink so key/focus behavior can be asserted without a live PTY.
 	writeHost func([]byte) error
 
+	// scrollAcc carries sub-cell pixel remainder between live scroll events
+	// so no movement is lost. Main-thread only; no lock needed.
+	scrollAcc float32
+
 	// Search state. All fields accessed on the GUI goroutine only (onChar,
 	// onKeyDown, onDraw) — no lock required.
 	searchActive  bool
 	searchQuery   string
 	searchMatches []ContentPos // viewport matches refreshed each onDraw
 	searchIdx     int          // index of last jump target in searchMatches
+
+	// Momentum scroll state. momentumVel/Acc/CellH/Coasting protected by
+	// momentumMu. momentumTimer and momentumKick owned by the GUI goroutine
+	// (onMouseScroll) except for the timer callback, which only touches
+	// momentumMu-protected fields.
+	momentumMu       sync.Mutex
+	momentumVel      float64      // EMA of recent scroll deltas (pixels)
+	momentumAcc      float64      // sub-cell pixel remainder for coast
+	momentumCellH    float32      // cellH snapshot at last scroll event
+	momentumCoasting bool         // true while goroutine is decelerating
+	momentumKick     chan struct{} // buffered 1; wakes momentumLoop
+	momentumTimer    *time.Timer  // reset on each scroll; fires kickMomentum
 }
 
 type keyModes struct {
@@ -277,8 +300,9 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		lastMouseC:  -1,
 		hoverR:      -1,
 		hoverC:      -1,
-		cursorEpoch: time.Now(),
-		blinkDone:   make(chan struct{}),
+		cursorEpoch:  time.Now(),
+		blinkDone:    make(chan struct{}),
+		momentumKick: make(chan struct{}, 1),
 	}
 	t.writeHost = func(b []byte) error {
 		_, err := t.pty.Write(b)
@@ -302,6 +326,8 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 	w.SetIDFocus(focusID)
 	go t.readLoop()
 	go t.blinkLoop()
+	go t.autoScrollLoop()
+	go t.momentumLoop()
 	return t, nil
 }
 
@@ -328,6 +354,31 @@ func (t *Term) blinkLoop() {
 					w.UpdateWindow()
 				})
 			}
+		}
+	}
+}
+
+// autoScrollLoop scrolls the viewport while autoScrollDir is non-zero.
+// Handles the case where onMouseMove stops firing when the mouse leaves
+// the window (e.g. above the title bar). Exits when blinkDone is closed.
+func (t *Term) autoScrollLoop() {
+	const rate = 80 * time.Millisecond
+	tk := time.NewTicker(rate)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.blinkDone:
+			return
+		case <-tk.C:
+			dir := int(t.autoScrollDir.Load())
+			if dir == 0 {
+				continue
+			}
+			t.grid.Mu.Lock()
+			t.grid.ScrollView(dir)
+			t.grid.Mu.Unlock()
+			t.bumpVersion()
+			t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
 		}
 	}
 }
@@ -920,6 +971,10 @@ func (t *Term) onClick(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	t.dragging = true
 	t.dragButton = e.MouseButton
 	t.dragReport = false
+	w.MouseLock(gui.MouseLockCfg{
+		MouseMove: t.onMouseMove,
+		MouseUp:   t.onMouseUp,
+	})
 	t.bumpVersion()
 	w.UpdateWindow()
 	e.IsHandled = true
@@ -964,12 +1019,37 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.grid.Mu.Lock()
+	rows := t.grid.Rows
+	if t.cellH > 0 {
+		widgetH := float32(rows) * t.cellH
+		switch {
+		case e.MouseY < 0:
+			t.grid.ScrollView(1)
+		case e.MouseY > widgetH:
+			t.grid.ScrollView(-1)
+		}
+	}
 	contentR := t.grid.viewportToContent(r)
 	t.grid.SelHead = ContentPos{Row: contentR, Col: c}
 	if t.grid.SelHead != t.grid.SelAnchor {
 		t.grid.SelActive = true
 	}
 	t.grid.Mu.Unlock()
+	// Persist scroll direction so autoScrollLoop keeps scrolling if
+	// onMouseMove stops firing (mouse above title bar / window edge).
+	if t.cellH > 0 {
+		widgetH := float32(rows) * t.cellH
+		switch {
+		case e.MouseY < 0:
+			t.autoScrollDir.Store(1)
+		case e.MouseY > widgetH:
+			t.autoScrollDir.Store(-1)
+		default:
+			t.autoScrollDir.Store(0)
+		}
+	}
+	t.bumpVersion()
+	w.UpdateWindow()
 	t.updateHover(r, c, w)
 }
 
@@ -1001,6 +1081,8 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	if !t.dragging {
 		return
 	}
+	t.autoScrollDir.Store(0)
+	w.MouseUnlock()
 	r, c := t.posToCell(e.MouseX, e.MouseY)
 	if t.dragReport {
 		snap := t.mouseSnap()
@@ -1104,6 +1186,8 @@ func (t *Term) copySelection(w *gui.Window) bool {
 // reports when reporting + SGR are active and the viewport is live;
 // otherwise moves the local scrollback viewport. Positive ScrollY
 // reveals older content (wheel-up); negative reveals newer (down).
+// Each event also feeds the momentum EMA so that releasing the trackpad
+// produces a brief coast rather than an abrupt stop.
 func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	if e.ScrollY == 0 {
 		return
@@ -1119,16 +1203,109 @@ func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		e.IsHandled = true
 		return
 	}
-	lines := linesFromScroll(e.ScrollY, t.cellH)
-	if lines == 0 {
+	if !realNumber(e.ScrollY) || !finite(t.cellH) {
 		return
 	}
-	t.grid.Mu.Lock()
-	t.grid.ScrollView(lines)
-	t.grid.Mu.Unlock()
-	t.bumpVersion()
-	w.UpdateWindow()
+	// Accumulate scaled pixels so sub-cell deltas carry over between events.
+	// scrollSensitivity converts raw trackpad px to a faster scroll speed;
+	// the accumulator ensures no movement is lost to integer truncation.
+	const scrollSensitivity float32 = 12
+	t.scrollAcc += e.ScrollY * scrollSensitivity
+	lines := int(t.scrollAcc / t.cellH)
+	if lines != 0 {
+		t.scrollAcc -= float32(lines) * t.cellH
+		t.grid.Mu.Lock()
+		t.grid.ScrollView(lines)
+		t.grid.Mu.Unlock()
+		t.bumpVersion()
+		w.UpdateWindow()
+	}
+	// Track peak velocity of the current gesture, scaled up so coast covers a
+	// meaningful number of lines. Ignore decelerating OS-momentum samples by
+	// only updating when the new sample is larger in magnitude or direction
+	// reverses. Cap prevents a huge flick from coasting forever.
+	const (
+		momentumScale = 5.0
+		momentumCap   = 300.0
+	)
+	t.momentumMu.Lock()
+	newVel := math.Max(-momentumCap, math.Min(momentumCap, float64(e.ScrollY)*momentumScale))
+	if math.Abs(newVel) >= math.Abs(t.momentumVel) || (t.momentumVel > 0) != (newVel > 0) {
+		t.momentumVel = newVel
+	}
+	t.momentumAcc = 0
+	t.momentumCellH = t.cellH
+	t.momentumCoasting = false
+	t.momentumMu.Unlock()
+	// Arm/reset a timer: coast starts 80 ms after the last scroll event.
+	if t.momentumTimer == nil {
+		t.momentumTimer = time.AfterFunc(80*time.Millisecond, t.kickMomentum)
+	} else {
+		t.momentumTimer.Reset(80 * time.Millisecond)
+	}
 	e.IsHandled = true
+}
+
+// kickMomentum is the AfterFunc callback fired 80 ms after the last scroll
+// event. It marks the momentum state as coasting and wakes momentumLoop.
+func (t *Term) kickMomentum() {
+	t.momentumMu.Lock()
+	t.momentumCoasting = true
+	t.momentumMu.Unlock()
+	select {
+	case t.momentumKick <- struct{}{}:
+	default:
+	}
+}
+
+// momentumLoop decelerates the scroll velocity after the user lifts their
+// finger. Ticks at ~60 fps; each tick applies the decaying velocity to a
+// pixel accumulator and converts whole cells into ScrollView calls.
+func (t *Term) momentumLoop() {
+	const (
+		tickDur  = 16 * time.Millisecond
+		friction = 0.96 // velocity multiplier per 16 ms tick (~1.8 s to 1 % of start)
+		minVel   = 0.3  // px/tick below which coast stops
+	)
+	tk := time.NewTicker(tickDur)
+	defer tk.Stop()
+	for {
+		select {
+		case <-t.blinkDone:
+			return
+		case <-t.momentumKick:
+			// coasting flag already set; next tick starts the coast
+		case <-tk.C:
+			t.momentumMu.Lock()
+			if !t.momentumCoasting {
+				t.momentumMu.Unlock()
+				continue
+			}
+			t.momentumVel *= friction
+			t.momentumAcc += t.momentumVel
+			cellH := t.momentumCellH
+			lines := 0
+			if finite(cellH) {
+				lines = int(t.momentumAcc / float64(cellH))
+				if lines != 0 {
+					t.momentumAcc -= float64(lines) * float64(cellH)
+				}
+			}
+			if math.Abs(t.momentumVel) < minVel {
+				t.momentumCoasting = false
+				t.momentumVel = 0
+				t.momentumAcc = 0
+			}
+			t.momentumMu.Unlock()
+			if lines != 0 {
+				t.grid.Mu.Lock()
+				t.grid.ScrollView(lines)
+				t.grid.Mu.Unlock()
+				t.bumpVersion()
+				t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+			}
+		}
+	}
 }
 
 func (t *Term) keyModes() keyModes {
