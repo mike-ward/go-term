@@ -299,17 +299,18 @@ type Grid struct {
 	AltActive bool
 	mainSaved altSavedScreen
 
-	// Selection state in viewport coordinates (not content coordinates):
-	// when ViewOffset changes mid-selection the highlighted cells follow
-	// the viewport, not the underlying text. SelActive == false means no
-	// selection (single-click position pre-drag). Anchor and Head may
-	// appear in any order; helpers normalize.
-	SelAnchor SelPos
-	SelHead   SelPos
+	// Selection state in content coordinates (scrollback + live, stable across
+	// ViewOffset changes). SelActive == false means no selection (single-click
+	// position pre-drag). Anchor and Head may appear in any order; helpers
+	// normalize. ContentPos row: 0..len(Scrollback)-1 for scrollback rows,
+	// len(Scrollback)..len(Scrollback)+Rows-1 for live rows.
+	SelAnchor ContentPos
+	SelHead   ContentPos
 	SelActive bool
 }
 
-// SelPos identifies a viewport cell (row, col).
+// SelPos identifies a viewport cell (row, col). Kept for callers that
+// predate Phase 17; new code should use ContentPos for selection.
 type SelPos struct{ Row, Col int }
 
 // ContentPos is a stable content-row coordinate, independent of ViewOffset.
@@ -318,12 +319,20 @@ type SelPos struct{ Row, Col int }
 type ContentPos struct{ Row, Col int }
 
 // selOrder returns the selection bounds in forward order (start <= end).
-func (g *Grid) selOrder() (start, end SelPos) {
+func (g *Grid) selOrder() (start, end ContentPos) {
 	a, b := g.SelAnchor, g.SelHead
 	if b.Row < a.Row || (b.Row == a.Row && b.Col < a.Col) {
 		a, b = b, a
 	}
 	return a, b
+}
+
+// viewportToContent converts a viewport row (0..Rows-1) to its content row
+// (0..len(Scrollback)+Rows-1) at the current ViewOffset. Caller must hold Mu.
+func (g *Grid) viewportToContent(r int) int {
+	sb := len(g.Scrollback)
+	off := clamp(g.ViewOffset, 0, sb)
+	return sb - off + r
 }
 
 // MouseReporting reports whether any of the press/drag/any-motion
@@ -333,20 +342,23 @@ func (g *Grid) MouseReporting() bool {
 	return g.MouseTrack || g.MouseTrackBtn || g.MouseTrackAny
 }
 
-// InSelection reports whether viewport (r, c) is inside the half-open
-// selection [start, end] (inclusive of end). False when SelActive is off.
+// InSelection reports whether viewport (r, c) is inside the selection.
+// r is a viewport row; it is converted to content coordinates internally
+// so the highlight follows content regardless of ViewOffset. False when
+// SelActive is off.
 func (g *Grid) InSelection(r, c int) bool {
 	if !g.SelActive {
 		return false
 	}
+	contentR := g.viewportToContent(r)
 	s, e := g.selOrder()
-	if r < s.Row || r > e.Row {
+	if contentR < s.Row || contentR > e.Row {
 		return false
 	}
-	if r == s.Row && c < s.Col {
+	if contentR == s.Row && c < s.Col {
 		return false
 	}
-	if r == e.Row && c > e.Col {
+	if contentR == e.Row && c > e.Col {
 		return false
 	}
 	return true
@@ -354,16 +366,17 @@ func (g *Grid) InSelection(r, c int) bool {
 
 // SelectedText extracts the selection as a UTF-8 string. Trailing
 // blanks per row are trimmed; row breaks emit '\n' (kitty convention).
-// Returns "" when nothing is selected. Coordinates outside the grid
-// (e.g. stale from a Resize-shrink) are clamped so the per-row cap is
-// never negative.
+// Returns "" when nothing is selected. Coordinates are content-relative
+// and are clamped to [0, len(Scrollback)+Rows-1] so stale coords from
+// a Resize never produce a negative span.
 func (g *Grid) SelectedText() string {
 	if !g.SelActive || g.Rows <= 0 || g.Cols <= 0 {
 		return ""
 	}
+	total := len(g.Scrollback) + g.Rows
 	s, e := g.selOrder()
-	s.Row, s.Col = clamp(s.Row, 0, g.Rows-1), clamp(s.Col, 0, g.Cols-1)
-	e.Row, e.Col = clamp(e.Row, 0, g.Rows-1), clamp(e.Col, 0, g.Cols-1)
+	s.Row, s.Col = clamp(s.Row, 0, total-1), clamp(s.Col, 0, g.Cols-1)
+	e.Row, e.Col = clamp(e.Row, 0, total-1), clamp(e.Col, 0, g.Cols-1)
 	if s == e {
 		return ""
 	}
@@ -381,12 +394,12 @@ func (g *Grid) SelectedText() string {
 		// are dropped without a second pass.
 		end := c0 - 1
 		for c := c0; c <= c1; c++ {
-			if g.ViewCellAt(r, c).Ch != ' ' {
+			if g.ContentCellAt(r, c).Ch != ' ' {
 				end = c
 			}
 		}
 		for c := c0; c <= end; c++ {
-			b.WriteRune(g.ViewCellAt(r, c).Ch)
+			b.WriteRune(g.ContentCellAt(r, c).Ch)
 		}
 		if r < e.Row {
 			b.WriteByte('\n')
@@ -409,8 +422,8 @@ func clamp(v, lo, hi int) int {
 // ClearSelection drops any active selection.
 func (g *Grid) ClearSelection() {
 	g.SelActive = false
-	g.SelAnchor = SelPos{}
-	g.SelHead = SelPos{}
+	g.SelAnchor = ContentPos{}
+	g.SelHead = ContentPos{}
 }
 
 // NewGrid allocates a rows×cols grid filled with default cells.
@@ -799,6 +812,8 @@ func (g *Grid) Resize(rows, cols int) {
 		return
 	}
 
+	oldSbLen := len(g.Scrollback)
+
 	if g.AltActive {
 		// Alt buffer: simple crop/pad reflow (full-screen app controls cells).
 		g.Cells = reflowBuffer(g.Cells, g.Rows, g.Cols, rows, cols)
@@ -851,7 +866,15 @@ func (g *Grid) Resize(rows, cols int) {
 	g.Top = 0
 	g.Bottom = rows - 1
 	g.ViewOffset = 0
-	g.ClearSelection()
+	// Shift selection content rows by the change in scrollback depth so the
+	// highlight follows the same content after reflow. Clear if entirely
+	// scrolled off (clamp handles out-of-range silently).
+	if g.SelActive {
+		delta := len(g.Scrollback) - oldSbLen
+		total := len(g.Scrollback) + rows
+		g.SelAnchor.Row = clamp(g.SelAnchor.Row+delta, 0, total-1)
+		g.SelHead.Row = clamp(g.SelHead.Row+delta, 0, total-1)
+	}
 }
 
 // At returns a pointer to the cell at (r,c) or nil if out of range.

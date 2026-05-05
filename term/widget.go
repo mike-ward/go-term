@@ -912,8 +912,9 @@ func (t *Term) onClick(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.grid.Mu.Lock()
-	t.grid.SelAnchor = SelPos{Row: r, Col: c}
-	t.grid.SelHead = SelPos{Row: r, Col: c}
+	contentR := t.grid.viewportToContent(r)
+	t.grid.SelAnchor = ContentPos{Row: contentR, Col: c}
+	t.grid.SelHead = ContentPos{Row: contentR, Col: c}
 	t.grid.SelActive = false
 	t.grid.Mu.Unlock()
 	t.dragging = true
@@ -963,7 +964,8 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 	t.grid.Mu.Lock()
-	t.grid.SelHead = SelPos{Row: r, Col: c}
+	contentR := t.grid.viewportToContent(r)
+	t.grid.SelHead = ContentPos{Row: contentR, Col: c}
 	if t.grid.SelHead != t.grid.SelAnchor {
 		t.grid.SelActive = true
 	}

@@ -446,8 +446,8 @@ func TestGrid_SelectedText_RowRange(t *testing.T) {
 	for c, r := range "world" {
 		g.At(1, c).Ch = r
 	}
-	g.SelAnchor = SelPos{Row: 0, Col: 0}
-	g.SelHead = SelPos{Row: 1, Col: 4}
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 1, Col: 4}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "hello\nworld" {
 		t.Errorf("got %q, want %q", got, "hello\nworld")
@@ -462,8 +462,8 @@ func TestGrid_SelectedText_TrailingBlankTrim(t *testing.T) {
 	for c, r := range "de" {
 		g.At(1, c).Ch = r
 	}
-	g.SelAnchor = SelPos{Row: 0, Col: 0}
-	g.SelHead = SelPos{Row: 1, Col: 7}
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 1, Col: 7}
 	g.SelActive = true
 	// Trailing spaces past 'abc' / 'de' must be trimmed per row.
 	if got := g.SelectedText(); got != "abc\nde" {
@@ -476,8 +476,8 @@ func TestGrid_SelectedText_ColumnRangeWithinRow(t *testing.T) {
 	for c, r := range "abcdefghij" {
 		g.At(0, c).Ch = r
 	}
-	g.SelAnchor = SelPos{Row: 0, Col: 3}
-	g.SelHead = SelPos{Row: 0, Col: 6}
+	g.SelAnchor = ContentPos{Row: 0, Col: 3}
+	g.SelHead = ContentPos{Row: 0, Col: 6}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "defg" {
 		t.Errorf("got %q, want %q", got, "defg")
@@ -493,8 +493,8 @@ func TestGrid_SelectedText_BackwardDragNormalized(t *testing.T) {
 		g.At(1, c).Ch = r
 	}
 	// Anchor below/right of head — must normalize.
-	g.SelAnchor = SelPos{Row: 1, Col: 1}
-	g.SelHead = SelPos{Row: 0, Col: 0}
+	g.SelAnchor = ContentPos{Row: 1, Col: 1}
+	g.SelHead = ContentPos{Row: 0, Col: 0}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "ab\ncd" {
 		t.Errorf("got %q, want %q", got, "ab\ncd")
@@ -506,8 +506,8 @@ func TestGrid_SelectedText_InactiveOrEmpty(t *testing.T) {
 	if got := g.SelectedText(); got != "" {
 		t.Errorf("inactive selection returned %q", got)
 	}
-	g.SelAnchor = SelPos{Row: 0, Col: 1}
-	g.SelHead = SelPos{Row: 0, Col: 1}
+	g.SelAnchor = ContentPos{Row: 0, Col: 1}
+	g.SelHead = ContentPos{Row: 0, Col: 1}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "" {
 		t.Errorf("zero-width selection returned %q", got)
@@ -571,24 +571,29 @@ func TestGrid_SelectedText_AcrossScrollbackBoundary(t *testing.T) {
 		g.At(0, c).Ch = r
 	}
 	g.scrollUpRegion(1)
-	// Live row 0 now = "xyz" (the formerly empty bottom shifted up).
+	// Live row 0 now = "xyz".
 	for c, r := range "xyz" {
 		g.At(0, c).Ch = r
 	}
-	g.ViewOffset = 1
-	// Viewport row 0 = scrollback "abc"; viewport row 1 = live "xyz".
-	g.SelAnchor = SelPos{Row: 0, Col: 0}
-	g.SelHead = SelPos{Row: 1, Col: 2}
+	// Content row 0 = scrollback[0]="abc", content row 1 = live row 0="xyz".
+	// Selection must work regardless of ViewOffset.
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 1, Col: 2}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "abc\nxyz" {
-		t.Errorf("got %q, want %q", got, "abc\nxyz")
+		t.Errorf("ViewOffset=0: got %q, want %q", got, "abc\nxyz")
+	}
+	// Same result with ViewOffset=1 (scrolled back into scrollback).
+	g.ViewOffset = 1
+	if got := g.SelectedText(); got != "abc\nxyz" {
+		t.Errorf("ViewOffset=1: got %q, want %q", got, "abc\nxyz")
 	}
 }
 
 func TestGrid_InSelection(t *testing.T) {
 	g := NewGrid(3, 5)
-	g.SelAnchor = SelPos{Row: 0, Col: 2}
-	g.SelHead = SelPos{Row: 1, Col: 1}
+	g.SelAnchor = ContentPos{Row: 0, Col: 2}
+	g.SelHead = ContentPos{Row: 1, Col: 1}
 	g.SelActive = true
 	cases := []struct {
 		r, c int
@@ -638,8 +643,8 @@ func TestGrid_SelectedText_ClampsOutOfRangeCoords(t *testing.T) {
 	for c, r := range "xyz" {
 		g.At(1, c).Ch = r
 	}
-	g.SelAnchor = SelPos{Row: -10, Col: -10}
-	g.SelHead = SelPos{Row: 99, Col: 99}
+	g.SelAnchor = ContentPos{Row: -10, Col: -10}
+	g.SelHead = ContentPos{Row: 99, Col: 99}
 	g.SelActive = true
 	got := g.SelectedText()
 	if got != "abc\nxyz" {
@@ -655,26 +660,94 @@ func TestGrid_SelectedText_RowWithEmptySpan(t *testing.T) {
 	g.At(0, 0).Ch = 'a'
 	g.At(0, 1).Ch = 'b'
 	g.At(0, 2).Ch = 'c'
-	g.SelAnchor = SelPos{Row: 0, Col: 0}
-	g.SelHead = SelPos{Row: 0, Col: 2}
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 0, Col: 2}
 	g.SelActive = true
 	if got := g.SelectedText(); got != "abc" {
 		t.Errorf("baseline: got %q want %q", got, "abc")
 	}
 }
 
-func TestGrid_Resize_ClearsSelection(t *testing.T) {
+func TestGrid_Resize_AdjustsSelectionByScrollbackDelta(t *testing.T) {
+	// Phase 17: Resize adjusts selection content rows by scrollback-depth
+	// change rather than clearing. Selection stays active and clamped to the
+	// new content space.
 	g := NewGrid(4, 4)
-	g.SelAnchor = SelPos{Row: 0, Col: 0}
-	g.SelHead = SelPos{Row: 3, Col: 3}
+	g.ScrollbackCap = 10
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 3, Col: 3}
 	g.SelActive = true
 	g.Resize(2, 2)
-	if g.SelActive {
-		t.Errorf("Resize should clear active selection")
+	if !g.SelActive {
+		t.Error("Resize should preserve active selection (Phase 17)")
 	}
-	if g.SelAnchor != (SelPos{}) || g.SelHead != (SelPos{}) {
-		t.Errorf("Resize should zero selection coords: anchor=%v head=%v",
-			g.SelAnchor, g.SelHead)
+	// Rows must be clamped to [0, total-1] after reflow.
+	total := len(g.Scrollback) + g.Rows
+	if g.SelAnchor.Row < 0 || g.SelAnchor.Row >= total {
+		t.Errorf("SelAnchor.Row %d out of [0,%d)", g.SelAnchor.Row, total)
+	}
+	if g.SelHead.Row < 0 || g.SelHead.Row >= total {
+		t.Errorf("SelHead.Row %d out of [0,%d)", g.SelHead.Row, total)
+	}
+}
+
+func TestGrid_InSelection_SurvivesViewOffsetChange(t *testing.T) {
+	// Phase 17: selection is content-relative so InSelection returns the
+	// same result regardless of ViewOffset.
+	g := NewGrid(2, 3)
+	g.ScrollbackCap = 5
+	for c, ch := range "abc" {
+		g.At(0, c).Ch = ch
+	}
+	g.scrollUpRegion(1)
+	for c, ch := range "xyz" {
+		g.At(0, c).Ch = ch
+	}
+	// Content row 0 = scrollback "abc", content row 1 = live "xyz".
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 1, Col: 2}
+	g.SelActive = true
+
+	// With ViewOffset=0: viewport row 0 = live, not in scrollback row.
+	// viewportToContent(0) = 1 (= len(Scrollback)=1 - 0 + 0)
+	g.ViewOffset = 0
+	if !g.InSelection(0, 0) {
+		t.Error("ViewOffset=0: viewport row 0 (content row 1) should be selected")
+	}
+	if g.InSelection(1, 0) {
+		t.Error("ViewOffset=0: viewport row 1 (content row 2) should not be selected")
+	}
+
+	// With ViewOffset=1: viewport row 0 = scrollback "abc" (content row 0).
+	g.ViewOffset = 1
+	if !g.InSelection(0, 0) {
+		t.Error("ViewOffset=1: viewport row 0 (content row 0) should be selected")
+	}
+	if !g.InSelection(1, 2) {
+		t.Error("ViewOffset=1: viewport row 1 (content row 1) should be selected")
+	}
+}
+
+func TestGrid_SelectedText_ContentCoords_IndependentOfViewOffset(t *testing.T) {
+	// Phase 17: SelectedText uses content coords; result identical for any ViewOffset.
+	g := NewGrid(2, 3)
+	g.ScrollbackCap = 5
+	for c, ch := range "abc" {
+		g.At(0, c).Ch = ch
+	}
+	g.scrollUpRegion(1)
+	for c, ch := range "xyz" {
+		g.At(0, c).Ch = ch
+	}
+	g.SelAnchor = ContentPos{Row: 0, Col: 0}
+	g.SelHead = ContentPos{Row: 1, Col: 2}
+	g.SelActive = true
+
+	for _, off := range []int{0, 1} {
+		g.ViewOffset = off
+		if got := g.SelectedText(); got != "abc\nxyz" {
+			t.Errorf("ViewOffset=%d: got %q, want %q", off, got, "abc\nxyz")
+		}
 	}
 }
 

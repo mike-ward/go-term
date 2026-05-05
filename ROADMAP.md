@@ -496,14 +496,14 @@ smooth scrolling.
 **Why:** selection should stick to the content, not the viewport
 pixels, so it survives scrolling and resizing.
 
-- [ ] `grid.go`: Move `SelAnchor` and `SelHead` from viewport-relative
+- [x] `grid.go`: Move `SelAnchor` and `SelHead` from viewport-relative
       coordinates to content-relative (Row = scrollback index or
       live row index).
-- [ ] `grid.go`: Update `InSelection` and `SelectedText` to walk
+- [x] `grid.go`: Update `InSelection` and `SelectedText` to walk
       content rows.
-- [ ] `grid.go`: Update `Resize` (Phase 13) to reflow selection
+- [x] `grid.go`: Update `Resize` (Phase 13) to reflow selection
       bounds along with the text.
-- [ ] Tests: Select text, scroll, verify highlight stays with text;
+- [x] Tests: Select text, scroll, verify highlight stays with text;
       select text, resize, verify selection remains correct.
 
 **Demo test:** select a word, scroll up, word stays highlighted.
