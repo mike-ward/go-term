@@ -1590,3 +1590,281 @@ func TestGrid_Resize_Reflow_WideChar(t *testing.T) {
 		t.Errorf("continuation cell width=%d, want 0", g.At(0, 4).Width)
 	}
 }
+
+func TestGrid_InternLink_Dedup(t *testing.T) {
+	g := NewGrid(5, 20)
+	id1 := g.internLink("https://example.com")
+	id2 := g.internLink("https://example.com")
+	if id1 == 0 {
+		t.Fatal("internLink returned 0 (reserved sentinel)")
+	}
+	if id1 != id2 {
+		t.Errorf("same URL got different IDs: %d != %d", id1, id2)
+	}
+}
+
+func TestGrid_InternLink_Counter(t *testing.T) {
+	g := NewGrid(5, 20)
+	id1 := g.internLink("https://a.com")
+	id2 := g.internLink("https://b.com")
+	if id1 == 0 || id2 == 0 {
+		t.Fatal("internLink returned 0 for non-empty URL")
+	}
+	if id1 == id2 {
+		t.Errorf("distinct URLs got same ID: %d", id1)
+	}
+	if g.LinkURL(id1) != "https://a.com" {
+		t.Errorf("LinkURL(%d) = %q, want https://a.com", id1, g.LinkURL(id1))
+	}
+	if g.LinkURL(id2) != "https://b.com" {
+		t.Errorf("LinkURL(%d) = %q, want https://b.com", id2, g.LinkURL(id2))
+	}
+}
+
+func TestGrid_LinkURL_Zero(t *testing.T) {
+	g := NewGrid(5, 20)
+	if got := g.LinkURL(0); got != "" {
+		t.Errorf("LinkURL(0) = %q, want empty", got)
+	}
+}
+
+func TestGrid_Put_LinkID(t *testing.T) {
+	g := NewGrid(5, 20)
+	id := g.internLink("https://example.com")
+	g.CurLinkID = id
+	g.Put('A')
+	if got := g.At(0, 0).LinkID; got != id {
+		t.Errorf("cell.LinkID = %d, want %d", got, id)
+	}
+}
+
+func TestGrid_Put_LinkID_ZeroAfterReset(t *testing.T) {
+	g := NewGrid(5, 20)
+	g.CurLinkID = 0
+	g.Put('A')
+	if got := g.At(0, 0).LinkID; got != 0 {
+		t.Errorf("cell.LinkID = %d, want 0", got)
+	}
+}
+
+// putRow writes a string of characters starting at column 0 of row 0 in g.
+func putRow(g *Grid, s string) {
+	g.CursorR, g.CursorC = 0, 0
+	for _, r := range s {
+		g.Put(r)
+	}
+}
+
+func TestGrid_ContentCellAt_Live(t *testing.T) {
+	g := NewGrid(3, 5)
+	putRow(g, "hello")
+	sb := len(g.Scrollback)
+	cell := g.ContentCellAt(sb, 0)
+	if cell.Ch != 'h' {
+		t.Errorf("ContentCellAt live row 0 col 0 = %q, want 'h'", cell.Ch)
+	}
+	cell = g.ContentCellAt(sb, 4)
+	if cell.Ch != 'o' {
+		t.Errorf("ContentCellAt live row 0 col 4 = %q, want 'o'", cell.Ch)
+	}
+}
+
+func TestGrid_ContentCellAt_Scrollback(t *testing.T) {
+	g := NewGrid(2, 5)
+	putRow(g, "first")
+	g.Newline() // scrolls "first" into scrollback
+	putRow(g, "secnd")
+	if len(g.Scrollback) == 0 {
+		t.Skip("no scrollback produced")
+	}
+	cell := g.ContentCellAt(0, 0)
+	if cell.Ch != 'f' {
+		t.Errorf("ContentCellAt scrollback row 0 col 0 = %q, want 'f'", cell.Ch)
+	}
+}
+
+func TestGrid_ContentCellAt_OutOfRange(t *testing.T) {
+	g := NewGrid(3, 5)
+	// Should never panic; returns default cell.
+	c := g.ContentCellAt(-1, 0)
+	if c.Ch != ' ' {
+		t.Errorf("out-of-range row -1 = %q, want ' '", c.Ch)
+	}
+	c = g.ContentCellAt(g.ContentRows(), 0)
+	if c.Ch != ' ' {
+		t.Errorf("out-of-range row past end = %q, want ' '", c.Ch)
+	}
+	c = g.ContentCellAt(0, -1)
+	if c.Ch != ' ' {
+		t.Errorf("out-of-range col -1 = %q, want ' '", c.Ch)
+	}
+}
+
+func TestGrid_ContentRowToViewport_Live(t *testing.T) {
+	g := NewGrid(3, 5)
+	sb := len(g.Scrollback)
+	// ViewOffset=0: live rows visible.
+	vr, ok := g.ContentRowToViewport(sb)
+	if !ok || vr != 0 {
+		t.Errorf("live row 0 → viewport %d ok=%v, want vr=0 ok=true", vr, ok)
+	}
+	vr, ok = g.ContentRowToViewport(sb + 2)
+	if !ok || vr != 2 {
+		t.Errorf("live row 2 → viewport %d ok=%v, want vr=2 ok=true", vr, ok)
+	}
+}
+
+func TestGrid_ContentRowToViewport_OutOfView(t *testing.T) {
+	g := NewGrid(3, 5)
+	_, ok := g.ContentRowToViewport(-1)
+	if ok {
+		t.Error("content row -1 should be off-screen")
+	}
+	_, ok = g.ContentRowToViewport(g.ContentRows())
+	if ok {
+		t.Error("content row past end should be off-screen")
+	}
+}
+
+func TestGrid_ContentRowToViewport_Scrollback(t *testing.T) {
+	g := NewGrid(2, 5)
+	putRow(g, "first")
+	g.Newline()
+	putRow(g, "secnd")
+	if len(g.Scrollback) == 0 {
+		t.Skip("no scrollback produced")
+	}
+	// Freeze viewport at 1 row back so scrollback row 0 is visible.
+	g.ScrollView(1)
+	vr, ok := g.ContentRowToViewport(0)
+	if !ok {
+		t.Errorf("scrollback row 0 should be visible, got ok=false")
+	}
+	if vr < 0 || vr >= g.Rows {
+		t.Errorf("scrollback row 0 → viewport %d, out of range [0, %d)", vr, g.Rows)
+	}
+}
+
+func TestGrid_Find_Basic(t *testing.T) {
+	g := NewGrid(3, 10)
+	putRow(g, "hello")
+	sb := len(g.Scrollback)
+	pos, ok := g.Find("hello", ContentPos{Row: sb, Col: -1}, true)
+	if !ok {
+		t.Fatal("Find did not find 'hello'")
+	}
+	if pos.Row != sb || pos.Col != 0 {
+		t.Errorf("Find 'hello' at {%d,%d}, want {%d,0}", pos.Row, pos.Col, sb)
+	}
+}
+
+func TestGrid_Find_CaseInsensitive(t *testing.T) {
+	g := NewGrid(3, 10)
+	putRow(g, "HELLO")
+	sb := len(g.Scrollback)
+	pos, ok := g.Find("hello", ContentPos{Row: sb, Col: -1}, true)
+	if !ok {
+		t.Fatal("Find case-insensitive did not match")
+	}
+	if pos.Col != 0 {
+		t.Errorf("Find 'hello' (case-insensitive) at col %d, want 0", pos.Col)
+	}
+}
+
+func TestGrid_Find_EmptyQuery_ReturnsFalse(t *testing.T) {
+	g := NewGrid(3, 10)
+	putRow(g, "hello")
+	_, ok := g.Find("", ContentPos{}, true)
+	if ok {
+		t.Error("Find with empty query should return false")
+	}
+}
+
+func TestGrid_Find_QueryWiderThanCols_ReturnsFalse(t *testing.T) {
+	g := NewGrid(3, 5)
+	_, ok := g.Find("toolong", ContentPos{}, true)
+	if ok {
+		t.Error("Find with query wider than Cols should return false")
+	}
+}
+
+func TestGrid_Find_NoMatch(t *testing.T) {
+	g := NewGrid(3, 10)
+	putRow(g, "hello")
+	_, ok := g.Find("xyz", ContentPos{}, true)
+	if ok {
+		t.Error("Find non-existent query should return false")
+	}
+}
+
+func TestGrid_Find_Wrap_Forward(t *testing.T) {
+	// Two live rows; query in row 0, start in row 1 → wraps to find it.
+	g := NewGrid(2, 10)
+	putRow(g, "target")
+	g.CursorR = 1
+	g.CursorC = 0
+	for range 10 {
+		g.Put(' ')
+	}
+	sb := len(g.Scrollback)
+	// Start search from row 1 (past the match), forward → should wrap and find.
+	pos, ok := g.Find("target", ContentPos{Row: sb + 1, Col: 0}, true)
+	if !ok {
+		t.Fatal("Find did not wrap forward to find 'target'")
+	}
+	if pos.Row != sb || pos.Col != 0 {
+		t.Errorf("Find wrapped forward: {%d,%d}, want {%d,0}", pos.Row, pos.Col, sb)
+	}
+}
+
+func TestGrid_Find_Wrap_Backward(t *testing.T) {
+	g := NewGrid(2, 10)
+	// Row 0: spaces (already blank).
+	// Row 1: "target".
+	g.CursorR = 1
+	g.CursorC = 0
+	for _, r := range "target" {
+		g.Put(r)
+	}
+	sb := len(g.Scrollback)
+	// Start from row 0, backward → wraps around and finds "target" on row 1.
+	pos, ok := g.Find("target", ContentPos{Row: sb, Col: 0}, false)
+	if !ok {
+		t.Fatal("Find did not wrap backward to find 'target'")
+	}
+	if pos.Row != sb+1 || pos.Col != 0 {
+		t.Errorf("Find wrapped backward: {%d,%d}, want {%d,0}", pos.Row, pos.Col, sb+1)
+	}
+}
+
+func TestGrid_ViewportMatches_All(t *testing.T) {
+	g := NewGrid(2, 20)
+	putRow(g, "foo bar foo")
+	matches := g.ViewportMatches("foo")
+	if len(matches) != 2 {
+		t.Errorf("ViewportMatches found %d matches, want 2", len(matches))
+	}
+	if matches[0].Col != 0 {
+		t.Errorf("first match col %d, want 0", matches[0].Col)
+	}
+	if matches[1].Col != 8 {
+		t.Errorf("second match col %d, want 8", matches[1].Col)
+	}
+}
+
+func TestGrid_ViewportMatches_EmptyQuery(t *testing.T) {
+	g := NewGrid(2, 10)
+	putRow(g, "hello")
+	if m := g.ViewportMatches(""); m != nil {
+		t.Errorf("ViewportMatches(\"\") = %v, want nil", m)
+	}
+}
+
+func TestGrid_ViewportMatches_AltActiveReturnsNil(t *testing.T) {
+	g := NewGrid(2, 10)
+	putRow(g, "hello")
+	g.EnterAlt()
+	if m := g.ViewportMatches("hello"); m != nil {
+		t.Errorf("ViewportMatches during alt = %v, want nil", m)
+	}
+}

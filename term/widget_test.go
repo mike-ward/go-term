@@ -5,6 +5,7 @@ import (
 	"math"
 	"testing"
 
+	glyph "github.com/mike-ward/go-glyph"
 	"github.com/mike-ward/go-gui/gui"
 )
 
@@ -342,6 +343,116 @@ func TestMouseModBits(t *testing.T) {
 	for _, c := range cases {
 		if got := mouseModBits(c.m); got != c.want {
 			t.Errorf("mod=%d: got %d, want %d", c.m, got, c.want)
+		}
+	}
+}
+
+func TestCellRunKey_PlainCell(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	cell := Cell{Ch: 'A', FG: 7, BG: 0, Width: 1}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if k.underline || k.strikethrough {
+		t.Error("plain cell should have no decoration")
+	}
+	if k.typeface != glyph.TypefaceRegular {
+		t.Errorf("typeface: got %v, want regular", k.typeface)
+	}
+	if k.linkID != 0 {
+		t.Error("no link expected")
+	}
+}
+
+func TestCellRunKey_BoldItalic(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	cell := Cell{Ch: 'B', Width: 1, Attrs: AttrBold | AttrItalic}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if k.typeface != glyph.TypefaceBoldItalic {
+		t.Errorf("bold+italic: got %v, want BoldItalic", k.typeface)
+	}
+}
+
+func TestCellRunKey_Underline(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{}
+	cell := Cell{Ch: 'C', Width: 1, Attrs: AttrUnderline}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if !k.underline {
+		t.Error("underline attr: expected underline in key")
+	}
+}
+
+func TestCellRunKey_Strikethrough(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{}
+	cell := Cell{Ch: 'D', Width: 1, Attrs: AttrStrikethrough}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if !k.strikethrough {
+		t.Error("strikethrough attr: expected strikethrough in key")
+	}
+}
+
+func TestCellRunKey_LinkForcesUnderline(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{}
+	cell := Cell{Ch: 'E', Width: 1, LinkID: 42}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if !k.underline {
+		t.Error("linked cell: expected underline forced on by linkID")
+	}
+	if k.linkID != 42 {
+		t.Errorf("linkID: got %d, want 42", k.linkID)
+	}
+}
+
+func TestCellRunKey_DimHalvesColor(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{}
+	cell := Cell{Ch: 'F', Width: 1, Attrs: AttrDim}
+	cell.FG = rgbColor(200, 100, 50)
+	k := cellRunKey(cell, base, g, -1, -1)
+	// Dim halves each channel via integer division.
+	want := gui.RGB(100, 50, 25)
+	if k.color != want {
+		t.Errorf("dim color: got %v, want %v", k.color, want)
+	}
+}
+
+// BenchmarkForegroundPass exercises the run-key computation and string
+// building for a full 80×24 screen of mixed colored text. It does not
+// call dc.Text (no GUI context required) — the hot path is the loop
+// logic and memory access pattern.
+func BenchmarkForegroundPass(b *testing.B) {
+	const rows, cols = 24, 80
+	g := NewGrid(rows, cols)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+
+	// Fill with alternating color runs to stress the coalescing path.
+	colors := []uint32{rgbColor(200, 200, 200), rgbColor(100, 200, 100), rgbColor(200, 100, 100)}
+	p := NewParser(g)
+	_ = p
+	for r := range rows {
+		for c := range cols {
+			g.Cells[r*cols+c] = Cell{
+				Ch:    rune('A' + c%26),
+				FG:    colors[c%len(colors)],
+				Width: 1,
+			}
+		}
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for range b.N {
+		for r := range rows {
+			for c := range cols {
+				cell := g.Cells[r*cols+c]
+				if cell.Width == 0 && cell.Ch == 0 {
+					continue
+				}
+				_ = cellRunKey(cell, base, g, -1, -1)
+			}
 		}
 	}
 }

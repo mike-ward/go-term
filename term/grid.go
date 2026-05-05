@@ -8,6 +8,7 @@ package term
 import (
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/rivo/uniseg"
 )
@@ -163,11 +164,12 @@ func rgbColor(r, g, b uint8) uint32 {
 //	0 — continuation cell (right half of a width-2 char to the left).
 //	    Ch == 0 in this state; the renderer skips it.
 type Cell struct {
-	Ch    rune
-	FG    uint32 // packed Color (palette index, RGB, or DefaultColor)
-	BG    uint32
-	Attrs uint8
-	Width uint8
+	Ch     rune
+	FG     uint32 // packed Color (palette index, RGB, or DefaultColor)
+	BG     uint32
+	Attrs  uint8
+	Width  uint8
+	LinkID uint16 // 0 = no link; non-zero indexes Grid.links
 }
 
 func defaultCell() Cell {
@@ -256,6 +258,15 @@ type Grid struct {
 	// "file://host/path"). Embedders read it through Term.Cwd().
 	// Empty until the shell emits an OSC 7.
 	Cwd string
+
+	// Hyperlink registry (OSC 8). CurLinkID is the active link applied
+	// by Put; 0 means no link. links/linkIDs are a sidecar map so Cell
+	// stays compact — URLs live here, not in each Cell. The maps grow
+	// only, never shrink; sessions are short and links are rare.
+	CurLinkID uint16
+	links     map[uint16]string
+	linkIDs   map[string]uint16
+	nextLink  uint16
 	// Top, Bottom define the scroll region (inclusive, 0-based).
 	// Default 0..Rows-1 (full screen). Set via DECSTBM (CSI Pt;Pb r).
 	// scrollUpRegion / scrollDownRegion / IND / RI / IL / DL all
@@ -300,6 +311,11 @@ type Grid struct {
 
 // SelPos identifies a viewport cell (row, col).
 type SelPos struct{ Row, Col int }
+
+// ContentPos is a stable content-row coordinate, independent of ViewOffset.
+// Rows 0..len(Scrollback)-1 index scrollback oldest-first;
+// rows len(Scrollback)..len(Scrollback)+Rows-1 index the live grid.
+type ContentPos struct{ Row, Col int }
 
 // selOrder returns the selection bounds in forward order (start <= end).
 func (g *Grid) selOrder() (start, end SelPos) {
@@ -412,13 +428,39 @@ func NewGrid(rows, cols int) *Grid {
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
 		CursorBlink:   false,
-		Top:           0,
-		Bottom:        rows - 1,
+		Top:      0,
+		Bottom:   rows - 1,
+		links:    make(map[uint16]string),
+		linkIDs:  make(map[string]uint16),
+		nextLink: 1,
 	}
 	for i := range g.Cells {
 		g.Cells[i] = defaultCell()
 	}
 	return g
+}
+
+// internLink returns the ID for url, creating one if needed. Called under Mu.
+func (g *Grid) internLink(url string) uint16 {
+	if id, ok := g.linkIDs[url]; ok {
+		return id
+	}
+	id := g.nextLink
+	g.nextLink++
+	if g.nextLink == 0 {
+		g.nextLink = 1 // wrap: ID 0 is reserved as "no link"
+	}
+	g.links[id] = url
+	g.linkIDs[url] = id
+	return id
+}
+
+// LinkURL returns the URL for the given link ID, or "" for ID 0 / unknown.
+func (g *Grid) LinkURL(id uint16) string {
+	if id == 0 {
+		return ""
+	}
+	return g.links[id]
 }
 
 // reflowBuffer copies src (oldRows×oldCols) into a freshly allocated
@@ -454,7 +496,7 @@ type physRow struct {
 // trailing padding from the last physical row of a logical line.
 func isDefaultBlank(c Cell) bool {
 	return c.Ch == ' ' && c.FG == DefaultColor && c.BG == DefaultColor &&
-		c.Attrs == 0 && c.Width == 1
+		c.Attrs == 0 && c.Width == 1 && c.LinkID == 0
 }
 
 // rewrapLine re-wraps a flat slice of cells (the content of one logical
@@ -866,14 +908,14 @@ func (g *Grid) Put(ch rune) {
 	if c := g.At(g.CursorR, g.CursorC); c != nil {
 		*c = Cell{
 			Ch: ch, FG: g.CurFG, BG: g.CurBG,
-			Attrs: g.CurAttrs, Width: uint8(w),
+			Attrs: g.CurAttrs, Width: uint8(w), LinkID: g.CurLinkID,
 		}
 	}
 	if w == 2 {
 		if c := g.At(g.CursorR, g.CursorC+1); c != nil {
 			*c = Cell{
 				Ch: 0, FG: g.CurFG, BG: g.CurBG,
-				Attrs: g.CurAttrs, Width: 0,
+				Attrs: g.CurAttrs, Width: 0, LinkID: g.CurLinkID,
 			}
 		}
 	}
@@ -1456,4 +1498,211 @@ func (g *Grid) ExitAlt() {
 	g.AltActive = false
 	g.ResetView()
 	g.ClearSelection()
+}
+
+// ContentRows returns the total number of content rows (scrollback + live).
+func (g *Grid) ContentRows() int { return len(g.Scrollback) + g.Rows }
+
+// ContentCellAt returns the cell at content-coordinate (row, col).
+// Bounds-safe: out-of-range inputs return a default cell (never panics).
+// Caller must hold Mu.
+func (g *Grid) ContentCellAt(row, col int) Cell {
+	sb := len(g.Scrollback)
+	if row < 0 || row >= sb+g.Rows || col < 0 || col >= g.Cols {
+		return defaultCell()
+	}
+	if row < sb {
+		return g.Scrollback[row][col]
+	}
+	return g.Cells[(row-sb)*g.Cols+col]
+}
+
+// ContentRowToViewport maps a content row to its viewport row at the current
+// ViewOffset. Returns (vr, true) when the content row is visible, (0, false)
+// when it is off-screen.
+func (g *Grid) ContentRowToViewport(contentRow int) (int, bool) {
+	sb := len(g.Scrollback)
+	off := clamp(g.ViewOffset, 0, sb)
+	n := min(off, g.Rows)
+	if contentRow < sb {
+		vr := contentRow - (sb - off)
+		if vr >= 0 && vr < n {
+			return vr, true
+		}
+		return 0, false
+	}
+	liveRow := contentRow - sb
+	vr := liveRow + n
+	if vr >= n && vr < g.Rows {
+		return vr, true
+	}
+	return 0, false
+}
+
+// rowRunes returns the rune slice for a content row with length == g.Cols,
+// so rune index == cell column. Continuation cells (Width==0, Ch==0) appear
+// as NUL runes and will never match printable query characters.
+func (g *Grid) rowRunes(contentRow int) []rune {
+	sb := len(g.Scrollback)
+	var src []Cell
+	if contentRow < sb {
+		if contentRow < 0 {
+			return nil
+		}
+		src = g.Scrollback[contentRow]
+	} else {
+		liveRow := contentRow - sb
+		if liveRow < 0 || liveRow >= g.Rows || g.Cols == 0 {
+			return nil
+		}
+		base := liveRow * g.Cols
+		src = g.Cells[base : base+g.Cols]
+	}
+	rr := make([]rune, len(src))
+	for i, cell := range src {
+		rr[i] = cell.Ch
+	}
+	return rr
+}
+
+// equalFoldRune reports whether a and b are equal under Unicode case-folding.
+func equalFoldRune(a, b rune) bool {
+	return unicode.ToLower(a) == unicode.ToLower(b)
+}
+
+// runeSliceSearch returns the first column index >= fromCol where needle
+// occurs in haystack. Returns -1 when not found. Case-insensitive.
+func runeSliceSearch(haystack, needle []rune, fromCol int) int {
+	n, m := len(haystack), len(needle)
+	if m == 0 || fromCol > n-m {
+		return -1
+	}
+	if fromCol < 0 {
+		fromCol = 0
+	}
+	for i := fromCol; i <= n-m; i++ {
+		match := true
+		for j := 0; j < m; j++ {
+			if !equalFoldRune(haystack[i+j], needle[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// runeSliceSearchLast returns the rightmost column index < upToCol where
+// needle occurs in haystack. Returns -1 when not found. Case-insensitive.
+func runeSliceSearchLast(haystack, needle []rune, upToCol int) int {
+	n, m := len(haystack), len(needle)
+	if m == 0 || n < m {
+		return -1
+	}
+	maxStart := n - m
+	if upToCol-1 < maxStart {
+		maxStart = upToCol - 1
+	}
+	if maxStart < 0 {
+		return -1
+	}
+	for i := maxStart; i >= 0; i-- {
+		match := true
+		for j := 0; j < m; j++ {
+			if !equalFoldRune(haystack[i+j], needle[j]) {
+				match = false
+				break
+			}
+		}
+		if match {
+			return i
+		}
+	}
+	return -1
+}
+
+// Find searches for query (case-insensitive) starting at start, walking
+// forward or backward through all content rows (scrollback + live), wrapping
+// once. Multi-row spanning is not supported; matches must fit within one row.
+// Returns the ContentPos of the first cell of the match and true on success.
+// Called under Mu.
+func (g *Grid) Find(query string, start ContentPos, forward bool) (ContentPos, bool) {
+	if query == "" || g.Cols <= 0 {
+		return ContentPos{}, false
+	}
+	qRunes := []rune(query)
+	if len(qRunes) > g.Cols {
+		return ContentPos{}, false
+	}
+	total := g.ContentRows()
+	if total == 0 {
+		return ContentPos{}, false
+	}
+	start.Row = clamp(start.Row, 0, total-1)
+	for i := 0; i < total; i++ {
+		var row int
+		if forward {
+			row = (start.Row + i) % total
+		} else {
+			row = (start.Row - i + total) % total
+		}
+		rr := g.rowRunes(row)
+		if forward {
+			fromCol := 0
+			if i == 0 {
+				fromCol = start.Col + 1
+			}
+			if col := runeSliceSearch(rr, qRunes, fromCol); col >= 0 {
+				return ContentPos{Row: row, Col: col}, true
+			}
+		} else {
+			upToCol := len(rr) + 1
+			if i == 0 {
+				upToCol = start.Col
+			}
+			if col := runeSliceSearchLast(rr, qRunes, upToCol); col >= 0 {
+				return ContentPos{Row: row, Col: col}, true
+			}
+		}
+	}
+	return ContentPos{}, false
+}
+
+// ViewportMatches returns the content positions of all query matches visible
+// at the current ViewOffset. Returns nil for an empty query, a zero-column
+// grid, or while the alt screen is active. Called under Mu.
+func (g *Grid) ViewportMatches(query string) []ContentPos {
+	if query == "" || g.Cols <= 0 || g.AltActive {
+		return nil
+	}
+	qRunes := []rune(query)
+	if len(qRunes) > g.Cols {
+		return nil
+	}
+	sb := len(g.Scrollback)
+	off := clamp(g.ViewOffset, 0, sb)
+	n := min(off, g.Rows)
+	var matches []ContentPos
+	for vr := range g.Rows {
+		var contentRow int
+		if vr < n {
+			contentRow = sb - off + vr
+		} else {
+			contentRow = sb + (vr - n)
+		}
+		rr := g.rowRunes(contentRow)
+		col := 0
+		for {
+			idx := runeSliceSearch(rr, qRunes, col)
+			if idx < 0 {
+				break
+			}
+			matches = append(matches, ContentPos{Row: contentRow, Col: idx})
+			col = idx + 1
+		}
+	}
+	return matches
 }

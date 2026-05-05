@@ -1,7 +1,9 @@
 package term
 
 import (
+	"encoding/base64"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -62,10 +64,13 @@ type Parser struct {
 
 	// onTitle, if non-nil, is invoked for OSC 0/1/2 (window title).
 	// onReply, if non-nil, is invoked when the parser needs to write
-	// bytes back toward the application (e.g. DA1 response). Both run
-	// while Grid.Mu is held — handlers must not re-enter the grid.
-	onTitle func(string)
-	onReply func([]byte)
+	// bytes back toward the application (e.g. DA1 response).
+	// onClipboard, if non-nil, is invoked for OSC 52 clipboard-write
+	// requests. All three run while Grid.Mu is held — handlers must not
+	// re-enter the grid.
+	onTitle     func(string)
+	onReply     func([]byte)
+	onClipboard func([]byte)
 }
 
 // SetTitleHandler registers a callback for OSC 0/1/2. Pass nil to
@@ -76,6 +81,11 @@ func (p *Parser) SetTitleHandler(fn func(string)) { p.onTitle = fn }
 // writes (DA1 today; future: cursor position reports, etc.). Called
 // while Grid.Mu is held.
 func (p *Parser) SetReplyHandler(fn func([]byte)) { p.onReply = fn }
+
+// SetClipboardHandler registers a callback for OSC 52 clipboard-write
+// requests. data is the decoded (raw) clipboard payload. Pass nil to
+// disable. Called while Grid.Mu is held.
+func (p *Parser) SetClipboardHandler(fn func([]byte)) { p.onClipboard = fn }
 
 // NewParser binds a parser to a grid. Callers must hold g.Mu while calling
 // Feed.
@@ -374,6 +384,40 @@ func (p *Parser) dispatchOSC() {
 		// Working directory notification (iTerm/VTE convention).
 		// Payload is typically "file://host/path"; embedders parse.
 		p.g.Cwd = pt
+	case 8:
+		// Hyperlink: OSC 8;params;URI ST
+		// params (before the ';') may carry an id= hint for multiplexers;
+		// we ignore it and dedup solely by URL.
+		semiIdx := strings.IndexByte(pt, ';')
+		if semiIdx < 0 {
+			return // malformed: no second semicolon
+		}
+		uri := pt[semiIdx+1:]
+		if uri == "" {
+			p.g.CurLinkID = 0 // close link
+		} else {
+			p.g.CurLinkID = p.g.internLink(uri)
+		}
+	case 52:
+		// Clipboard write: OSC 52;c;base64data ST
+		// c = clipboard target selector (we accept any value, treat as
+		// the system clipboard). "?" as base64 data is a read request —
+		// ignored (requires async UI-thread access to GetClipboard).
+		semiIdx := strings.IndexByte(pt, ';')
+		if semiIdx < 0 {
+			return
+		}
+		b64 := pt[semiIdx+1:]
+		if b64 == "?" {
+			return
+		}
+		data, err := base64.StdEncoding.DecodeString(b64)
+		if err != nil {
+			return
+		}
+		if p.onClipboard != nil {
+			p.onClipboard(data)
+		}
 	}
 }
 

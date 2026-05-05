@@ -1194,3 +1194,105 @@ func TestParser_SGR_NewAttrs_Clear(t *testing.T) {
 	}
 }
 
+// OSC 8 — hyperlinks
+
+func TestParser_OSC8_OpenLink(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	// OSC 8 ;params;URI BEL
+	feed(t, g, p, []byte("\x1b]8;;https://example.com\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if g.CurLinkID == 0 {
+		t.Fatal("CurLinkID is 0 after OSC 8 open")
+	}
+	if got := g.LinkURL(g.CurLinkID); got != "https://example.com" {
+		t.Errorf("LinkURL = %q, want https://example.com", got)
+	}
+}
+
+func TestParser_OSC8_CloseLink(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	feed(t, g, p, []byte("\x1b]8;;https://example.com\x07"))
+	feed(t, g, p, []byte("\x1b]8;;\x07")) // empty URI = close
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if g.CurLinkID != 0 {
+		t.Errorf("CurLinkID = %d after OSC 8 close, want 0", g.CurLinkID)
+	}
+}
+
+func TestParser_OSC8_MalformedNoSecondSemi(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	// Missing second semicolon — entire sequence should be ignored
+	feed(t, g, p, []byte("\x1b]8;https://example.com\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if g.CurLinkID != 0 {
+		t.Errorf("CurLinkID = %d, want 0 (malformed OSC 8)", g.CurLinkID)
+	}
+}
+
+func TestParser_OSC8_DeduplicatesURL(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	feed(t, g, p, []byte("\x1b]8;;https://same.com\x07"))
+	g.Mu.Lock()
+	id1 := g.CurLinkID
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1b]8;;\x07"))
+	feed(t, g, p, []byte("\x1b]8;;https://same.com\x07"))
+	g.Mu.Lock()
+	id2 := g.CurLinkID
+	g.Mu.Unlock()
+	if id1 == 0 || id2 == 0 {
+		t.Fatal("CurLinkID is 0, expected nonzero")
+	}
+	if id1 != id2 {
+		t.Errorf("same URL assigned different IDs: %d vs %d", id1, id2)
+	}
+}
+
+// OSC 52 — clipboard
+
+func TestParser_OSC52_Write(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	var got []byte
+	p.SetClipboardHandler(func(data []byte) {
+		got = append([]byte(nil), data...)
+	})
+	// base64("hello world") = "aGVsbG8gd29ybGQ="
+	feed(t, g, p, []byte("\x1b]52;c;aGVsbG8gd29ybGQ=\x07"))
+	if string(got) != "hello world" {
+		t.Errorf("clipboard = %q, want \"hello world\"", got)
+	}
+}
+
+func TestParser_OSC52_InvalidBase64(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	called := false
+	p.SetClipboardHandler(func(_ []byte) { called = true })
+	feed(t, g, p, []byte("\x1b]52;c;!!!notbase64!!!\x07"))
+	if called {
+		t.Error("onClipboard called for invalid base64")
+	}
+}
+
+func TestParser_OSC52_ReadIgnored(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	called := false
+	p.SetClipboardHandler(func(_ []byte) { called = true })
+	feed(t, g, p, []byte("\x1b]52;c;?\x07"))
+	if called {
+		t.Error("onClipboard called for read request (?)")
+	}
+}
+
+func TestParser_OSC52_NoSemicolon(t *testing.T) {
+	g, p := newParserGrid(5, 40)
+	called := false
+	p.SetClipboardHandler(func(_ []byte) { called = true })
+	feed(t, g, p, []byte("\x1b]52;aGVsbG8=\x07")) // missing second semicolon
+	if called {
+		t.Error("onClipboard called for malformed OSC 52 (no second semicolon)")
+	}
+}
+

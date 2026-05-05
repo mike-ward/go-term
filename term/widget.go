@@ -226,6 +226,12 @@ type Term struct {
 	// Close.
 	blinkDone chan struct{}
 
+	// drawVersion is incremented on every visual state change so that
+	// go-gui's DrawCanvas tessellation cache can skip OnDraw on unchanged
+	// frames. Reads happen on the main thread (View); writes happen on
+	// both the main thread and the reader goroutine, hence atomic.
+	drawVersion atomic.Uint64
+
 	// writeHost forwards bytes to the PTY. Tests replace this with a
 	// buffer sink so key/focus behavior can be asserted without a live PTY.
 	writeHost func([]byte) error
@@ -317,6 +323,7 @@ func (t *Term) blinkLoop() {
 				t.cursorBlinks()
 			t.grid.Mu.Unlock()
 			if redraw {
+				t.bumpVersion()
 				t.win.QueueCommand(func(w *gui.Window) {
 					w.UpdateWindow()
 				})
@@ -410,6 +417,8 @@ func (t *Term) View(w *gui.Window) gui.View {
 		OnKeyDown: t.onKeyDown,
 		Content: []gui.View{
 			gui.DrawCanvas(gui.DrawCanvasCfg{
+				ID:            "term-canvas",
+				Version:       t.drawVersion.Load(),
 				Sizing:        gui.FillFill,
 				OnDraw:        t.onDraw,
 				OnMouseScroll: t.onMouseScroll,
@@ -441,6 +450,9 @@ func (t *Term) readLoop() {
 			t.grid.Mu.Lock()
 			t.parser.Feed(buf[:n])
 			redraw := !t.grid.SyncOutput || !t.grid.SyncActive
+			if redraw {
+				t.bumpVersion()
+			}
 			t.grid.Mu.Unlock()
 			if redraw {
 				t.win.QueueCommand(func(w *gui.Window) {
@@ -460,6 +472,59 @@ func (t *Term) style() gui.TextStyle {
 		return t.cfg.TextStyle
 	}
 	return gui.CurrentTheme().M5
+}
+
+// bumpVersion increments drawVersion so the next View call produces a
+// new cache key, forcing go-gui to re-invoke OnDraw for this frame.
+func (t *Term) bumpVersion() { t.drawVersion.Add(1) }
+
+// runKey captures the rendering-relevant properties of a cell for
+// run-coalescing in the foreground pass. Two cells with equal runKey
+// can be drawn in a single dc.Text call.
+type runKey struct {
+	color         gui.Color
+	typeface      glyph.Typeface
+	underline     bool
+	strikethrough bool
+	linkID        uint16
+}
+
+// cellRunKey computes the runKey for cell, applying attribute and
+// hyperlink-hover color transforms. Must be called under Grid.Mu.
+func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runKey {
+	color := fg(cell)
+	if cell.Attrs&AttrDim != 0 {
+		col := color
+		color = gui.RGB(col.R/2, col.G/2, col.B/2)
+	}
+	tf := base.Typeface
+	bold, italic := cell.Attrs&AttrBold != 0, cell.Attrs&AttrItalic != 0
+	switch {
+	case bold && italic:
+		tf = glyph.TypefaceBoldItalic
+	case bold:
+		tf = glyph.TypefaceBold
+	case italic:
+		tf = glyph.TypefaceItalic
+	}
+	underline := cell.Attrs&AttrUnderline != 0
+	strikethrough := cell.Attrs&AttrStrikethrough != 0
+	if cell.LinkID != 0 {
+		underline = true
+		if hoverR >= 0 && hoverC >= 0 {
+			if g.ViewCellAt(hoverR, hoverC).LinkID == cell.LinkID {
+				col := color
+				color = gui.RGB(col.R/2, col.G/2, 255)
+			}
+		}
+	}
+	return runKey{
+		color:         color,
+		typeface:      tf,
+		underline:     underline,
+		strikethrough: strikethrough,
+		linkID:        cell.LinkID,
+	}
 }
 
 // onDraw is the DrawCanvas callback. Measures cell size on first call,
@@ -553,54 +618,74 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		t.fillRun(dc, r, runStart, cols, runColor)
 	}
 
-	// Foreground pass: draw each cell's glyph. Skip spaces (already
-	// covered by bg) when there are no attrs (e.g. underline).
-	// Continuation cells (right half of a wide char) carry Width==0
-	// and a NUL rune — skip them entirely; the wide head's glyph
-	// renders into both columns at draw time.
+	// Foreground pass: coalesce adjacent cells with identical style into a
+	// single dc.Text call. Wide chars break the run and are emitted
+	// individually (their glyph spans two columns). Continuation cells
+	// (right half of a wide char, Width==0 Ch==0) are skipped without
+	// breaking the current run. Plain spaces with no attrs or link don't
+	// start a new run but extend an existing same-style one.
+	hR, hC := t.hoverR, t.hoverC // benign unsynchronized read; see updateHover
+	var (
+		runBuf   strings.Builder
+		runStart int
+		runStyle runKey
+		runOpen  bool
+	)
+	flushRun := func(r int) {
+		if !runOpen || runBuf.Len() == 0 {
+			runOpen = false
+			return
+		}
+		cs := style
+		cs.Color = runStyle.color
+		cs.Typeface = runStyle.typeface
+		cs.Underline = runStyle.underline
+		cs.Strikethrough = runStyle.strikethrough
+		dc.Text(float32(runStart)*t.cellW, float32(r)*t.cellH,
+			runBuf.String(), cs)
+		runOpen = false
+		runBuf.Reset()
+	}
 	for r := range renderRows {
+		runOpen = false
+		runBuf.Reset()
 		for c := range cols {
 			cell := resolveCell(r, c)
 			if cell.Width == 0 && cell.Ch == 0 {
+				continue // continuation cell; skip without breaking run
+			}
+			k := cellRunKey(cell, style, g, hR, hC)
+			isPlainSpace := cell.Ch == ' ' && cell.Attrs == 0 && cell.LinkID == 0
+			if cell.Width == 2 {
+				flushRun(r)
+				cs := style
+				cs.Color = k.color
+				cs.Typeface = k.typeface
+				cs.Underline = k.underline
+				cs.Strikethrough = k.strikethrough
+				dc.Text(float32(c)*t.cellW, float32(r)*t.cellH,
+					runeString(cell.Ch), cs)
 				continue
 			}
-			if cell.Ch == ' ' && cell.Attrs == 0 && cell.LinkID == 0 {
+			if isPlainSpace {
+				if runOpen && k == runStyle {
+					runBuf.WriteRune(' ')
+				} else {
+					flushRun(r)
+				}
 				continue
 			}
-			cs := style
-			cs.Color = fg(cell)
-			if cell.Attrs != 0 {
-				if cell.Attrs&AttrDim != 0 {
-					col := cs.Color
-					cs.Color = gui.RGB(col.R/2, col.G/2, col.B/2)
-				}
-				bold, italic := cell.Attrs&AttrBold != 0, cell.Attrs&AttrItalic != 0
-				switch {
-				case bold && italic:
-					cs.Typeface = glyph.TypefaceBoldItalic
-				case bold:
-					cs.Typeface = glyph.TypefaceBold
-				case italic:
-					cs.Typeface = glyph.TypefaceItalic
-				}
-				cs.Underline = cell.Attrs&AttrUnderline != 0
-				cs.Strikethrough = cell.Attrs&AttrStrikethrough != 0
+			if runOpen && k == runStyle {
+				runBuf.WriteRune(cell.Ch)
+			} else {
+				flushRun(r)
+				runOpen = true
+				runStart = c
+				runStyle = k
+				runBuf.WriteRune(cell.Ch)
 			}
-			if cell.LinkID != 0 {
-				cs.Underline = true
-				// Hover: same link as the cell under the pointer gets
-				// brightened toward blue (xterm hyperlink convention).
-				hR, hC := t.hoverR, t.hoverC // benign unsynchronized read
-				if hR >= 0 && hC >= 0 {
-					if g.ViewCellAt(hR, hC).LinkID == cell.LinkID {
-						col := cs.Color
-						cs.Color = gui.RGB(col.R/2, col.G/2, 255)
-					}
-				}
-			}
-			dc.Text(float32(c)*t.cellW, float32(r)*t.cellH,
-				runeString(cell.Ch), cs)
 		}
+		flushRun(r)
 	}
 
 	// Cursor: shape per DECSCUSR (block / underline / bar). Suppress
@@ -700,6 +785,7 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 	if t.searchActive {
 		t.searchQuery += string(rune(e.CharCode))
 		e.IsHandled = true
+		t.bumpVersion()
 		t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
 		return
 	}
@@ -833,6 +919,7 @@ func (t *Term) onClick(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	t.dragging = true
 	t.dragButton = e.MouseButton
 	t.dragReport = false
+	t.bumpVersion()
 	w.UpdateWindow()
 	e.IsHandled = true
 }
@@ -900,6 +987,7 @@ func (t *Term) updateHover(r, c int, w *gui.Window) {
 	curLink = t.grid.ViewCellAt(r, c).LinkID
 	t.grid.Mu.Unlock()
 	if prevLink != 0 || curLink != 0 {
+		t.bumpVersion()
 		w.UpdateWindow()
 	}
 }
@@ -946,6 +1034,7 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		t.grid.ClearSelection()
 		t.grid.Mu.Unlock()
 	}
+	t.bumpVersion()
 	w.UpdateWindow()
 	e.IsHandled = true
 }
@@ -1035,6 +1124,7 @@ func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	t.grid.Mu.Lock()
 	t.grid.ScrollView(lines)
 	t.grid.Mu.Unlock()
+	t.bumpVersion()
 	w.UpdateWindow()
 	e.IsHandled = true
 }
@@ -1105,6 +1195,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		t.searchMatches = nil
 		t.searchIdx = 0
 		e.IsHandled = true
+		t.bumpVersion()
 		w.UpdateWindow()
 		return
 	}
@@ -1118,12 +1209,14 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			if len(t.searchQuery) > 0 {
 				rr := []rune(t.searchQuery)
 				t.searchQuery = string(rr[:len(rr)-1])
+				t.bumpVersion()
 				w.UpdateWindow()
 			}
 		case gui.KeyEscape:
 			t.searchActive = false
 			t.searchQuery = ""
 			t.searchMatches = nil
+			t.bumpVersion()
 			w.UpdateWindow()
 		}
 		e.IsHandled = true
@@ -1259,6 +1352,7 @@ func (t *Term) scrollByPage(dir int, w *gui.Window) {
 	}
 	t.grid.ScrollView(dir * step)
 	t.grid.Mu.Unlock()
+	t.bumpVersion()
 	w.UpdateWindow()
 }
 
@@ -1267,6 +1361,7 @@ func (t *Term) scrollToTop(w *gui.Window) {
 	t.grid.Mu.Lock()
 	t.grid.ScrollViewTop()
 	t.grid.Mu.Unlock()
+	t.bumpVersion()
 	w.UpdateWindow()
 }
 
@@ -1275,6 +1370,7 @@ func (t *Term) scrollToBottom(w *gui.Window) {
 	t.grid.Mu.Lock()
 	t.grid.ResetView()
 	t.grid.Mu.Unlock()
+	t.bumpVersion()
 	w.UpdateWindow()
 }
 
