@@ -605,7 +605,7 @@ func logicalReflow(
 		phys[nSB+r] = physRow{cells: row, wrapped: w}
 	}
 
-	cursorPhys := nSB + cursorR // cursor's index in phys[]
+	cursorPhys := nSB + clamp(cursorR, 0, oldRows-1) // cursor's index in phys[]
 
 	// --- Identify logical lines and the one containing the cursor ---
 	type logLine struct {

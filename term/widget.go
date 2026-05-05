@@ -612,15 +612,41 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	live := g.ViewOffset == 0 && !g.SelActive && !t.searchActive
 	cells := g.Cells
 
-	// Collect viewport search matches while holding Mu (ViewportMatches is
-	// cheap: at most Rows rows). Cache into t.searchMatches so searchJump
-	// can use the most-recent result without re-locking.
-	var vMatches []ContentPos
+	// Pre-map search matches and selection to viewport rows to avoid O(N)
+	// checks inside the per-cell loop.
+	type vMatch struct{ col, len int }
+	vMatchesByRow := make([][]vMatch, rows)
 	var qRunes []rune
 	if t.searchActive && t.searchQuery != "" {
-		vMatches = g.ViewportMatches(t.searchQuery)
+		matches := g.ViewportMatches(t.searchQuery)
 		qRunes = []rune(t.searchQuery)
-		t.searchMatches = vMatches
+		t.searchMatches = matches
+		qLen := len(qRunes)
+		for _, m := range matches {
+			if vr, ok := g.ContentRowToViewport(m.Row); ok && vr < rows {
+				vMatchesByRow[vr] = append(vMatchesByRow[vr], vMatch{m.Col, qLen})
+			}
+		}
+	}
+
+	type rowBounds struct{ c0, c1 int; active bool }
+	rowSel := make([]rowBounds, rows)
+	if g.SelActive {
+		s, e := g.selOrder()
+		for r := range rows {
+			cr := g.viewportToContent(r)
+			if cr < s.Row || cr > e.Row {
+				continue
+			}
+			c0, c1 := 0, cols-1
+			if cr == s.Row {
+				c0 = s.Col
+			}
+			if cr == e.Row {
+				c1 = e.Col
+			}
+			rowSel[r] = rowBounds{c0, c1, true}
+		}
 	}
 
 	resolveCell := func(r, c int) Cell {
@@ -628,17 +654,13 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			return cells[r*cols+c]
 		}
 		cell := g.ViewCellAt(r, c)
-		if g.InSelection(r, c) {
+		if rb := rowSel[r]; rb.active && c >= rb.c0 && c <= rb.c1 {
 			cell.Attrs ^= AttrInverse
 		}
-		if len(qRunes) > 0 {
-			qLen := len(qRunes)
-			for _, m := range vMatches {
-				vr, ok := g.ContentRowToViewport(m.Row)
-				if ok && vr == r && c >= m.Col && c < m.Col+qLen {
-					cell.Attrs ^= AttrInverse
-					break
-				}
+		for _, m := range vMatchesByRow[r] {
+			if c >= m.col && c < m.col+m.len {
+				cell.Attrs ^= AttrInverse
+				break
 			}
 		}
 		return cell
@@ -1428,13 +1450,23 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 
 	switch e.KeyCode {
 	case gui.KeyPageUp:
-		t.scrollByPage(+1, w)
-		e.IsHandled = true
-		return
+		t.grid.Mu.Lock()
+		alt := t.grid.AltActive
+		t.grid.Mu.Unlock()
+		if shift || !alt {
+			t.scrollByPage(+1, w)
+			e.IsHandled = true
+			return
+		}
 	case gui.KeyPageDown:
-		t.scrollByPage(-1, w)
-		e.IsHandled = true
-		return
+		t.grid.Mu.Lock()
+		alt := t.grid.AltActive
+		t.grid.Mu.Unlock()
+		if shift || !alt {
+			t.scrollByPage(-1, w)
+			e.IsHandled = true
+			return
+		}
 	case gui.KeyHome:
 		if shift {
 			t.scrollToTop(w)
@@ -1451,6 +1483,10 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 
 	var out []byte
 	switch e.KeyCode {
+	case gui.KeyPageUp:
+		out = []byte("\x1b[5~")
+	case gui.KeyPageDown:
+		out = []byte("\x1b[6~")
 	case gui.KeyEnter, gui.KeyKPEnter:
 		if modes.appKeypad && e.KeyCode == gui.KeyKPEnter {
 			out = []byte("\x1bOM")
