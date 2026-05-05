@@ -510,15 +510,111 @@ pixels, so it survives scrolling and resizing.
 
 ---
 
+## Phase 18 — Visual Bell (BEL)
+
+**Why:** Many CLI tools and shells emit `\a` (BEL) to signal completion or errors.
+
+- [ ] `grid.go`: Add `Bell()` which increments a `BellCounter` or sets a timestamp.
+- [ ] `parser.go`: When `0x07` (BEL) is received, call `g.Bell()`.
+- [ ] `widget.go`: `onDraw` checks the bell state/timestamp and briefly inverts the screen or draws a subtle flash.
+- [ ] Tests for BEL reception and state mutation.
+
+**Demo test:** `printf '\a'` (or `echo -e "\a"`) triggers a visual flash.
+
+---
+
+## Phase 19 — Scrollbar Indicator
+
+**Why:** With a large scrollback, users need visual feedback on their position in history.
+
+- [ ] `widget.go`: `onDraw` renders a thin, semi-transparent vertical bar on the right edge.
+- [ ] Logic to map `ViewOffset` and `ContentRows` to scrollbar position and size.
+- [ ] Logic to hide the scrollbar when at the live viewport and no movement has occurred for N seconds.
+
+**Demo test:** Scroll up; a scrollbar appears on the right indicating position.
+
+---
+
+## Phase 20 — Extended Underline Styles & Colors
+
+**Why:** Modern syntax highlighters and editors (like Neovim) use curly or colored underlines for diagnostics.
+
+- [ ] `grid.go`: Add `UnderlineStyle` (single, double, curly, dotted, dashed) and `UnderlineColor` to `Cell`.
+- [ ] `parser.go`: Handle `CSI 4 : n m` (style) and `CSI 58 ; 2 ; r ; g ; b m` (color).
+- [ ] `widget.go`: `onDraw` renders the various underline styles using `dc` primitives.
+- [ ] Tests for SGR 4:n and 58.
+
+**Demo test:** `printf '\x1b[4:3mCURLY\x1b[0m\n'`.
+
+---
+
+## Phase 21 — Customizable Tab Stops (HTS / TBC)
+
+**Why:** Required for some legacy CLI applications and specialized text layouts.
+
+- [ ] `grid.go`: Add `TabStops []bool` (size `MaxGridDim`).
+- [ ] `parser.go`: Handle `ESC H` (HTS - set stop) and `CSI g` (TBC - clear stop).
+- [ ] `grid.go`: `Tab()` uses `TabStops` if set, else falls back to default 8-col.
+- [ ] Tests for setting and clearing tab stops.
+
+**Demo test:** Set a custom tab stop, then use `\t` to verify alignment.
+
+---
+
+## Phase 22 — Meta/Alt Key Encoding
+
+**Why:** Many CLI apps (Emacs, readline) use Alt+Key combinations for shortcuts.
+
+- [ ] `widget.go`: `onKeyDown` prefixes output with `\x1b` (ESC) when `ModAlt` is held.
+- [ ] Handle both single characters and existing escape sequences (e.g., Alt+Arrow).
+
+**Demo test:** Press Alt+F in a shell to jump forward a word (if supported by shell).
+
+---
+
+## Phase 23 — Enhanced Keypad & Function Keys (F1–F12)
+
+**Why:** Required for complex TUIs like Midnight Commander or specialized editors.
+
+- [ ] `widget.go`: Expand `onKeyDown` and `keypadSeq` to cover F1–F12 and more keypad variants.
+- [ ] Honor `AppCursorKeys` and `AppKeypad` modes for all new keys.
+
+**Demo test:** Run `mc` or `htop` and verify function keys work.
+
+---
+
+## Phase 24 — Color Themes & Palette API
+
+**Why:** Allow users to use popular themes (Gruvbox, Solarized, Nord) without modifying `palette.go`.
+
+- [ ] `grid.go`: Move the 256-color palette from a global to a field in `Grid` or a shared `Theme` struct.
+- [ ] `term.go`: Add `SetTheme(colors [16]gui.Color)` or similar API.
+- [ ] Update `resolve` to use the grid-local palette.
+
+**Demo test:** Change the theme at runtime via a demo menu.
+
+---
+
+## Phase 25 — Performance: Dirty Row Tracking
+
+**Why:** Even with coalescing, `onDraw` iterates every cell. Large windows can be optimized.
+
+- [ ] `grid.go`: Add `Dirty []bool` to track modified rows.
+- [ ] `widget.go`: `onDraw` only re-renders rows marked dirty, or when the viewport/selection changes.
+- [ ] Benchmarking to confirm performance gain on large high-DPI displays.
+
+**Demo test:** `top` or `htop` running in a large window should show lower CPU usage for the UI thread.
+
 ## Critical files
 
 All edits stay in:
-- `term/grid.go` — every phase touches it (cells, cursor, regions,
-  scrollback, alt, selection, wide).
-- `term/parser.go` — every phase except 4-only (selection is
-  widget-only).
-- `term/widget.go` — phases 3, 4, 5, 8, 9, 10, 11.
-- `term/palette.go` — phase 1 only.
+- `term/grid.go` — most phases.
+- `term/parser.go` — phases 18, 20, 21.
+- `term/widget.go` — phases 18, 19, 20, 22, 23, 25.
+- `term/palette.go` — phase 24.
+
+## Reused functions / patterns to preserve
+
 
 No new files unless a phase grows past ~300 LoC; if so, split that
 phase's surface into `term/<feature>.go` (e.g. `term/scrollback.go`).

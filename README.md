@@ -16,14 +16,17 @@ Pre-1.0. The public API in `term/` (`Cfg`, `Term`, `New`, `View`,
 ## Features
 
 - Real PTY-backed shell (`$SHELL`, fallback `/bin/sh`)
-- 16-color ANSI palette (SGR 30–37, 40–47, 90–97, 100–107) plus
-  bold / underline / inverse attributes
-- Cursor movement, erase-in-line, erase-in-display
-- UTF-8 input with carry-over across reads
-- Keyboard input including arrows, Page Up/Down, Home/End, Delete,
-  Ctrl+letter
-- Live resize: floors the canvas to whole cells, reflows the grid,
-  sends `TIOCSWINSZ` so the child receives `SIGWINCH`
+- Full color support: 16-color ANSI, 256-color palette, and 24-bit Truecolor
+- Advanced text attributes: Bold, Dim, Italic, Underline, Inverse, Strikethrough
+- Logical line wrapping (reflow): Content is re-wrapped on window resize
+- Scrollback ring buffer with momentum scrolling (default 5000 rows)
+- Alt-screen support for full-screen apps (`vim`, `htop`, `less`, `tmux`)
+- Mouse reporting (SGR 1006) and mouse wheel support
+- Text selection and system clipboard integration (Copy/Paste)
+- OSC support: Window titles, Hyperlinks (OSC 8), CWD, and Clipboard (OSC 52)
+- Bracketed paste mode and Focus reporting
+- Search in scrollback (Cmd+F)
+- East Asian Wide (CJK) and Emoji support
 
 ## Requirements
 
@@ -100,7 +103,7 @@ term/parser.go         VT state machine. Bytes → grid mutations.
 term/grid.go           Cell buffer + cursor + scroll-up. Pure data.
 
 term/pty.go            creack/pty wrapper. Spawns $SHELL, resize ioctl.
-term/palette.go        16-color ANSI table + default fg/bg.
+term/palette.go        256-color ANSI table + RGB resolution.
 ```
 
 Concurrency: one PTY reader goroutine. `Grid.Mu` is the single lock —
@@ -109,20 +112,13 @@ cells. After feeding bytes, the reader calls `win.QueueCommand(...)` to
 schedule the redraw on the main thread. Direct `*gui.Window` access
 from the reader goroutine is forbidden.
 
-## Out of scope
+## Out of scope (still)
 
-These were excluded from MVP and should remain so unless a feature
-explicitly requires them. Each is a real chunk of work — please open
-an issue first to discuss.
+These are currently excluded from the roadmap. Each is a real chunk of work:
 
-- Alt screen / xterm 1049 (vim, htop, less, tmux all need this)
-- Mouse reporting (1000/1006)
-- 24-bit truecolor
-- Scrollback ring buffer
-- Bracketed paste
-- OSC sequences (titles, hyperlinks, OSC 52 clipboard)
+- Sixel / kitty graphics protocol
 - IME composition / dead keys
-- Sixel / kitty graphics
+- GPU-accelerated rendering
 - Windows / ConPTY support
 
 ## Testing

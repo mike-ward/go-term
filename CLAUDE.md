@@ -109,18 +109,17 @@ term/palette.go        16-color ANSI table + default fg/bg.
 
 ### Parser scope (intentional)
 
-Only what's needed to display `cat`, `ls`, simple prompts, and 16-color
-output. Implemented:
+Supports a modern xterm-compatible subset:
 
 - C0: `BEL`, `BS`, `HT`, `LF`, `CR`, `ESC`.
-- `CSI ... m` (SGR): reset, bold/underline/inverse + clears, fg 30-37
-  + bright 90-97, bg 40-47 + bright 100-107, default 39/49. Truecolor
-  (`38;2;...`) and 256-color (`38;5;...`) introducers are *parsed and
-  swallowed* so subsequent params don't get reinterpreted as separate
-  SGRs — they don't recolor.
-- All other CSI sequences (cursor moves, erase-in-display, scroll
-  regions, alt screen, mouse, etc.): silently dropped. UTF-8 decoded
-  with carry-over across `Feed` calls.
+- `CSI ... m` (SGR): reset, bold/underline/inverse, dim/italic/strike,
+  fg/bg 16-color, 256-color, and 24-bit truecolor.
+- CSI: cursor movement, erase, scroll regions (DECSTBM), line/char
+  insertion/deletion.
+- Modes: Alt screen (1049/1047/47), Mouse (1000/1002/1003/1006),
+  Bracketed paste (2004), Focus reporting (1004).
+- OSC: window title (0/1/2), CWD (7), Hyperlinks (8), Clipboard (52).
+- DCS: DECRQSS, XTGETTCAP, Synchronized Updates (?2026).
 
 When extending: add cases to `dispatchCSI` in `term/parser.go`. Don't
 let parser code reach into go-gui — it must stay grid-only.
@@ -138,18 +137,12 @@ If keystrokes don't reach the PTY, focus is the first place to look.
 
 ## Out-of-scope (don't add casually)
 
-These were excluded from MVP and should remain so unless a feature
-explicitly requires them. Each is a real chunk of work:
+These are currently excluded from the roadmap. Each is a real chunk of work:
 
-- Alt screen / xterm 1049 (vim, htop, less, tmux all want this)
-- Mouse reporting (1000/1006)
-- 24-bit truecolor
-- Scrollback ring buffer
-- Bracketed paste
-- OSC sequences (titles, hyperlinks, OSC 52 clipboard)
+- Sixel / kitty graphics protocol
 - IME composition / dead keys
-- Sixel / kitty graphics
-- Windows/ConPTY support
+- GPU-accelerated rendering
+- Windows / ConPTY support
 
 ## Conventions
 
