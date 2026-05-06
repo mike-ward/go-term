@@ -1296,3 +1296,39 @@ func TestParser_OSC52_NoSemicolon(t *testing.T) {
 	}
 }
 
+func TestParser_BEL_IncrementsBellCount(t *testing.T) {
+	g, p := newParserGrid(5, 20)
+	feed(t, g, p, []byte{0x07})
+	if g.BellCount != 1 {
+		t.Fatalf("BellCount after BEL = %d, want 1", g.BellCount)
+	}
+	feed(t, g, p, []byte{0x07, 0x07})
+	if g.BellCount != 3 {
+		t.Fatalf("BellCount after 3 BELs = %d, want 3", g.BellCount)
+	}
+}
+
+func TestParser_BEL_DoesNotMoveCursor(t *testing.T) {
+	g, p := newParserGrid(5, 20)
+	g.Put('A')
+	feed(t, g, p, []byte{0x07})
+	if g.CursorC != 1 {
+		t.Errorf("BEL moved cursor: col = %d, want 1", g.CursorC)
+	}
+}
+
+func TestParser_BEL_InOSCTerminatesPayload(t *testing.T) {
+	// BEL as OSC terminator must not double-count as a bell.
+	g, p := newParserGrid(5, 40)
+	var title string
+	p.SetTitleHandler(func(s string) { title = s })
+	feed(t, g, p, []byte("\x1b]0;hello\x07"))
+	if title != "hello" {
+		t.Errorf("OSC title = %q, want %q", title, "hello")
+	}
+	// The BEL here terminated the OSC; BellCount must remain 0.
+	if g.BellCount != 0 {
+		t.Errorf("OSC-terminator BEL incremented BellCount = %d, want 0", g.BellCount)
+	}
+}
+

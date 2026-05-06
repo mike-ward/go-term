@@ -177,6 +177,9 @@ const cursorBlinkPeriod = 500 * time.Millisecond
 // defaultScrollbackRows is the cap applied when Cfg.ScrollbackRows == 0.
 const defaultScrollbackRows = 5000
 
+// bellFlashDuration is how long the visual-bell overlay remains visible.
+const bellFlashDuration = 100 * time.Millisecond
+
 // maxPasteBytes caps clipboard payloads written to the PTY. Multi-MB
 // pastes can wedge the shell and stall the reader goroutine; truncate
 // silently — nothing useful types thousands of lines at once.
@@ -253,6 +256,12 @@ type Term struct {
 	searchQuery   string
 	searchMatches []ContentPos // viewport matches refreshed each onDraw
 	searchIdx     int          // index of last jump target in searchMatches
+
+	// Bell flash state. Both fields are main-thread only (written inside
+	// QueueCommand callbacks and read in onDraw). bellSeenCount tracks
+	// the last BellCount observed so new bells are detected exactly once.
+	bellSeenCount uint64
+	bellFlashUntil time.Time
 
 	// Momentum scroll state. momentumVel/Acc/CellH/Coasting protected by
 	// momentumMu. momentumTimer and momentumKick owned by the GUI goroutine
@@ -500,6 +509,7 @@ func (t *Term) readLoop() {
 		if n > 0 {
 			t.grid.Mu.Lock()
 			t.parser.Feed(buf[:n])
+			bellCount := t.grid.BellCount
 			redraw := !t.grid.SyncOutput || !t.grid.SyncActive
 			if redraw {
 				t.bumpVersion()
@@ -507,6 +517,17 @@ func (t *Term) readLoop() {
 			t.grid.Mu.Unlock()
 			if redraw {
 				t.win.QueueCommand(func(w *gui.Window) {
+					if bellCount > t.bellSeenCount {
+						t.bellSeenCount = bellCount
+						t.bellFlashUntil = time.Now().Add(bellFlashDuration)
+						// Schedule a redraw to clear the flash overlay.
+						time.AfterFunc(bellFlashDuration+time.Millisecond, func() {
+							if !t.closed.Load() {
+								t.bumpVersion()
+								t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+							}
+						})
+					}
 					w.UpdateWindow()
 				})
 			}
@@ -778,6 +799,12 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	if t.searchActive {
 		t.drawSearchBar(dc, rows, cols, style)
 	}
+
+	// Visual bell: brief semi-transparent overlay that fades within bellFlashDuration.
+	if time.Now().Before(t.bellFlashUntil) {
+		dc.FilledRect(0, 0, dc.Width, dc.Height, gui.RGBA(255, 255, 255, 40))
+	}
+
 	t.grid.Mu.Unlock()
 }
 

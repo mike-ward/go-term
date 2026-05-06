@@ -238,6 +238,10 @@ type Grid struct {
 	AppCursorKeys  bool // DEC ?1 — application cursor key mode
 	AppKeypad      bool // DECNKM — application keypad mode
 
+	// BellCount is incremented each time the terminal receives BEL (0x07).
+	// The widget watches for changes to trigger a visual flash.
+	BellCount uint64
+
 	// Cursor shape + blink. Set via DECSCUSR (CSI Ps SP q). Default is
 	// a steady block. Embedders can override blink via
 	// Cfg.CursorBlink without overriding shape.
@@ -341,6 +345,10 @@ func (g *Grid) viewportToContent(r int) int {
 func (g *Grid) MouseReporting() bool {
 	return g.MouseTrack || g.MouseTrackBtn || g.MouseTrackAny
 }
+
+// Bell increments BellCount. Called by the parser on 0x07 (BEL). Caller
+// holds Mu.
+func (g *Grid) Bell() { g.BellCount++ }
 
 // InSelection reports whether viewport (r, c) is inside the selection.
 // r is a viewport row; it is converted to content coordinates internally

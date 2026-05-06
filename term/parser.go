@@ -109,6 +109,7 @@ func (p *Parser) Feed(b []byte) {
 		case stGround:
 			switch {
 			case c == 0x07: // BEL
+				p.g.Bell()
 				i++
 			case c == 0x08: // BS
 				p.g.Backspace()

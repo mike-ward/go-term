@@ -1941,3 +1941,19 @@ func TestGrid_ViewportMatches_AltActiveReturnsNil(t *testing.T) {
 		t.Errorf("ViewportMatches during alt = %v, want nil", m)
 	}
 }
+
+func TestGrid_Bell_IncrementsCount(t *testing.T) {
+	g := NewGrid(5, 20)
+	if g.BellCount != 0 {
+		t.Fatalf("initial BellCount = %d, want 0", g.BellCount)
+	}
+	g.Bell()
+	if g.BellCount != 1 {
+		t.Fatalf("BellCount after 1 bell = %d, want 1", g.BellCount)
+	}
+	g.Bell()
+	g.Bell()
+	if g.BellCount != 3 {
+		t.Fatalf("BellCount after 3 bells = %d, want 3", g.BellCount)
+	}
+}

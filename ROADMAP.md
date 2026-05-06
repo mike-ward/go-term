@@ -514,10 +514,10 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Many CLI tools and shells emit `\a` (BEL) to signal completion or errors.
 
-- [ ] `grid.go`: Add `Bell()` which increments a `BellCounter` or sets a timestamp.
-- [ ] `parser.go`: When `0x07` (BEL) is received, call `g.Bell()`.
-- [ ] `widget.go`: `onDraw` checks the bell state/timestamp and briefly inverts the screen or draws a subtle flash.
-- [ ] Tests for BEL reception and state mutation.
+- [x] `grid.go`: Add `Bell()` which increments a `BellCounter` or sets a timestamp.
+- [x] `parser.go`: When `0x07` (BEL) is received, call `g.Bell()`.
+- [x] `widget.go`: `onDraw` checks the bell state/timestamp and briefly inverts the screen or draws a subtle flash.
+- [x] Tests for BEL reception and state mutation.
 
 **Demo test:** `printf '\a'` (or `echo -e "\a"`) triggers a visual flash.
 
