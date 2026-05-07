@@ -527,9 +527,9 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** With a large scrollback, users need visual feedback on their position in history.
 
-- [ ] `widget.go`: `onDraw` renders a thin, semi-transparent vertical bar on the right edge.
-- [ ] Logic to map `ViewOffset` and `ContentRows` to scrollbar position and size.
-- [ ] Logic to hide the scrollbar when at the live viewport and no movement has occurred for N seconds.
+- [x] `widget.go`: `onDraw` renders a thin, semi-transparent vertical bar on the right edge.
+- [x] Logic to map `ViewOffset` and `ContentRows` to scrollbar position and size.
+- [x] Logic to hide the scrollbar when at the live viewport and no movement has occurred for N seconds.
 
 **Demo test:** Scroll up; a scrollbar appears on the right indicating position.
 

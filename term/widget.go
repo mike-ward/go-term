@@ -180,6 +180,13 @@ const defaultScrollbackRows = 5000
 // bellFlashDuration is how long the visual-bell overlay remains visible.
 const bellFlashDuration = 100 * time.Millisecond
 
+// scrollbarWidth is the pixel width of the scrollbar thumb.
+const scrollbarWidth float32 = 4
+
+// scrollbarDuration is how long the scrollbar stays visible after the last
+// scroll event while the viewport is back at the live bottom.
+const scrollbarDuration = 1500 * time.Millisecond
+
 // maxPasteBytes caps clipboard payloads written to the PTY. Multi-MB
 // pastes can wedge the shell and stall the reader goroutine; truncate
 // silently — nothing useful types thousands of lines at once.
@@ -260,8 +267,16 @@ type Term struct {
 	// Bell flash state. Both fields are main-thread only (written inside
 	// QueueCommand callbacks and read in onDraw). bellSeenCount tracks
 	// the last BellCount observed so new bells are detected exactly once.
-	bellSeenCount uint64
+	bellSeenCount  uint64
 	bellFlashUntil time.Time
+
+	// scrollbarUntil is the deadline until which the scrollbar thumb is
+	// rendered, even after ViewOffset returns to 0. Main-thread only.
+	scrollbarUntil time.Time
+	// scrollbarTimer is the single debounce timer that schedules the hide
+	// redraw. Reset on each scroll event; avoids spawning a goroutine per
+	// event. Main-thread only (created lazily in showScrollbar).
+	scrollbarTimer *time.Timer
 
 	// Momentum scroll state. momentumVel/Acc/CellH/Coasting protected by
 	// momentumMu. momentumTimer and momentumKick owned by the GUI goroutine
@@ -387,7 +402,10 @@ func (t *Term) autoScrollLoop() {
 			t.grid.ScrollView(dir)
 			t.grid.Mu.Unlock()
 			t.bumpVersion()
-			t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+			t.win.QueueCommand(func(w *gui.Window) {
+				t.showScrollbar()
+				w.UpdateWindow()
+			})
 		}
 	}
 }
@@ -549,6 +567,32 @@ func (t *Term) style() gui.TextStyle {
 // bumpVersion increments drawVersion so the next View call produces a
 // new cache key, forcing go-gui to re-invoke OnDraw for this frame.
 func (t *Term) bumpVersion() { t.drawVersion.Add(1) }
+
+// scrollbarGeometry computes the scrollbar thumb Y position and height.
+// sbLen = len(Scrollback), viewH = canvas pixel height. Caller ensures sbLen > 0.
+func scrollbarGeometry(sbLen, rows, viewOffset int, viewH float32) (thumbY, thumbH float32) {
+	total := float32(sbLen + rows)
+	thumbH = float32(rows) / total * viewH
+	thumbY = float32(sbLen-viewOffset) / total * viewH
+	return
+}
+
+// showScrollbar arms the auto-hide timer for the scrollbar thumb. Call on
+// the main thread whenever the viewport scrolls. Uses a single debounced
+// timer so rapid scroll events don't accumulate goroutines.
+func (t *Term) showScrollbar() {
+	t.scrollbarUntil = time.Now().Add(scrollbarDuration)
+	if t.scrollbarTimer == nil {
+		t.scrollbarTimer = time.AfterFunc(scrollbarDuration+time.Millisecond, func() {
+			if !t.closed.Load() {
+				t.bumpVersion()
+				t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+			}
+		})
+	} else {
+		t.scrollbarTimer.Reset(scrollbarDuration + time.Millisecond)
+	}
+}
 
 // runKey captures the rendering-relevant properties of a cell for
 // run-coalescing in the foreground pass. Two cells with equal runKey
@@ -800,9 +844,20 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		t.drawSearchBar(dc, rows, cols, style)
 	}
 
+	now := time.Now()
+
 	// Visual bell: brief semi-transparent overlay that fades within bellFlashDuration.
-	if time.Now().Before(t.bellFlashUntil) {
+	if now.Before(t.bellFlashUntil) {
 		dc.FilledRect(0, 0, dc.Width, dc.Height, gui.RGBA(255, 255, 255, 40))
+	}
+
+	// Scrollbar: pill-shaped thumb on the right edge. Visible while scrolled
+	// back or within scrollbarDuration of the last scroll event.
+	sb := len(g.Scrollback)
+	if (now.Before(t.scrollbarUntil) || g.ViewOffset > 0) && sb > 0 && dc.Width >= scrollbarWidth {
+		thumbY, thumbH := scrollbarGeometry(sb, g.Rows, g.ViewOffset, dc.Height)
+		dc.FilledRoundedRect(dc.Width-scrollbarWidth, thumbY, scrollbarWidth, thumbH,
+			scrollbarWidth/2, gui.RGBA(128, 128, 128, 120))
 	}
 
 	t.grid.Mu.Unlock()
@@ -1266,6 +1321,7 @@ func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		t.grid.Mu.Lock()
 		t.grid.ScrollView(lines)
 		t.grid.Mu.Unlock()
+		t.showScrollbar()
 		t.bumpVersion()
 		w.UpdateWindow()
 	}
@@ -1351,7 +1407,10 @@ func (t *Term) momentumLoop() {
 				t.grid.ScrollView(lines)
 				t.grid.Mu.Unlock()
 				t.bumpVersion()
-				t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+				t.win.QueueCommand(func(w *gui.Window) {
+					t.showScrollbar()
+					w.UpdateWindow()
+				})
 			}
 		}
 	}
@@ -1594,6 +1653,7 @@ func (t *Term) scrollByPage(dir int, w *gui.Window) {
 	}
 	t.grid.ScrollView(dir * step)
 	t.grid.Mu.Unlock()
+	t.showScrollbar()
 	t.bumpVersion()
 	w.UpdateWindow()
 }
@@ -1603,6 +1663,7 @@ func (t *Term) scrollToTop(w *gui.Window) {
 	t.grid.Mu.Lock()
 	t.grid.ScrollViewTop()
 	t.grid.Mu.Unlock()
+	t.showScrollbar()
 	t.bumpVersion()
 	w.UpdateWindow()
 }
@@ -1612,6 +1673,7 @@ func (t *Term) scrollToBottom(w *gui.Window) {
 	t.grid.Mu.Lock()
 	t.grid.ResetView()
 	t.grid.Mu.Unlock()
+	t.showScrollbar()
 	t.bumpVersion()
 	w.UpdateWindow()
 }

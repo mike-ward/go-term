@@ -9,6 +9,41 @@ import (
 	"github.com/mike-ward/go-gui/gui"
 )
 
+// scrollbarThumb delegates to scrollbarGeometry so tests share the production formula.
+func scrollbarThumb(sbRows, liveRows, viewOffset int, viewH float32) (thumbY, thumbH float32) {
+	return scrollbarGeometry(sbRows, liveRows, viewOffset, viewH)
+}
+
+func TestScrollbarGeometry_LiveView(t *testing.T) {
+	// ViewOffset=0: thumb bottom should align with viewport bottom.
+	const sb, rows, h = 100, 24, 480.0
+	y, th := scrollbarThumb(sb, rows, 0, h)
+	bottom := y + th
+	if math.Abs(float64(bottom-h)) > 0.001 {
+		t.Errorf("live view: thumb bottom = %.3f, want %.3f", bottom, float32(h))
+	}
+}
+
+func TestScrollbarGeometry_TopView(t *testing.T) {
+	// ViewOffset=len(Scrollback): thumb top should be at 0.
+	const sb, rows, h = 100, 24, 480.0
+	y, _ := scrollbarThumb(sb, rows, sb, h)
+	if math.Abs(float64(y)) > 0.001 {
+		t.Errorf("top view: thumbY = %.3f, want 0", y)
+	}
+}
+
+func TestScrollbarGeometry_MidView(t *testing.T) {
+	// ViewOffset=half scrollback: thumb midpoint should be near viewport midpoint.
+	const sb, rows, h = 100, 0, 100.0 // rows=0 so total=sb; mid is exact
+	mid := sb / 2
+	y, th := scrollbarThumb(sb, rows, mid, h)
+	thumbMid := y + th/2
+	if math.Abs(float64(thumbMid-h/2)) > 1.0 {
+		t.Errorf("mid view: thumb midpoint = %.3f, want ~%.3f", thumbMid, float32(h/2))
+	}
+}
+
 func TestRuneString_ASCIINoAlloc(t *testing.T) {
 	var sink string
 	avg := testing.AllocsPerRun(100, func() {
