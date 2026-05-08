@@ -859,6 +859,8 @@ func (p *Parser) applySGR() {
 	if len(p.params) == 0 {
 		// Bare "CSI m" == "CSI 0 m".
 		g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+		g.CurULStyle = 0
+		g.CurULColor = DefaultColor
 		return
 	}
 	for i := 0; i < len(p.params); i++ {

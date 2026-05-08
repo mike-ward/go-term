@@ -280,6 +280,11 @@ type Term struct {
 	bellSeenCount  uint64
 	bellFlashUntil time.Time
 
+	// readBellCount tracks the BellCount seen by the readLoop goroutine so
+	// bell events (which dirty no cells) still trigger a version bump.
+	// Only accessed from readLoop; no synchronization needed.
+	readBellCount uint64
+
 	// scrollbarUntil is the deadline until which the scrollbar thumb is
 	// rendered, even after ViewOffset returns to 0. Main-thread only.
 	scrollbarUntil time.Time
@@ -587,11 +592,17 @@ func (t *Term) readLoop() {
 			t.parser.Feed(buf[:n])
 			bellCount := t.grid.BellCount
 			redraw := !t.grid.SyncOutput || !t.grid.SyncActive
-			if redraw {
+			// Gate the version bump on actual visual changes: cell mutations
+			// (HasDirtyRows) or a new BEL (which marks no cells but needs a
+			// flash). Pure no-op sequences (swallowed queries, etc.) skip the
+			// version bump so the tessellation cache stays valid.
+			dirty := t.grid.HasDirtyRows() || bellCount != t.readBellCount
+			if redraw && dirty {
+				t.readBellCount = bellCount
 				t.bumpVersion()
 			}
 			t.grid.Mu.Unlock()
-			if redraw {
+			if redraw && dirty {
 				t.win.QueueCommand(func(w *gui.Window) {
 					if bellCount > t.bellSeenCount {
 						t.bellSeenCount = bellCount
@@ -733,6 +744,7 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			log.Printf("term: pty resize: %v", err)
 		}
 	}
+	t.grid.ClearDirty()
 
 	// Fast path: live viewport with no selection and no active search reads
 	// directly from the cell buffer, skipping ViewOffset / scrollback

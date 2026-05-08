@@ -319,6 +319,12 @@ type Grid struct {
 	// cells (erase, insert, scroll).
 	RowWrapped []bool // len = Rows, parallel to live cell buffer
 
+	// Dirty[r] is set whenever row r has a cell-level mutation since the
+	// last render. The widget's readLoop reads this (under Mu) to decide
+	// whether to bump drawVersion; onDraw calls ClearDirty at the start
+	// of each render cycle. Allocation mirrors RowWrapped: len = Rows.
+	Dirty []bool
+
 	// TabStops[c] is true when column c has a tab stop set. Initialized to
 	// every 8 columns (xterm default). ESC H sets; CSI g clears. Tab()
 	// advances to the next set stop, or to Cols-1 when none remains.
@@ -382,6 +388,37 @@ func (g *Grid) MouseReporting() bool {
 // Bell increments BellCount. Called by the parser on 0x07 (BEL). Caller
 // holds Mu.
 func (g *Grid) Bell() { g.BellCount++ }
+
+func (g *Grid) markDirty(r int) {
+	if r >= 0 && r < len(g.Dirty) {
+		g.Dirty[r] = true
+	}
+}
+
+func (g *Grid) markAllDirty() {
+	for i := range g.Dirty {
+		g.Dirty[i] = true
+	}
+}
+
+// HasDirtyRows reports whether any row is marked dirty since the last
+// ClearDirty call. Called under Mu by the widget's readLoop.
+func (g *Grid) HasDirtyRows() bool {
+	for _, d := range g.Dirty {
+		if d {
+			return true
+		}
+	}
+	return false
+}
+
+// ClearDirty resets all dirty flags. Called by onDraw under Mu at the
+// start of each render cycle so new mutations are captured next frame.
+func (g *Grid) ClearDirty() {
+	for i := range g.Dirty {
+		g.Dirty[i] = false
+	}
+}
 
 // InSelection reports whether viewport (r, c) is inside the selection.
 // r is a viewport row; it is converted to content coordinates internally
@@ -476,6 +513,7 @@ func NewGrid(rows, cols int) *Grid {
 		Cols:          cols,
 		Cells:         make([]Cell, rows*cols),
 		RowWrapped:    make([]bool, rows),
+		Dirty:         make([]bool, rows),
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
 		CurULColor:    DefaultColor,
@@ -928,6 +966,8 @@ func (g *Grid) Resize(rows, cols int) {
 
 	g.Rows = rows
 	g.Cols = cols
+	g.Dirty = make([]bool, rows)
+	g.markAllDirty()
 	// Reset scroll region to full screen on resize; apps re-issue DECSTBM
 	// after SIGWINCH. ViewOffset reset: scrollback row indices changed.
 	g.Top = 0
@@ -1011,6 +1051,7 @@ func (g *Grid) Put(ch rune) {
 			}
 		}
 	}
+	g.markDirty(g.CursorR)
 	g.CursorC += w
 	if !g.AutoWrap && g.CursorC >= g.Cols {
 		g.CursorC = g.Cols - 1
@@ -1122,6 +1163,7 @@ func (g *Grid) ClearAll() {
 		g.Cells[i] = defaultCell()
 	}
 	g.CursorR, g.CursorC = 0, 0
+	g.markAllDirty()
 }
 
 // MoveCursor sets the cursor to (r,c), clamped to grid bounds. Used by
@@ -1208,6 +1250,7 @@ func (g *Grid) EraseInLine(mode int) {
 	for c := cFrom; c < cTo; c++ {
 		g.Cells[row*g.Cols+c] = blank
 	}
+	g.markDirty(row)
 }
 
 // EraseInDisplay implements CSI J. mode: 0 = cursor to end of screen,
@@ -1222,6 +1265,7 @@ func (g *Grid) EraseInDisplay(mode int) {
 				g.Cells[r*g.Cols+c] = blank
 			}
 		}
+		g.markAllDirty()
 	case 1:
 		g.EraseInLine(1)
 		for r := range g.CursorR {
@@ -1229,10 +1273,12 @@ func (g *Grid) EraseInDisplay(mode int) {
 				g.Cells[r*g.Cols+c] = blank
 			}
 		}
+		g.markAllDirty()
 	case 2, 3:
 		for i := range g.Cells {
 			g.Cells[i] = blank
 		}
+		g.markAllDirty()
 	}
 }
 
@@ -1332,6 +1378,7 @@ func (g *Grid) scrollUpRegion(n int) {
 		}
 		g.RowWrapped[r] = false
 	}
+	g.markAllDirty()
 }
 
 // scrollDownRegion shifts rows [Top..Bottom] down by n, clearing the
@@ -1364,6 +1411,7 @@ func (g *Grid) scrollDownRegion(n int) {
 		}
 		g.RowWrapped[r] = false
 	}
+	g.markAllDirty()
 }
 
 // SetScrollRegion implements DECSTBM (CSI Pt;Pb r). top/bottom are
@@ -1425,6 +1473,7 @@ func (g *Grid) InsertLines(n int) {
 		g.RowWrapped[r] = false
 	}
 	g.CursorC = 0
+	g.markAllDirty()
 }
 
 // DeleteLines implements CSI Ps M (DL): delete n lines starting at the
@@ -1457,6 +1506,7 @@ func (g *Grid) DeleteLines(n int) {
 		g.RowWrapped[r] = false
 	}
 	g.CursorC = 0
+	g.markAllDirty()
 }
 
 // InsertChars implements CSI Ps @ (ICH): insert n blanks at the cursor,
@@ -1481,6 +1531,7 @@ func (g *Grid) InsertChars(n int) {
 	for c := g.CursorC; c < g.CursorC+n; c++ {
 		row[c] = blank
 	}
+	g.markDirty(g.CursorR)
 }
 
 // DeleteChars implements CSI Ps P (DCH): delete n cells at the cursor,
@@ -1504,6 +1555,7 @@ func (g *Grid) DeleteChars(n int) {
 	for c := g.Cols - n; c < g.Cols; c++ {
 		row[c] = blank
 	}
+	g.markDirty(g.CursorR)
 }
 
 // ScrollView shifts the viewport by `delta` rows: positive = back into
@@ -1599,6 +1651,7 @@ func (g *Grid) EnterAlt() {
 	g.AltActive = true
 	g.ResetView()
 	g.ClearSelection()
+	g.markAllDirty()
 }
 
 // ExitAlt restores the main-screen state captured by EnterAlt: cells,
@@ -1625,6 +1678,7 @@ func (g *Grid) ExitAlt() {
 	g.AltActive = false
 	g.ResetView()
 	g.ClearSelection()
+	g.markAllDirty()
 }
 
 // ContentRows returns the total number of content rows (scrollback + live).

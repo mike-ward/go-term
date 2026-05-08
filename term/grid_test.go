@@ -2210,3 +2210,97 @@ func TestGrid_Resize_Reflow_DeepScrollbackNarrow_CursorSurvives(t *testing.T) {
 		t.Errorf("scrollback len %d exceeds cap %d", len(g.Scrollback), g.ScrollbackCap)
 	}
 }
+
+func TestGrid_DirtyTracking_HasDirtyRows(t *testing.T) {
+	g := NewGrid(5, 10)
+	if g.HasDirtyRows() {
+		t.Fatal("new grid should have no dirty rows")
+	}
+	g.markDirty(2)
+	if !g.HasDirtyRows() {
+		t.Fatal("expected dirty after markDirty")
+	}
+	g.ClearDirty()
+	if g.HasDirtyRows() {
+		t.Fatal("expected clean after ClearDirty")
+	}
+}
+
+func TestGrid_DirtyTracking_PutMarksDirty(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.CursorR, g.CursorC = 2, 0
+	g.ClearDirty()
+	g.Put('A')
+	if !g.Dirty[2] {
+		t.Error("Put should mark cursor row dirty")
+	}
+	for r := range g.Rows {
+		if r != 2 && g.Dirty[r] {
+			t.Errorf("row %d should not be dirty after Put at row 2", r)
+		}
+	}
+}
+
+func TestGrid_DirtyTracking_EraseInLineMarksDirty(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.CursorR, g.CursorC = 3, 0
+	g.ClearDirty()
+	g.EraseInLine(2)
+	if !g.Dirty[3] {
+		t.Error("EraseInLine should mark cursor row dirty")
+	}
+}
+
+func TestGrid_DirtyTracking_ScrollUpRegionMarksAll(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.ClearDirty()
+	g.scrollUpRegion(1)
+	for r := range g.Rows {
+		if !g.Dirty[r] {
+			t.Errorf("row %d should be dirty after scrollUpRegion", r)
+		}
+	}
+}
+
+func TestGrid_DirtyTracking_ClearAllMarksAll(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.ClearDirty()
+	g.ClearAll()
+	for r := range g.Rows {
+		if !g.Dirty[r] {
+			t.Errorf("row %d should be dirty after ClearAll", r)
+		}
+	}
+}
+
+func TestGrid_DirtyTracking_ResizeReallocates(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.ClearDirty()
+	g.Resize(8, 10)
+	if len(g.Dirty) != 8 {
+		t.Fatalf("Dirty len = %d, want 8", len(g.Dirty))
+	}
+	for r := range g.Rows {
+		if !g.Dirty[r] {
+			t.Errorf("row %d should be dirty after Resize", r)
+		}
+	}
+}
+
+func TestGrid_DirtyTracking_EnterExitAltMarksAll(t *testing.T) {
+	g := NewGrid(5, 10)
+	g.ClearDirty()
+	g.EnterAlt()
+	for r := range g.Rows {
+		if !g.Dirty[r] {
+			t.Errorf("row %d should be dirty after EnterAlt", r)
+		}
+	}
+	g.ClearDirty()
+	g.ExitAlt()
+	for r := range g.Rows {
+		if !g.Dirty[r] {
+			t.Errorf("row %d should be dirty after ExitAlt", r)
+		}
+	}
+}

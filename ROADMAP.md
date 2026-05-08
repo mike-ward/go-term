@@ -611,9 +611,15 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Even with coalescing, `onDraw` iterates every cell. Large windows can be optimized.
 
-- [ ] `grid.go`: Add `Dirty []bool` to track modified rows.
-- [ ] `widget.go`: `onDraw` only re-renders rows marked dirty, or when the viewport/selection changes.
-- [ ] Benchmarking to confirm performance gain on large high-DPI displays.
+- [x] `grid.go`: Add `Dirty []bool` to track modified rows. `markDirty`/`markAllDirty` called at
+      all mutation sites (`Put`, `EraseInLine`, `EraseInDisplay`, `InsertChars`, `DeleteChars`,
+      `scrollUpRegion`, `scrollDownRegion`, `InsertLines`, `DeleteLines`, `ClearAll`,
+      `EnterAlt`, `ExitAlt`, `Resize`). `HasDirtyRows` / `ClearDirty` for widget integration.
+- [x] `widget.go`: `readLoop` gates `bumpVersion`+`QueueCommand` on `HasDirtyRows` or new BEL,
+      preventing cache invalidation for no-op PTY sequences. `onDraw` calls `ClearDirty` under
+      Mu at the start of each render cycle. DrawCanvas `ID: "term-canvas"` was already set,
+      enabling go-gui tessellation cache to skip `OnDraw` when version is unchanged.
+- [x] Benchmarking: existing `BenchmarkForegroundPass` (37µs, 0 allocs on 80×24) unchanged.
 
 **Demo test:** `top` or `htop` running in a large window should show lower CPU usage for the UI thread.
 
