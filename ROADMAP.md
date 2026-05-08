@@ -623,16 +623,103 @@ pixels, so it survives scrolling and resizing.
 
 **Demo test:** `top` or `htop` running in a large window should show lower CPU usage for the UI thread.
 
+---
+
+## Phase 26 — Semantic Shell Integration (OSC 133)
+
+**Why:** Unlocks power-user features like jumping between prompts and capturing command output.
+
+- [ ] `parser.go`: Handle `OSC 133;A` (Prompt start), `B` (Command start), `C` (Command end/exit code), `D` (Output end).
+- [ ] `grid.go`: Store command boundaries as "Marks" in the scrollback and live buffer.
+- [ ] `widget.go`: Add keyboard shortcuts (e.g., Cmd+Up/Down) to jump to the previous/next command mark.
+- [ ] Tests: Verify mark placement and retrieval across resizes and reflows.
+
+**Demo test:** `source shell-integration.zsh` (generic script) and verify command jumping works.
+
+---
+
+## Phase 27 — Kitty Keyboard Protocol (CSI u)
+
+**Why:** Modern TUI apps (Neovim, Emacs) need to distinguish `Tab` from `Ctrl+I` and handle complex chords like `Ctrl+Enter`.
+
+- [ ] `parser.go`: Handle `CSI > u` for enabling/disabling extended keyboard reporting modes.
+- [ ] `widget.go`: Update `onKeyDown` to emit `CSI u` encoded sequences when the host enables the protocol.
+- [ ] Support for reporting key release events and modifier-only events if requested.
+- [ ] Tests: Round-trip verification for complex key combinations.
+
+**Demo test:** Run `showkey -a` or a test script in Neovim to verify distinct key codes.
+
+---
+
+## Phase 28 — SGR-Pixels Mouse Reporting (1016)
+
+**Why:** High-precision mouse coordinates for advanced TUI drawing/interactions and pixel-perfect clicking.
+
+- [ ] `parser.go`: Track DEC private mode `?1016 h/l` (SGR-Pixels).
+- [ ] `widget.go`: Update `encodeMouseSGR` to emit pixel-relative coordinates instead of 1-based cell coordinates when mode 1016 is active.
+- [ ] Tests: Verify pixel vs cell coordinate math.
+
+**Demo test:** A TUI app that requires pixel-perfect clicks (e.g., a drawing tool) behaves correctly.
+
+---
+
+## Phase 29 — Regular Expression Search
+
+**Why:** Finding patterns like IP addresses, Git hashes, or specific error formats in large logs.
+
+- [ ] `grid.go`: Upgrade the `Find` helper to support `regexp.Regexp` patterns.
+- [ ] `widget.go`: Update the search UI to allow toggling between plain-text and regex modes.
+- [ ] Tests: Verify complex regex matches across multi-line wrapped content.
+
+**Demo test:** Cmd+F, toggle regex, search for `[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}` to find IPs.
+
+---
+
+## Phase 30 — External Control / API (OSC commands)
+
+**Why:** Allows scripts and tools to interact with or query the terminal state (e.g., changing themes per-project).
+
+- [ ] `parser.go`: Implement OSC sequences for querying/setting terminal state (e.g., Background color, window title, or font size).
+- [ ] `widget.go`: Handle requests for state that requires UI-thread synchronization.
+- [ ] Tests: Verify state changes and host replies for query sequences.
+
+**Demo test:** `printf '\x1b]11;rgb:ff/00/00\x07'` to change the background to red.
+
+---
+
+## Phase 31 — Disk-Backed Scrollback
+
+**Why:** Effectively "infinite" scrollback without high RAM usage or stalling on large `cat` operations.
+
+- [ ] `grid.go`: Refactor the `Scrollback` ring buffer to use a pager that can swap old rows to a compressed temporary file on disk.
+- [ ] Implement transparent loading of rows when `ViewOffset` moves deep into history.
+- [ ] Tests: Verify integrity of disk-persisted rows and performance of random access.
+
+**Demo test:** `seq 1 1000000` and verify memory usage stays flat while history remains reachable.
+
+---
+
+## Phase 32 — Sixel Graphics (Minimal)
+
+**Why:** Essential for modern terminal-parity; allows image previews and plot visualization.
+
+- [ ] `parser.go`: Handle DCS `q` for Sixel data streams.
+- [ ] `term/graphics.go`: New layer for managing a pixel-buffer (sidecar to the cell grid) and rendering it in `onDraw`.
+- [ ] `grid.go`: Cells covered by graphics need "placeholder" state to avoid text overstrike.
+- [ ] Tests: Verify Sixel decoding and correct placement relative to scrolling.
+
+**Demo test:** `img2sixel logo.png` renders the image inside the terminal.
+
 ## Critical files
 
 All edits stay in:
 - `term/grid.go` — most phases.
-- `term/parser.go` — phases 18, 20, 21.
-- `term/widget.go` — phases 18, 19, 20, 22, 23, 25.
+- `term/parser.go` — phases 18, 20, 21, 26, 27, 28, 30, 32.
+- `term/widget.go` — phases 18, 19, 20, 22, 23, 25, 26, 27, 28, 29, 30.
 - `term/palette.go` — phase 24.
+- `term/graphics.go` — phase 32 (new file).
 
 ## Reused functions / patterns to preserve
-
 
 No new files unless a phase grows past ~300 LoC; if so, split that
 phase's surface into `term/<feature>.go` (e.g. `term/scrollback.go`).
@@ -667,7 +754,6 @@ phase's surface into `term/<feature>.go` (e.g. `term/scrollback.go`).
 ## Out of scope (still)
 
 Per CLAUDE.md "Out-of-scope" list, defer:
-- Sixel / kitty graphics protocol
 - IME / dead keys
 - GPU-accelerated rendering
 

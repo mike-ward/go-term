@@ -116,7 +116,6 @@ from the reader goroutine is forbidden.
 
 These are currently excluded from the roadmap. Each is a real chunk of work:
 
-- Sixel / kitty graphics protocol
 - IME composition / dead keys
 - GPU-accelerated rendering
 - Windows / ConPTY support
