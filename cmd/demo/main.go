@@ -19,7 +19,14 @@ func main() {
 		Height: 600,
 		OnInit: func(w *gui.Window) {
 			var err error
-			t, err = term.New(w, term.Cfg{})
+			t, err = term.New(w, term.Cfg{
+				Themes: []term.NamedTheme{
+					{Name: "Default", Theme: term.DefaultTheme},
+					{Name: "Gruvbox", Theme: term.GruvboxTheme},
+					{Name: "Nord", Theme: term.NordTheme},
+					{Name: "Solarized Dark", Theme: term.SolarizedDarkTheme},
+				},
+			})
 			if err != nil {
 				log.Fatalf("term.New: %v", err)
 			}

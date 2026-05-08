@@ -1332,3 +1332,210 @@ func TestParser_BEL_InOSCTerminatesPayload(t *testing.T) {
 	}
 }
 
+// --- Phase 20: Extended Underline Styles & Colors ---
+
+func TestParser_SGR4_NoSubparam_SingleUnderline(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	feed(t, g, p, []byte("\x1b[4m"))
+	if g.CurAttrs&AttrUnderline == 0 {
+		t.Error("SGR 4: AttrUnderline not set")
+	}
+	if g.CurULStyle != ULSingle {
+		t.Errorf("SGR 4: CurULStyle = %d, want ULSingle (%d)", g.CurULStyle, ULSingle)
+	}
+}
+
+func TestParser_SGR4_ColonSubparam_Styles(t *testing.T) {
+	cases := []struct {
+		seq     string
+		style   uint8
+		hasAttr bool
+	}{
+		{"\x1b[4:0m", ULNone, false},  // explicit no-underline
+		{"\x1b[4:1m", ULSingle, true},
+		{"\x1b[4:2m", ULDouble, true},
+		{"\x1b[4:3m", ULCurly, true},
+		{"\x1b[4:4m", ULDotted, true},
+		{"\x1b[4:5m", ULDashed, true},
+	}
+	for _, c := range cases {
+		g, p := newParserGrid(2, 10)
+		// pre-set underline so 4:0 can clear it
+		g.CurAttrs |= AttrUnderline
+		g.CurULStyle = ULSingle
+		feed(t, g, p, []byte(c.seq))
+		if g.CurULStyle != c.style {
+			t.Errorf("seq %q: CurULStyle = %d, want %d", c.seq, g.CurULStyle, c.style)
+		}
+		if c.hasAttr && g.CurAttrs&AttrUnderline == 0 {
+			t.Errorf("seq %q: AttrUnderline not set", c.seq)
+		}
+		if !c.hasAttr && g.CurAttrs&AttrUnderline != 0 {
+			t.Errorf("seq %q: AttrUnderline should be cleared", c.seq)
+		}
+	}
+}
+
+func TestParser_SGR21_DoubleUnderline(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	feed(t, g, p, []byte("\x1b[21m"))
+	if g.CurAttrs&AttrUnderline == 0 {
+		t.Error("SGR 21: AttrUnderline not set")
+	}
+	if g.CurULStyle != ULDouble {
+		t.Errorf("SGR 21: CurULStyle = %d, want ULDouble (%d)", g.CurULStyle, ULDouble)
+	}
+}
+
+func TestParser_SGR24_ClearsUnderline(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	g.CurAttrs |= AttrUnderline
+	g.CurULStyle = ULCurly
+	g.CurULColor = rgbColor(255, 0, 0)
+	feed(t, g, p, []byte("\x1b[24m"))
+	if g.CurAttrs&AttrUnderline != 0 {
+		t.Error("SGR 24: AttrUnderline should be cleared")
+	}
+	if g.CurULStyle != ULNone {
+		t.Errorf("SGR 24: CurULStyle = %d, want 0", g.CurULStyle)
+	}
+	if g.CurULColor != DefaultColor {
+		t.Errorf("SGR 24: CurULColor = %#x, want DefaultColor", g.CurULColor)
+	}
+}
+
+func TestParser_SGR58_ULColor_RGB(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	feed(t, g, p, []byte("\x1b[58;2;255;128;0m"))
+	want := rgbColor(255, 128, 0)
+	if g.CurULColor != want {
+		t.Errorf("SGR 58 RGB: CurULColor = %#x, want %#x", g.CurULColor, want)
+	}
+}
+
+func TestParser_SGR58_ULColor_Palette(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	feed(t, g, p, []byte("\x1b[58;5;196m"))
+	want := paletteColor(196)
+	if g.CurULColor != want {
+		t.Errorf("SGR 58 palette: CurULColor = %#x, want %#x", g.CurULColor, want)
+	}
+}
+
+func TestParser_SGR59_ResetsULColor(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	g.CurULColor = rgbColor(0, 255, 0)
+	feed(t, g, p, []byte("\x1b[59m"))
+	if g.CurULColor != DefaultColor {
+		t.Errorf("SGR 59: CurULColor = %#x, want DefaultColor", g.CurULColor)
+	}
+}
+
+func TestParser_SGRReset_ClearsULState(t *testing.T) {
+	g, p := newParserGrid(2, 10)
+	g.CurULStyle = ULCurly
+	g.CurULColor = rgbColor(100, 200, 50)
+	g.CurAttrs |= AttrUnderline
+	feed(t, g, p, []byte("\x1b[0m"))
+	if g.CurULStyle != ULNone {
+		t.Errorf("SGR 0: CurULStyle = %d, want 0", g.CurULStyle)
+	}
+	if g.CurULColor != DefaultColor {
+		t.Errorf("SGR 0: CurULColor = %#x, want DefaultColor", g.CurULColor)
+	}
+	if g.CurAttrs&AttrUnderline != 0 {
+		t.Error("SGR 0: AttrUnderline should be cleared")
+	}
+}
+
+func TestParser_SGR4_Semicolon_NotSubparam(t *testing.T) {
+	// "4;3m" = SGR 4 (underline) + SGR 3 (italic) — NOT curly underline.
+	g, p := newParserGrid(2, 10)
+	feed(t, g, p, []byte("\x1b[4;3m"))
+	if g.CurULStyle != ULSingle {
+		t.Errorf("4;3m: CurULStyle = %d, want ULSingle (semicolon ≠ colon)", g.CurULStyle)
+	}
+	if g.CurAttrs&AttrItalic == 0 {
+		t.Error("4;3m: AttrItalic should also be set")
+	}
+}
+
+func TestParser_HTS_SetTabStop(t *testing.T) {
+	g, p := newParserGrid(1, 80)
+	g.Mu.Lock()
+	g.CursorC = 12
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1bH")) // ESC H = HTS
+	g.Mu.Lock()
+	got := g.TabStops[12]
+	g.Mu.Unlock()
+	if !got {
+		t.Error("ESC H: tab stop not set at col 12")
+	}
+}
+
+func TestParser_TBC_ClearAtCursor(t *testing.T) {
+	g, p := newParserGrid(1, 80)
+	// Default stop at 8; position cursor there and clear it.
+	g.Mu.Lock()
+	g.CursorC = 8
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1b[g")) // CSI g = TBC Ps=0
+	g.Mu.Lock()
+	got := g.TabStops[8]
+	g.Mu.Unlock()
+	if got {
+		t.Error("CSI g: stop at col 8 should be cleared")
+	}
+}
+
+func TestParser_TBC_ClearAll(t *testing.T) {
+	g, p := newParserGrid(1, 80)
+	feed(t, g, p, []byte("\x1b[3g")) // CSI 3 g = TBC clear all
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	for c := 0; c < MaxGridDim; c++ {
+		if g.TabStops[c] {
+			t.Errorf("CSI 3g: stop still set at col %d", c)
+		}
+	}
+}
+
+func TestParser_HTS_TBC_RoundTrip(t *testing.T) {
+	g, p := newParserGrid(1, 80)
+	// Clear all, then set custom stops at 5 and 10.
+	feed(t, g, p, []byte("\x1b[3g")) // clear all
+	g.Mu.Lock()
+	g.CursorC = 5
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1bH")) // set stop at 5
+	g.Mu.Lock()
+	g.CursorC = 10
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1bH")) // set stop at 10
+
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	// Only stops at 5 and 10 should be set.
+	for c := 0; c < 20; c++ {
+		want := c == 5 || c == 10
+		if g.TabStops[c] != want {
+			t.Errorf("col %d: TabStops=%v, want %v", c, g.TabStops[c], want)
+		}
+	}
+	// Tab from 0 → 5 → 10 → clamp.
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != 5 {
+		t.Errorf("Tab from 0: got %d, want 5", g.CursorC)
+	}
+	g.Tab()
+	if g.CursorC != 10 {
+		t.Errorf("Tab from 5: got %d, want 10", g.CursorC)
+	}
+	g.Tab()
+	if g.CursorC != g.Cols-1 {
+		t.Errorf("Tab from 10 (no more stops): got %d, want %d", g.CursorC, g.Cols-1)
+	}
+}
+

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"math"
 	"testing"
+	"unicode/utf8"
 
 	glyph "github.com/mike-ward/go-glyph"
 	"github.com/mike-ward/go-gui/gui"
@@ -387,7 +388,7 @@ func TestCellRunKey_PlainCell(t *testing.T) {
 	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
 	cell := Cell{Ch: 'A', FG: 7, BG: 0, Width: 1}
 	k := cellRunKey(cell, base, g, -1, -1)
-	if k.underline || k.strikethrough {
+	if k.ulStyle != ULNone || k.strikethrough {
 		t.Error("plain cell should have no decoration")
 	}
 	if k.typeface != glyph.TypefaceRegular {
@@ -411,10 +412,10 @@ func TestCellRunKey_BoldItalic(t *testing.T) {
 func TestCellRunKey_Underline(t *testing.T) {
 	g := NewGrid(4, 8)
 	base := gui.TextStyle{}
-	cell := Cell{Ch: 'C', Width: 1, Attrs: AttrUnderline}
+	cell := Cell{Ch: 'C', Width: 1, Attrs: AttrUnderline, ULStyle: ULSingle, ULColor: DefaultColor}
 	k := cellRunKey(cell, base, g, -1, -1)
-	if !k.underline {
-		t.Error("underline attr: expected underline in key")
+	if k.ulStyle != ULSingle {
+		t.Errorf("underline attr: expected ULSingle in key, got %d", k.ulStyle)
 	}
 }
 
@@ -433,7 +434,7 @@ func TestCellRunKey_LinkForcesUnderline(t *testing.T) {
 	base := gui.TextStyle{}
 	cell := Cell{Ch: 'E', Width: 1, LinkID: 42}
 	k := cellRunKey(cell, base, g, -1, -1)
-	if !k.underline {
+	if k.ulStyle == ULNone {
 		t.Error("linked cell: expected underline forced on by linkID")
 	}
 	if k.linkID != 42 {
@@ -488,6 +489,268 @@ func BenchmarkForegroundPass(b *testing.B) {
 				}
 				_ = cellRunKey(cell, base, g, -1, -1)
 			}
+		}
+	}
+}
+
+func TestTerm_OnKeyDown_AltLetter(t *testing.T) {
+	cases := []struct {
+		key  gui.KeyCode
+		want string
+	}{
+		{gui.KeyF, "\x1bf"},
+		{gui.KeyB, "\x1bb"},
+		{gui.KeyA, "\x1ba"},
+		{gui.KeyZ, "\x1bz"},
+	}
+	for _, c := range cases {
+		term, buf := newTestTermCapture()
+		e := &gui.Event{KeyCode: c.key, Modifiers: gui.ModAlt}
+		term.onKeyDown(nil, e, &gui.Window{})
+		if got := string(*buf); got != c.want {
+			t.Errorf("Alt+%v = %q, want %q", c.key, got, c.want)
+		}
+		if !e.IsHandled {
+			t.Errorf("Alt+%v: event should be handled", c.key)
+		}
+	}
+}
+
+func TestTerm_OnKeyDown_AltArrow(t *testing.T) {
+	cases := []struct {
+		key  gui.KeyCode
+		want string
+	}{
+		{gui.KeyUp, "\x1b\x1b[A"},
+		{gui.KeyDown, "\x1b\x1b[B"},
+		{gui.KeyRight, "\x1b\x1b[C"},
+		{gui.KeyLeft, "\x1b\x1b[D"},
+	}
+	for _, c := range cases {
+		term, buf := newTestTermCapture()
+		e := &gui.Event{KeyCode: c.key, Modifiers: gui.ModAlt}
+		term.onKeyDown(nil, e, &gui.Window{})
+		if got := string(*buf); got != c.want {
+			t.Errorf("Alt+%v = %q, want %q", c.key, got, c.want)
+		}
+	}
+}
+
+func TestTerm_OnKeyDown_AltCtrlLetter(t *testing.T) {
+	term, buf := newTestTermCapture()
+	// Alt+Ctrl+B → ESC + 0x02
+	e := &gui.Event{KeyCode: gui.KeyB, Modifiers: gui.ModAlt | gui.ModCtrl}
+	term.onKeyDown(nil, e, &gui.Window{})
+	want := "\x1b\x02"
+	if got := string(*buf); got != want {
+		t.Fatalf("Alt+Ctrl+B = %q, want %q", got, want)
+	}
+}
+
+func TestModParam(t *testing.T) {
+	cases := []struct {
+		shift, alt, ctrl bool
+		want             int
+	}{
+		{false, false, false, 0},
+		{true, false, false, 2},
+		{false, true, false, 3},
+		{true, true, false, 4},
+		{false, false, true, 5},
+		{true, false, true, 6},
+		{false, true, true, 7},
+		{true, true, true, 8},
+	}
+	for _, c := range cases {
+		if got := modParam(c.shift, c.alt, c.ctrl); got != c.want {
+			t.Errorf("modParam(%v,%v,%v)=%d want %d", c.shift, c.alt, c.ctrl, got, c.want)
+		}
+	}
+}
+
+func TestFuncKeySeq_NoModifier(t *testing.T) {
+	cases := []struct {
+		key  gui.KeyCode
+		want string
+	}{
+		{gui.KeyInsert, "\x1b[2~"},
+		{gui.KeyF1, "\x1bOP"},
+		{gui.KeyF2, "\x1bOQ"},
+		{gui.KeyF3, "\x1bOR"},
+		{gui.KeyF4, "\x1bOS"},
+		{gui.KeyF5, "\x1b[15~"},
+		{gui.KeyF6, "\x1b[17~"},
+		{gui.KeyF7, "\x1b[18~"},
+		{gui.KeyF8, "\x1b[19~"},
+		{gui.KeyF9, "\x1b[20~"},
+		{gui.KeyF10, "\x1b[21~"},
+		{gui.KeyF11, "\x1b[23~"},
+		{gui.KeyF12, "\x1b[24~"},
+	}
+	for _, c := range cases {
+		got := string(funcKeySeq(c.key, false, false))
+		if got != c.want {
+			t.Errorf("funcKeySeq(%v)=%q want %q", c.key, got, c.want)
+		}
+	}
+}
+
+func TestFuncKeySeq_ShiftModifier(t *testing.T) {
+	// Shift+F1 → \x1b[1;2P, Shift+F5 → \x1b[15;2~
+	if got := string(funcKeySeq(gui.KeyF1, true, false)); got != "\x1b[1;2P" {
+		t.Errorf("Shift+F1=%q want %q", got, "\x1b[1;2P")
+	}
+	if got := string(funcKeySeq(gui.KeyF5, true, false)); got != "\x1b[15;2~" {
+		t.Errorf("Shift+F5=%q want %q", got, "\x1b[15;2~")
+	}
+}
+
+func TestFuncKeySeq_CtrlModifier(t *testing.T) {
+	// Ctrl+F1 → \x1b[1;5P, Ctrl+F10 → \x1b[21;5~
+	if got := string(funcKeySeq(gui.KeyF1, false, true)); got != "\x1b[1;5P" {
+		t.Errorf("Ctrl+F1=%q want %q", got, "\x1b[1;5P")
+	}
+	if got := string(funcKeySeq(gui.KeyF10, false, true)); got != "\x1b[21;5~" {
+		t.Errorf("Ctrl+F10=%q want %q", got, "\x1b[21;5~")
+	}
+}
+
+func TestTerm_OnKeyDown_FuncKeys(t *testing.T) {
+	cases := []struct {
+		key  gui.KeyCode
+		mods gui.Modifier
+		want string
+	}{
+		{gui.KeyF1, 0, "\x1bOP"},
+		{gui.KeyF4, 0, "\x1bOS"},
+		{gui.KeyF5, 0, "\x1b[15~"},
+		{gui.KeyF12, 0, "\x1b[24~"},
+		{gui.KeyInsert, 0, "\x1b[2~"},
+		{gui.KeyF1, gui.ModShift, "\x1b[1;2P"},
+		{gui.KeyF5, gui.ModCtrl, "\x1b[15;5~"},
+		{gui.KeyF1, gui.ModAlt, "\x1b\x1bOP"}, // alt as ESC prefix
+	}
+	for _, c := range cases {
+		term, buf := newTestTermCapture()
+		e := &gui.Event{KeyCode: c.key, Modifiers: c.mods}
+		term.onKeyDown(nil, e, &gui.Window{})
+		if got := string(*buf); got != c.want {
+			t.Errorf("key=%v mods=%v: got %q want %q", c.key, c.mods, got, c.want)
+		}
+		if !e.IsHandled {
+			t.Errorf("key=%v mods=%v: event not handled", c.key, c.mods)
+		}
+	}
+}
+
+func TestScrollbarGeometry_ZeroTotal_NoPanic(t *testing.T) {
+	// sbLen=0, rows=0 → total=0: must not divide by zero.
+	y, h := scrollbarGeometry(0, 0, 0, 100)
+	if y != 0 || h != 0 {
+		t.Errorf("zero total: got y=%v h=%v, want (0,0)", y, h)
+	}
+}
+
+func TestTerm_PosToCell_NaNInfCollapseToZero(t *testing.T) {
+	term := &Term{
+		grid:  NewGrid(24, 80),
+		cellW: 8,
+		cellH: 16,
+	}
+	nan := float32(math.NaN())
+	inf := float32(math.Inf(1))
+	ninf := float32(math.Inf(-1))
+	cases := []struct{ x, y float32 }{
+		{nan, 16}, {inf, 16}, {ninf, 16},
+		{8, nan}, {8, inf}, {8, ninf},
+		{nan, nan},
+	}
+	for _, c := range cases {
+		r, col := term.posToCell(c.x, c.y)
+		if r < 0 || r >= term.grid.Rows || col < 0 || col >= term.grid.Cols {
+			t.Errorf("posToCell(%v,%v)=(%d,%d): outside grid [0,%d)x[0,%d)",
+				c.x, c.y, r, col, term.grid.Rows, term.grid.Cols)
+		}
+	}
+}
+
+func TestTerm_OnChar_SearchMode_AppendAndCap(t *testing.T) {
+	term, _ := newTestTermCapture()
+	term.win = &gui.Window{}
+	term.searchActive = true
+
+	e := &gui.Event{CharCode: 'a'}
+	term.onChar(nil, e, nil)
+	if term.searchQuery != "a" {
+		t.Fatalf("query = %q, want \"a\"", term.searchQuery)
+	}
+	if !e.IsHandled {
+		t.Error("event must be handled in search mode")
+	}
+
+	// Fill to exactly MaxGridDim runes (already have 1 'a').
+	for i := 1; i < MaxGridDim; i++ {
+		term.onChar(nil, &gui.Event{CharCode: 'x'}, nil)
+	}
+	if utf8.RuneCountInString(term.searchQuery) != MaxGridDim {
+		t.Fatalf("query rune count = %d, want %d", utf8.RuneCountInString(term.searchQuery), MaxGridDim)
+	}
+	// Next char must be rejected (at cap).
+	before := term.searchQuery
+	term.onChar(nil, &gui.Event{CharCode: 'z'}, nil)
+	if term.searchQuery != before {
+		t.Errorf("query grew past MaxGridDim cap: len now %d", utf8.RuneCountInString(term.searchQuery))
+	}
+}
+
+func TestTerm_SearchJump_ForwardFindsMatch(t *testing.T) {
+	term, _ := newTestTermCapture()
+	term.win = &gui.Window{}
+	putRow(term.grid, "hello")
+	term.searchQuery = "hello"
+	term.searchJump(true, &gui.Window{})
+	term.grid.Mu.Lock()
+	off := term.grid.ViewOffset
+	term.grid.Mu.Unlock()
+	if off != 0 {
+		t.Errorf("ViewOffset = %d after live match, want 0", off)
+	}
+}
+
+func TestTerm_SearchJump_NoMatchDoesNotPanic(t *testing.T) {
+	term, _ := newTestTermCapture()
+	term.win = &gui.Window{}
+	term.searchQuery = "xyzzy_not_present"
+	term.searchJump(true, &gui.Window{}) // must not panic
+}
+
+func TestTerm_SearchJump_EmptyQuery_Nop(t *testing.T) {
+	term, _ := newTestTermCapture()
+	term.win = &gui.Window{}
+	term.searchQuery = ""
+	term.searchJump(true, &gui.Window{}) // early return, must not panic
+}
+
+func TestTerm_OnKeyDown_ModifiedCursorKeys(t *testing.T) {
+	cases := []struct {
+		key  gui.KeyCode
+		mods gui.Modifier
+		want string
+	}{
+		{gui.KeyUp, gui.ModShift, "\x1b[1;2A"},
+		{gui.KeyDown, gui.ModCtrl, "\x1b[1;5B"},
+		{gui.KeyRight, gui.ModShift | gui.ModCtrl, "\x1b[1;6C"},
+		{gui.KeyLeft, gui.ModShift, "\x1b[1;2D"},
+		// No modifier → normal sequences.
+		{gui.KeyUp, 0, "\x1b[A"},
+		{gui.KeyDown, 0, "\x1b[B"},
+	}
+	for _, c := range cases {
+		term, buf := newTestTermCapture()
+		e := &gui.Event{KeyCode: c.key, Modifiers: c.mods}
+		term.onKeyDown(nil, e, &gui.Window{})
+		if got := string(*buf); got != c.want {
+			t.Errorf("key=%v mods=%v: got %q want %q", c.key, c.mods, got, c.want)
 		}
 	}
 }

@@ -167,6 +167,16 @@ type Cfg struct {
 	// steady. Leave nil to honor whatever the shell asks for (steady
 	// by default for a brand-new grid).
 	CursorBlink *bool
+
+	// Themes, if non-empty, adds a right-click context menu for selecting
+	// a color theme at runtime. The first entry is used as the initial theme.
+	Themes []NamedTheme
+}
+
+// NamedTheme pairs a display name with a Theme for use in menus.
+type NamedTheme struct {
+	Name  string
+	Theme Theme
 }
 
 // cursorBlinkPeriod is the half-cycle duration: cursor visible for
@@ -278,6 +288,10 @@ type Term struct {
 	// event. Main-thread only (created lazily in showScrollbar).
 	scrollbarTimer *time.Timer
 
+	// themeMenuItems is the precomputed ContextMenu item list for runtime
+	// theme switching. Built once in New; nil when no themes are configured.
+	themeMenuItems []gui.MenuItemCfg
+
 	// Momentum scroll state. momentumVel/Acc/CellH/Coasting protected by
 	// momentumMu. momentumTimer and momentumKick owned by the GUI goroutine
 	// (onMouseScroll) except for the timer callback, which only touches
@@ -289,6 +303,9 @@ type Term struct {
 	momentumCoasting bool         // true while goroutine is decelerating
 	momentumKick     chan struct{} // buffered 1; wakes momentumLoop
 	momentumTimer    *time.Timer  // reset on each scroll; fires kickMomentum
+
+	// runBuf reused across onDraw calls; grows once, never freed.
+	runBuf strings.Builder
 }
 
 type keyModes struct {
@@ -306,6 +323,17 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		return nil, err
 	}
 	g := NewGrid(initRows, initCols)
+	if len(cfg.Themes) > 0 {
+		g.Theme = cfg.Themes[0].Theme
+	}
+	var themeMenuItems []gui.MenuItemCfg
+	if len(cfg.Themes) > 0 {
+		themeMenuItems = make([]gui.MenuItemCfg, 0, len(cfg.Themes)+1)
+		themeMenuItems = append(themeMenuItems, gui.MenuSubtitle("Theme"))
+		for i, nt := range cfg.Themes {
+			themeMenuItems = append(themeMenuItems, gui.MenuItemCfg{ID: strconv.Itoa(i), Text: nt.Name})
+		}
+	}
 	switch {
 	case cfg.ScrollbackRows == 0:
 		g.ScrollbackCap = defaultScrollbackRows
@@ -315,18 +343,19 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 		// Negative: leave ScrollbackCap = 0 (scrollback disabled).
 	}
 	t := &Term{
-		cfg:         cfg,
-		grid:        g,
-		parser:      NewParser(g),
-		pty:         pty,
-		win:         w,
-		lastMouseR:  -1,
-		lastMouseC:  -1,
-		hoverR:      -1,
-		hoverC:      -1,
-		cursorEpoch:  time.Now(),
-		blinkDone:    make(chan struct{}),
-		momentumKick: make(chan struct{}, 1),
+		cfg:            cfg,
+		grid:           g,
+		parser:         NewParser(g),
+		pty:            pty,
+		win:            w,
+		lastMouseR:     -1,
+		lastMouseC:     -1,
+		hoverR:         -1,
+		hoverC:         -1,
+		cursorEpoch:    time.Now(),
+		blinkDone:      make(chan struct{}),
+		momentumKick:   make(chan struct{}, 1),
+		themeMenuItems: themeMenuItems,
 	}
 	t.writeHost = func(b []byte) error {
 		_, err := t.pty.Write(b)
@@ -476,6 +505,15 @@ func (t *Term) Cwd() string {
 	return t.grid.Cwd
 }
 
+// SetTheme replaces the active color theme and schedules a redraw.
+// Safe to call from the main thread at any time.
+func (t *Term) SetTheme(th Theme) {
+	t.grid.Mu.Lock()
+	t.grid.Theme = th
+	t.grid.Mu.Unlock()
+	t.bumpVersion()
+}
+
 // focusID is the IDFocus value claimed by the terminal container.
 const focusID uint32 = 1
 
@@ -483,29 +521,49 @@ const focusID uint32 = 1
 // gui.Window UpdateView generator: w.UpdateView(t.View).
 func (t *Term) View(w *gui.Window) gui.View {
 	ww, wh := w.WindowSize()
-	return gui.Column(gui.ContainerCfg{
-		Width:     float32(ww),
-		Height:    float32(wh),
-		Sizing:    gui.FixedFixed,
+	canvas := gui.DrawCanvas(gui.DrawCanvasCfg{
+		ID:            "term-canvas",
+		Version:       t.drawVersion.Load(),
+		Sizing:        gui.FillFill,
+		OnDraw:        t.onDraw,
+		OnMouseScroll: t.onMouseScroll,
+		OnClick:       t.onClick,
+		OnMouseMove:   t.onMouseMove,
+		OnMouseUp:     t.onMouseUp,
+	})
+	colCfg := gui.ContainerCfg{
 		Padding:   gui.Some(gui.Padding{}),
 		Spacing:   gui.SomeF(0),
-		Color:     defaultBG,
+		Color:     t.grid.Theme.DefaultBG,
 		IDFocus:   focusID,
 		OnChar:    t.onChar,
 		OnKeyDown: t.onKeyDown,
-		Content: []gui.View{
-			gui.DrawCanvas(gui.DrawCanvasCfg{
-				ID:            "term-canvas",
-				Version:       t.drawVersion.Load(),
-				Sizing:        gui.FillFill,
-				OnDraw:        t.onDraw,
-				OnMouseScroll: t.onMouseScroll,
-				OnClick:       t.onClick,
-				OnMouseMove:   t.onMouseMove,
-				OnMouseUp:     t.onMouseUp,
-			}),
-		},
-	})
+		Content:   []gui.View{canvas},
+	}
+	if len(t.themeMenuItems) > 0 {
+		colCfg.Sizing = gui.FillFill
+		return gui.ContextMenu(w, gui.ContextMenuCfg{
+			ID:      "term-theme-menu",
+			Width:   float32(ww),
+			Height:  float32(wh),
+			Sizing:  gui.FixedFixed,
+			Padding: gui.NoPadding,
+			Items:   t.themeMenuItems,
+			Action: func(id string, _ *gui.Event, w *gui.Window) {
+				i, err := strconv.Atoi(id)
+				if err != nil || i < 0 || i >= len(t.cfg.Themes) {
+					return
+				}
+				t.SetTheme(t.cfg.Themes[i].Theme)
+				w.UpdateWindow()
+			},
+			Content: []gui.View{gui.Column(colCfg)},
+		})
+	}
+	colCfg.Width = float32(ww)
+	colCfg.Height = float32(wh)
+	colCfg.Sizing = gui.FixedFixed
+	return gui.Column(colCfg)
 }
 
 // Close stops the shell, reader, and blink goroutine. Safe to call
@@ -572,6 +630,9 @@ func (t *Term) bumpVersion() { t.drawVersion.Add(1) }
 // sbLen = len(Scrollback), viewH = canvas pixel height. Caller ensures sbLen > 0.
 func scrollbarGeometry(sbLen, rows, viewOffset int, viewH float32) (thumbY, thumbH float32) {
 	total := float32(sbLen + rows)
+	if total <= 0 {
+		return
+	}
 	thumbH = float32(rows) / total * viewH
 	thumbY = float32(sbLen-viewOffset) / total * viewH
 	return
@@ -599,8 +660,9 @@ func (t *Term) showScrollbar() {
 // can be drawn in a single dc.Text call.
 type runKey struct {
 	color         gui.Color
+	ulColor       gui.Color
 	typeface      glyph.Typeface
-	underline     bool
+	ulStyle       uint8 // ULNone..ULDashed; drives underline rendering
 	strikethrough bool
 	linkID        uint16
 }
@@ -608,10 +670,10 @@ type runKey struct {
 // cellRunKey computes the runKey for cell, applying attribute and
 // hyperlink-hover color transforms. Must be called under Grid.Mu.
 func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runKey {
-	color := fg(cell)
+	rawFG := g.Theme.fg(cell)
+	color := rawFG
 	if cell.Attrs&AttrDim != 0 {
-		col := color
-		color = gui.RGB(col.R/2, col.G/2, col.B/2)
+		color = gui.RGB(rawFG.R/2, rawFG.G/2, rawFG.B/2)
 	}
 	tf := base.Typeface
 	bold, italic := cell.Attrs&AttrBold != 0, cell.Attrs&AttrItalic != 0
@@ -623,10 +685,12 @@ func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runK
 	case italic:
 		tf = glyph.TypefaceItalic
 	}
-	underline := cell.Attrs&AttrUnderline != 0
-	strikethrough := cell.Attrs&AttrStrikethrough != 0
+	ulStyle := cell.ULStyle
+	ulColor := g.Theme.resolve(cell.ULColor, rawFG)
 	if cell.LinkID != 0 {
-		underline = true
+		if ulStyle == ULNone {
+			ulStyle = ULSingle
+		}
 		if hoverR >= 0 && hoverC >= 0 {
 			if g.ViewCellAt(hoverR, hoverC).LinkID == cell.LinkID {
 				col := color
@@ -636,9 +700,10 @@ func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runK
 	}
 	return runKey{
 		color:         color,
+		ulColor:       ulColor,
 		typeface:      tf,
-		underline:     underline,
-		strikethrough: strikethrough,
+		ulStyle:       ulStyle,
+		strikethrough: cell.Attrs&AttrStrikethrough != 0,
 		linkID:        cell.LinkID,
 	}
 }
@@ -680,9 +745,12 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	// Pre-map search matches and selection to viewport rows to avoid O(N)
 	// checks inside the per-cell loop.
 	type vMatch struct{ col, len int }
-	vMatchesByRow := make([][]vMatch, rows)
-	var qRunes []rune
+	var (
+		vMatchesByRow [][]vMatch
+		qRunes        []rune
+	)
 	if t.searchActive && t.searchQuery != "" {
+		vMatchesByRow = make([][]vMatch, rows)
 		matches := g.ViewportMatches(t.searchQuery)
 		qRunes = []rune(t.searchQuery)
 		t.searchMatches = matches
@@ -694,9 +762,13 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 		}
 	}
 
-	type rowBounds struct{ c0, c1 int; active bool }
-	rowSel := make([]rowBounds, rows)
+	type rowBounds struct {
+		c0, c1 int
+		active bool
+	}
+	var rowSel []rowBounds
 	if g.SelActive {
+		rowSel = make([]rowBounds, rows)
 		s, e := g.selOrder()
 		for r := range rows {
 			cr := g.viewportToContent(r)
@@ -719,13 +791,17 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			return cells[r*cols+c]
 		}
 		cell := g.ViewCellAt(r, c)
-		if rb := rowSel[r]; rb.active && c >= rb.c0 && c <= rb.c1 {
-			cell.Attrs ^= AttrInverse
-		}
-		for _, m := range vMatchesByRow[r] {
-			if c >= m.col && c < m.col+m.len {
+		if rowSel != nil {
+			if rb := rowSel[r]; rb.active && c >= rb.c0 && c <= rb.c1 {
 				cell.Attrs ^= AttrInverse
-				break
+			}
+		}
+		if vMatchesByRow != nil {
+			for _, m := range vMatchesByRow[r] {
+				if c >= m.col && c < m.col+m.len {
+					cell.Attrs ^= AttrInverse
+					break
+				}
 			}
 		}
 		return cell
@@ -744,9 +820,9 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	// Background pass: coalesce runs of equal bg color per row.
 	for r := range renderRows {
 		runStart := 0
-		runColor := bg(resolveCell(r, 0))
+		runColor := g.Theme.bg(resolveCell(r, 0))
 		for c := 1; c < cols; c++ {
-			cur := bg(resolveCell(r, c))
+			cur := g.Theme.bg(resolveCell(r, c))
 			if cur != runColor {
 				t.fillRun(dc, r, runStart, c, runColor)
 				runStart = c
@@ -763,30 +839,39 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	// breaking the current run. Plain spaces with no attrs or link don't
 	// start a new run but extend an existing same-style one.
 	hR, hC := t.hoverR, t.hoverC // benign unsynchronized read; see updateHover
+	t.runBuf.Reset()
 	var (
-		runBuf   strings.Builder
 		runStart int
+		runCols  int // columns spanned by the open run (for underline width)
 		runStyle runKey
 		runOpen  bool
 	)
 	flushRun := func(r int) {
-		if !runOpen || runBuf.Len() == 0 {
+		if !runOpen || t.runBuf.Len() == 0 {
 			runOpen = false
 			return
 		}
 		cs := style
 		cs.Color = runStyle.color
 		cs.Typeface = runStyle.typeface
-		cs.Underline = runStyle.underline
+		cs.Underline = false
 		cs.Strikethrough = runStyle.strikethrough
 		dc.Text(float32(runStart)*t.cellW, float32(r)*t.cellH,
-			runBuf.String(), cs)
+			t.runBuf.String(), cs)
+		if runStyle.ulStyle != ULNone {
+			t.drawUnderlineDecor(dc,
+				float32(runStart)*t.cellW, float32(r)*t.cellH,
+				float32(runCols)*t.cellW,
+				runStyle.ulStyle, runStyle.ulColor)
+		}
 		runOpen = false
-		runBuf.Reset()
+		t.runBuf.Reset()
+		runCols = 0
 	}
 	for r := range renderRows {
 		runOpen = false
-		runBuf.Reset()
+		t.runBuf.Reset()
+		runCols = 0
 		for c := range cols {
 			cell := resolveCell(r, c)
 			if cell.Width == 0 && cell.Ch == 0 {
@@ -799,38 +884,48 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 				cs := style
 				cs.Color = k.color
 				cs.Typeface = k.typeface
-				cs.Underline = k.underline
+				cs.Underline = false
 				cs.Strikethrough = k.strikethrough
 				dc.Text(float32(c)*t.cellW, float32(r)*t.cellH,
 					runeString(cell.Ch), cs)
+				if k.ulStyle != ULNone {
+					t.drawUnderlineDecor(dc,
+						float32(c)*t.cellW, float32(r)*t.cellH,
+						2*t.cellW, k.ulStyle, k.ulColor)
+				}
 				continue
 			}
 			if isPlainSpace {
 				if runOpen && k == runStyle {
-					runBuf.WriteRune(' ')
+					t.runBuf.WriteRune(' ')
+					runCols++
 				} else {
 					flushRun(r)
 				}
 				continue
 			}
 			if runOpen && k == runStyle {
-				runBuf.WriteRune(cell.Ch)
+				t.runBuf.WriteRune(cell.Ch)
+				runCols++
 			} else {
 				flushRun(r)
 				runOpen = true
 				runStart = c
+				runCols = 1
 				runStyle = k
-				runBuf.WriteRune(cell.Ch)
+				t.runBuf.WriteRune(cell.Ch)
 			}
 		}
 		flushRun(r)
 	}
 
+	now := time.Now()
+
 	// Cursor: shape per DECSCUSR (block / underline / bar). Suppress
 	// entirely when DEC ?25 has hidden it OR when the viewport is
 	// scrolled back into history. Honor blink-off half-cycle when
 	// blinking is enabled.
-	if g.CursorVisible && g.ViewOffset == 0 && !t.cursorBlinkOff() {
+	if g.CursorVisible && g.ViewOffset == 0 && !t.cursorBlinkOff(now) {
 		cc := g.CursorC
 		if cc >= cols {
 			cc = cols - 1
@@ -843,8 +938,6 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	if t.searchActive {
 		t.drawSearchBar(dc, rows, cols, style)
 	}
-
-	now := time.Now()
 
 	// Visual bell: brief semi-transparent overlay that fades within bellFlashDuration.
 	if now.Before(t.bellFlashUntil) {
@@ -866,11 +959,11 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 // cursorBlinkOff reports whether the cursor is currently in the
 // hidden half of its blink cycle. Returns false (always visible) for
 // steady cursors. Caller holds Grid.Mu.
-func (t *Term) cursorBlinkOff() bool {
+func (t *Term) cursorBlinkOff(now time.Time) bool {
 	if !t.cursorBlinks() {
 		return false
 	}
-	elapsed := time.Since(t.cursorEpoch)
+	elapsed := now.Sub(t.cursorEpoch)
 	return (elapsed/cursorBlinkPeriod)%2 == 1
 }
 
@@ -890,23 +983,87 @@ func (t *Term) drawCursor(dc *gui.DrawContext, col, row int, cell Cell,
 		if h < 2 {
 			h = 2
 		}
-		dc.FilledRect(x, y+t.cellH-h, t.cellW, h, fg(cell))
+		dc.FilledRect(x, y+t.cellH-h, t.cellW, h, t.grid.Theme.fg(cell))
 	case CursorBar:
 		w := t.cellW / 6
 		if w < 2 {
 			w = 2
 		}
-		dc.FilledRect(x, y, w, t.cellH, fg(cell))
+		dc.FilledRect(x, y, w, t.cellH, t.grid.Theme.fg(cell))
 	default: // CursorBlock
-		dc.FilledRect(x, y, t.cellW, t.cellH, fg(cell))
+		dc.FilledRect(x, y, t.cellW, t.cellH, t.grid.Theme.fg(cell))
 		cs := style
-		cs.Color = bg(cell)
+		cs.Color = t.grid.Theme.bg(cell)
 		dc.Text(x, y, runeString(cell.Ch), cs)
 	}
 }
 
+// drawUnderlineDecor renders underline decorations for a text run.
+// x,y are the top-left of the run; w is its pixel width. Handles all
+// ULStyle values including ULSingle (drawn as a rect so ulColor is honored).
+func (t *Term) drawUnderlineDecor(dc *gui.DrawContext, x, y, w float32, ulStyle uint8, ulColor gui.Color) {
+	thick := t.cellH / 14
+	if thick < 1 {
+		thick = 1
+	}
+	baseY := y + t.cellH - 2*thick - 1
+	switch ulStyle {
+	case ULSingle:
+		dc.FilledRect(x, baseY, w, thick, ulColor)
+	case ULDouble:
+		dc.FilledRect(x, baseY-thick-1, w, thick, ulColor)
+		dc.FilledRect(x, baseY, w, thick, ulColor)
+	case ULCurly:
+		// Approximate curly as alternating up/down segments.
+		seg := t.cellW * 2
+		if seg < 4 {
+			seg = 4
+		}
+		xi := x
+		up := true
+		for xi < x+w {
+			ww := seg
+			if xi+ww > x+w {
+				ww = x + w - xi
+			}
+			yy := baseY
+			if up {
+				yy = baseY - thick - 1
+			}
+			dc.FilledRect(xi, yy, ww, thick, ulColor)
+			xi += ww
+			up = !up
+		}
+	case ULDotted:
+		step := thick * 3
+		if step < 3 {
+			step = 3
+		}
+		xi := x
+		for xi+thick <= x+w {
+			dc.FilledRect(xi, baseY, thick, thick, ulColor)
+			xi += step
+		}
+	case ULDashed:
+		dash := t.cellW * 3
+		if dash < 6 {
+			dash = 6
+		}
+		gap := dash / 2
+		xi := x
+		for xi < x+w {
+			ww := dash
+			if xi+ww > x+w {
+				ww = x + w - xi
+			}
+			dc.FilledRect(xi, baseY, ww, thick, ulColor)
+			xi += dash + gap
+		}
+	}
+}
+
 func (t *Term) fillRun(dc *gui.DrawContext, row, c0, c1 int, color gui.Color) {
-	if color == defaultBG {
+	if color == t.grid.Theme.DefaultBG {
 		return // canvas already painted with default bg.
 	}
 	x := float32(c0) * t.cellW
@@ -938,7 +1095,9 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 		return
 	}
 	if t.searchActive {
-		t.searchQuery += string(rune(e.CharCode))
+		if utf8.RuneCountInString(t.searchQuery) < MaxGridDim {
+			t.searchQuery += string(rune(e.CharCode))
+		}
 		e.IsHandled = true
 		t.bumpVersion()
 		t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
@@ -1124,8 +1283,8 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	}
 	t.grid.Mu.Lock()
 	rows := t.grid.Rows
+	widgetH := float32(rows) * t.cellH
 	if t.cellH > 0 {
-		widgetH := float32(rows) * t.cellH
 		switch {
 		case e.MouseY < 0:
 			t.grid.ScrollView(1)
@@ -1142,7 +1301,6 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	// Persist scroll direction so autoScrollLoop keeps scrolling if
 	// onMouseMove stops firing (mouse above title bar / window edge).
 	if t.cellH > 0 {
-		widgetH := float32(rows) * t.cellH
 		switch {
 		case e.MouseY < 0:
 			t.autoScrollDir.Store(1)
@@ -1464,6 +1622,83 @@ func keypadSeq(k gui.KeyCode) []byte {
 	}
 }
 
+// modParam returns the xterm modifier parameter (2..8) for shift/alt/ctrl
+// combinations, or 0 when no modifiers are active.
+func modParam(shift, alt, ctrl bool) int {
+	n := 1
+	if shift {
+		n++
+	}
+	if alt {
+		n += 2
+	}
+	if ctrl {
+		n += 4
+	}
+	if n == 1 {
+		return 0
+	}
+	return n
+}
+
+// modTilde returns \x1b[Ps~ (no modifier) or \x1b[Ps;N~ (with modifier).
+func modTilde(ps string, mod int) []byte {
+	if mod == 0 {
+		return []byte("\x1b[" + ps + "~")
+	}
+	b := append([]byte("\x1b["), ps...)
+	b = append(b, ';')
+	b = strconv.AppendInt(b, int64(mod), 10)
+	b = append(b, '~')
+	return b
+}
+
+// modSS3 returns \x1bOl (no modifier) or \x1b[1;Nl (with modifier).
+func modSS3(letter byte, mod int) []byte {
+	if mod == 0 {
+		return []byte{0x1b, 'O', letter}
+	}
+	b := []byte("\x1b[1;")
+	b = strconv.AppendInt(b, int64(mod), 10)
+	b = append(b, letter)
+	return b
+}
+
+// funcKeySeq returns the xterm sequence for Insert and F1–F12, with optional
+// modifier encoding. Alt is excluded: callers prepend ESC separately.
+func funcKeySeq(k gui.KeyCode, shift, ctrl bool) []byte {
+	mod := modParam(shift, false, ctrl)
+	switch k {
+	case gui.KeyInsert:
+		return modTilde("2", mod)
+	case gui.KeyF1:
+		return modSS3('P', mod)
+	case gui.KeyF2:
+		return modSS3('Q', mod)
+	case gui.KeyF3:
+		return modSS3('R', mod)
+	case gui.KeyF4:
+		return modSS3('S', mod)
+	case gui.KeyF5:
+		return modTilde("15", mod)
+	case gui.KeyF6:
+		return modTilde("17", mod)
+	case gui.KeyF7:
+		return modTilde("18", mod)
+	case gui.KeyF8:
+		return modTilde("19", mod)
+	case gui.KeyF9:
+		return modTilde("20", mod)
+	case gui.KeyF10:
+		return modTilde("21", mod)
+	case gui.KeyF11:
+		return modTilde("23", mod)
+	case gui.KeyF12:
+		return modTilde("24", mod)
+	}
+	return nil
+}
+
 // onKeyDown receives non-character keys (arrows, Enter, Backspace,
 // Ctrl+letter combinations, etc.) and emits the corresponding terminal
 // byte sequence. Scrollback navigation keys (PgUp/PgDn, Shift+Home/End)
@@ -1473,6 +1708,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	shift := e.Modifiers.Has(gui.ModShift)
 	cmd := e.Modifiers.Has(gui.ModSuper)
 	ctrl := e.Modifiers.Has(gui.ModCtrl)
+	alt := e.Modifiers.Has(gui.ModAlt)
 	modes := t.keyModes()
 
 	// Search: Cmd+F opens the search bar.
@@ -1537,18 +1773,18 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	switch e.KeyCode {
 	case gui.KeyPageUp:
 		t.grid.Mu.Lock()
-		alt := t.grid.AltActive
+		inAlt := t.grid.AltActive
 		t.grid.Mu.Unlock()
-		if shift || !alt {
+		if shift || !inAlt {
 			t.scrollByPage(+1, w)
 			e.IsHandled = true
 			return
 		}
 	case gui.KeyPageDown:
 		t.grid.Mu.Lock()
-		alt := t.grid.AltActive
+		inAlt := t.grid.AltActive
 		t.grid.Mu.Unlock()
-		if shift || !alt {
+		if shift || !inAlt {
 			t.scrollByPage(-1, w)
 			e.IsHandled = true
 			return
@@ -1586,43 +1822,62 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	case gui.KeyEscape:
 		out = []byte{0x1B}
 	case gui.KeyUp:
-		if modes.appCursor {
+		if mod := modParam(shift, false, ctrl); mod != 0 {
+			out = modSS3('A', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOA")
 		} else {
 			out = []byte("\x1b[A")
 		}
 	case gui.KeyDown:
-		if modes.appCursor {
+		if mod := modParam(shift, false, ctrl); mod != 0 {
+			out = modSS3('B', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOB")
 		} else {
 			out = []byte("\x1b[B")
 		}
 	case gui.KeyRight:
-		if modes.appCursor {
+		if mod := modParam(shift, false, ctrl); mod != 0 {
+			out = modSS3('C', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOC")
 		} else {
 			out = []byte("\x1b[C")
 		}
 	case gui.KeyLeft:
-		if modes.appCursor {
+		if mod := modParam(shift, false, ctrl); mod != 0 {
+			out = modSS3('D', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOD")
 		} else {
 			out = []byte("\x1b[D")
 		}
 	case gui.KeyHome:
-		if modes.appCursor {
+		if mod := modParam(false, false, ctrl); mod != 0 {
+			// Shift+Home is consumed by scrollToTop above; only Ctrl here.
+			out = modSS3('H', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOH")
 		} else {
 			out = []byte("\x1b[H")
 		}
 	case gui.KeyEnd:
-		if modes.appCursor {
+		if mod := modParam(false, false, ctrl); mod != 0 {
+			// Shift+End is consumed by scrollToBottom above; only Ctrl here.
+			out = modSS3('F', mod)
+		} else if modes.appCursor {
 			out = []byte("\x1bOF")
 		} else {
 			out = []byte("\x1b[F")
 		}
 	case gui.KeyDelete:
 		out = []byte("\x1b[3~")
+	case gui.KeyInsert,
+		gui.KeyF1, gui.KeyF2, gui.KeyF3, gui.KeyF4,
+		gui.KeyF5, gui.KeyF6, gui.KeyF7, gui.KeyF8,
+		gui.KeyF9, gui.KeyF10, gui.KeyF11, gui.KeyF12:
+		out = funcKeySeq(e.KeyCode, shift, ctrl)
 	default:
 		if modes.appKeypad {
 			out = keypadSeq(e.KeyCode)
@@ -1630,11 +1885,22 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 				break
 			}
 		}
+		// Alt+letter → lowercase letter; ESC prefix applied below.
+		// Handled here so onChar sees IsHandled=true and does not also
+		// send the OS-translated glyph (e.g. macOS Alt+F → ƒ).
+		if alt && !ctrl && e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
+			out = []byte{byte('a' + (e.KeyCode - gui.KeyA))}
+			break
+		}
 		// Ctrl+letter → control byte. Letter keys are KeyA..KeyZ.
 		if e.Modifiers.Has(gui.ModCtrl) &&
 			e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
 			out = []byte{byte(e.KeyCode-gui.KeyA) + 1}
 		}
+	}
+	// Alt/Meta key: prefix any outbound sequence with ESC.
+	if alt && len(out) > 0 {
+		out = append([]byte{0x1b}, out...)
 	}
 	if len(out) == 0 {
 		return

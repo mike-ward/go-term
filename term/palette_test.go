@@ -8,33 +8,33 @@ import (
 
 func TestPalette_FGBG_Default(t *testing.T) {
 	c := defaultCell()
-	if got := fg(c); got != defaultFG {
-		t.Errorf("default fg: %+v want %+v", got, defaultFG)
+	if got := DefaultTheme.fg(c); got != DefaultTheme.DefaultFG {
+		t.Errorf("default fg: %+v want %+v", got, DefaultTheme.DefaultFG)
 	}
-	if got := bg(c); got != defaultBG {
-		t.Errorf("default bg: %+v want %+v", got, defaultBG)
+	if got := DefaultTheme.bg(c); got != DefaultTheme.DefaultBG {
+		t.Errorf("default bg: %+v want %+v", got, DefaultTheme.DefaultBG)
 	}
 }
 
 func TestPalette_FGBG_Indexed(t *testing.T) {
 	c := Cell{Ch: ' ', FG: 1, BG: 2}
-	if got := fg(c); got != palette[1] {
-		t.Errorf("fg index 1: %+v want %+v", got, palette[1])
+	if got := DefaultTheme.fg(c); got != DefaultTheme.ANSI[1] {
+		t.Errorf("fg index 1: %+v want %+v", got, DefaultTheme.ANSI[1])
 	}
-	if got := bg(c); got != palette[2] {
-		t.Errorf("bg index 2: %+v want %+v", got, palette[2])
+	if got := DefaultTheme.bg(c); got != DefaultTheme.ANSI[2] {
+		t.Errorf("bg index 2: %+v want %+v", got, DefaultTheme.ANSI[2])
 	}
 }
 
 func TestPalette_Inverse_SwapsFGBG(t *testing.T) {
 	c := Cell{Ch: ' ', FG: 1, BG: 2, Attrs: AttrInverse}
-	if got := fg(c); got != palette[2] {
+	if got := DefaultTheme.fg(c); got != DefaultTheme.ANSI[2] {
 		t.Errorf("inverse fg should be bg color: %+v want %+v",
-			got, palette[2])
+			got, DefaultTheme.ANSI[2])
 	}
-	if got := bg(c); got != palette[1] {
+	if got := DefaultTheme.bg(c); got != DefaultTheme.ANSI[1] {
 		t.Errorf("inverse bg should be fg color: %+v want %+v",
-			got, palette[1])
+			got, DefaultTheme.ANSI[1])
 	}
 }
 
@@ -63,10 +63,10 @@ func TestPalette_256_Grayscale(t *testing.T) {
 
 func TestPalette_TruecolorRoundtrip(t *testing.T) {
 	c := Cell{Ch: ' ', FG: rgbColor(255, 100, 0), BG: rgbColor(10, 20, 30)}
-	if got, want := fg(c), gui.RGB(255, 100, 0); got != want {
+	if got, want := DefaultTheme.fg(c), gui.RGB(255, 100, 0); got != want {
 		t.Errorf("truecolor fg: got %+v want %+v", got, want)
 	}
-	if got, want := bg(c), gui.RGB(10, 20, 30); got != want {
+	if got, want := DefaultTheme.bg(c), gui.RGB(10, 20, 30); got != want {
 		t.Errorf("truecolor bg: got %+v want %+v", got, want)
 	}
 }
@@ -76,10 +76,10 @@ func TestPalette_ResolveUnknownTagUsesPaletteByte(t *testing.T) {
 	// DefaultColor (0xFF). Decoder must not panic; falls back to
 	// palette[low byte] which is in-bounds (palette has 256 entries).
 	bad := uint32(0x42)<<24 | uint32(5)
-	if got, want := resolve(bad, defaultFG), palette[5]; got != want {
+	if got, want := DefaultTheme.resolve(bad, DefaultTheme.DefaultFG), DefaultTheme.ANSI[5]; got != want {
 		t.Errorf("resolve unknown tag (FG default): got %+v want %+v", got, want)
 	}
-	if got, want := resolve(bad, defaultBG), palette[5]; got != want {
+	if got, want := DefaultTheme.resolve(bad, DefaultTheme.DefaultBG), DefaultTheme.ANSI[5]; got != want {
 		t.Errorf("resolve unknown tag (BG default): got %+v want %+v", got, want)
 	}
 }
@@ -91,20 +91,38 @@ func TestPalette_TruecolorInverse(t *testing.T) {
 		BG:    rgbColor(10, 20, 30),
 		Attrs: AttrInverse,
 	}
-	if got, want := fg(c), gui.RGB(10, 20, 30); got != want {
+	if got, want := DefaultTheme.fg(c), gui.RGB(10, 20, 30); got != want {
 		t.Errorf("inverse truecolor fg: got %+v want %+v", got, want)
 	}
-	if got, want := bg(c), gui.RGB(1, 2, 3); got != want {
+	if got, want := DefaultTheme.bg(c), gui.RGB(1, 2, 3); got != want {
 		t.Errorf("inverse truecolor bg: got %+v want %+v", got, want)
 	}
 }
 
 func TestPalette_Inverse_DefaultsSwap(t *testing.T) {
 	c := Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor, Attrs: AttrInverse}
-	if got := fg(c); got != defaultBG {
+	if got := DefaultTheme.fg(c); got != DefaultTheme.DefaultBG {
 		t.Errorf("inverse default fg: %+v", got)
 	}
-	if got := bg(c); got != defaultFG {
+	if got := DefaultTheme.bg(c); got != DefaultTheme.DefaultFG {
 		t.Errorf("inverse default bg: %+v", got)
+	}
+}
+
+func TestPalette_ThemeOverridesANSI(t *testing.T) {
+	custom := Theme{
+		ANSI:      DefaultTheme.ANSI,
+		DefaultFG: DefaultTheme.DefaultFG,
+		DefaultBG: DefaultTheme.DefaultBG,
+	}
+	custom.ANSI[1] = gui.RGB(255, 0, 128) // override red
+	c := Cell{Ch: ' ', FG: 1}
+	if got, want := custom.fg(c), gui.RGB(255, 0, 128); got != want {
+		t.Errorf("theme ANSI override: got %+v want %+v", got, want)
+	}
+	// Extended colors (≥16) should be unaffected by ANSI override.
+	c2 := Cell{Ch: ' ', FG: paletteColor(196)}
+	if got, want := custom.fg(c2), palette[196]; got != want {
+		t.Errorf("extended color unchanged: got %+v want %+v", got, want)
 	}
 }

@@ -539,10 +539,22 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Modern syntax highlighters and editors (like Neovim) use curly or colored underlines for diagnostics.
 
-- [ ] `grid.go`: Add `UnderlineStyle` (single, double, curly, dotted, dashed) and `UnderlineColor` to `Cell`.
-- [ ] `parser.go`: Handle `CSI 4 : n m` (style) and `CSI 58 ; 2 ; r ; g ; b m` (color).
-- [ ] `widget.go`: `onDraw` renders the various underline styles using `dc` primitives.
-- [ ] Tests for SGR 4:n and 58.
+- [x] `grid.go`: Add `ULStyle uint8` (ULNone/ULSingle/ULDouble/ULCurly/ULDotted/ULDashed) and
+      `ULColor uint32` to `Cell`; `CurULStyle`/`CurULColor` to `Grid`. Propagated through
+      `Put`, `SaveCursor`/`RestoreCursor`, `EnterAlt`/`ExitAlt`, `blankCell`, `defaultCell`.
+- [x] `parser.go`: Colon sub-param tracking (`paramSub`/`nextIsSub`). Handle `CSI 4:n m`
+      (style), `CSI 21 m` (double), `CSI 24 m` (clear), `CSI 58;2;r;g;b m` / `58;5;n m`
+      (underline color), `CSI 59 m` (reset color). SGR 0 resets all UL state.
+- [x] `widget.go`: `runKey` carries `ulStyle`/`ulColor`; `cellRunKey` extracts from cell.
+      `drawUnderlineDecor` renders double/curly/dotted/dashed via `dc.FilledRect`. Single
+      underline uses `gui.TextStyle.Underline`. `runCols` tracks run width for decor sizing.
+- [x] Tests: `TestParser_SGR4_NoSubparam_SingleUnderline`, `TestParser_SGR4_ColonSubparam_Styles`,
+      `TestParser_SGR21_DoubleUnderline`, `TestParser_SGR24_ClearsUnderline`,
+      `TestParser_SGR58_ULColor_RGB`, `TestParser_SGR58_ULColor_Palette`,
+      `TestParser_SGR59_ResetsULColor`, `TestParser_SGRReset_ClearsULState`,
+      `TestParser_SGR4_Semicolon_NotSubparam`, `TestGrid_Put_PropagatesULStyle`,
+      `TestGrid_Put_BlankCellNoUL`, `TestGrid_SaveRestoreCursor_ULState`,
+      `TestGrid_DefaultCell_ULColor`.
 
 **Demo test:** `printf '\x1b[4:3mCURLY\x1b[0m\n'`.
 
@@ -552,10 +564,10 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Required for some legacy CLI applications and specialized text layouts.
 
-- [ ] `grid.go`: Add `TabStops []bool` (size `MaxGridDim`).
-- [ ] `parser.go`: Handle `ESC H` (HTS - set stop) and `CSI g` (TBC - clear stop).
-- [ ] `grid.go`: `Tab()` uses `TabStops` if set, else falls back to default 8-col.
-- [ ] Tests for setting and clearing tab stops.
+- [x] `grid.go`: Add `TabStops []bool` (size `MaxGridDim`).
+- [x] `parser.go`: Handle `ESC H` (HTS - set stop) and `CSI g` (TBC - clear stop).
+- [x] `grid.go`: `Tab()` uses `TabStops` if set, else falls back to default 8-col.
+- [x] Tests for setting and clearing tab stops.
 
 **Demo test:** Set a custom tab stop, then use `\t` to verify alignment.
 
@@ -565,8 +577,8 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Many CLI apps (Emacs, readline) use Alt+Key combinations for shortcuts.
 
-- [ ] `widget.go`: `onKeyDown` prefixes output with `\x1b` (ESC) when `ModAlt` is held.
-- [ ] Handle both single characters and existing escape sequences (e.g., Alt+Arrow).
+- [x] `widget.go`: `onKeyDown` prefixes output with `\x1b` (ESC) when `ModAlt` is held.
+- [x] Handle both single characters and existing escape sequences (e.g., Alt+Arrow).
 
 **Demo test:** Press Alt+F in a shell to jump forward a word (if supported by shell).
 
@@ -576,8 +588,8 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Required for complex TUIs like Midnight Commander or specialized editors.
 
-- [ ] `widget.go`: Expand `onKeyDown` and `keypadSeq` to cover F1–F12 and more keypad variants.
-- [ ] Honor `AppCursorKeys` and `AppKeypad` modes for all new keys.
+- [x] `widget.go`: Expand `onKeyDown` and `keypadSeq` to cover F1–F12 and more keypad variants.
+- [x] Honor `AppCursorKeys` and `AppKeypad` modes for all new keys.
 
 **Demo test:** Run `mc` or `htop` and verify function keys work.
 
@@ -587,9 +599,9 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Allow users to use popular themes (Gruvbox, Solarized, Nord) without modifying `palette.go`.
 
-- [ ] `grid.go`: Move the 256-color palette from a global to a field in `Grid` or a shared `Theme` struct.
-- [ ] `term.go`: Add `SetTheme(colors [16]gui.Color)` or similar API.
-- [ ] Update `resolve` to use the grid-local palette.
+- [x] `grid.go`: Move the 256-color palette from a global to a field in `Grid` or a shared `Theme` struct.
+- [x] `term.go`: Add `SetTheme(colors [16]gui.Color)` or similar API.
+- [x] Update `resolve` to use the grid-local palette.
 
 **Demo test:** Change the theme at runtime via a demo menu.
 

@@ -49,8 +49,10 @@ type Parser struct {
 	g            *Grid
 	state        parserState
 	params       []int   // SGR params accumulated in current CSI
+	paramSub     []bool  // paramSub[i] true when params[i] was colon-separated from params[i-1]
 	curP         int     // value being accumulated
 	hasP         bool    // any digit seen for curP
+	nextIsSub    bool    // pending: next param pushed will be marked as sub-param
 	leader       byte    // optional CSI private leader: one of < = > ?
 	intermediate byte    // last intermediate byte (0x20..0x2F) seen, 0 if none
 	escInter     byte    // ESC intermediate introducer like '(' in ESC(B
@@ -90,7 +92,7 @@ func (p *Parser) SetClipboardHandler(fn func([]byte)) { p.onClipboard = fn }
 // NewParser binds a parser to a grid. Callers must hold g.Mu while calling
 // Feed.
 func NewParser(g *Grid) *Parser {
-	return &Parser{g: g, params: make([]int, 0, 8)}
+	return &Parser{g: g, params: make([]int, 0, 8), paramSub: make([]bool, 0, 8)}
 }
 
 // Feed processes b, mutating the grid. Caller holds g.Mu.
@@ -145,8 +147,10 @@ func (p *Parser) Feed(b []byte) {
 			case '[':
 				p.state = stCSI
 				p.params = p.params[:0]
+				p.paramSub = p.paramSub[:0]
 				p.curP = 0
 				p.hasP = false
+				p.nextIsSub = false
 				p.leader = 0
 				p.intermediate = 0
 			case ']': // OSC introducer
@@ -169,6 +173,9 @@ func (p *Parser) Feed(b []byte) {
 				p.state = stGround
 			case 'E': // NEL — next line (CR + LF)
 				p.g.NextLine()
+				p.state = stGround
+			case 'H': // HTS — set tab stop at current column
+				p.g.SetTabStop()
 				p.state = stGround
 			case '=': // DECPAM — application keypad
 				p.g.AppKeypad = true
@@ -212,12 +219,25 @@ func (p *Parser) Feed(b []byte) {
 			case c == ';':
 				if len(p.params) < maxCSIParams {
 					p.params = append(p.params, p.curP)
+					p.paramSub = append(p.paramSub, p.nextIsSub)
 				}
 				p.curP = 0
 				p.hasP = false
+				p.nextIsSub = false // semicolon resets sub-param chain
+			case c == ':':
+				// Colon introduces a sub-parameter within the same logical
+				// parameter group (e.g. "4:3" = curly underline).
+				if len(p.params) < maxCSIParams {
+					p.params = append(p.params, p.curP)
+					p.paramSub = append(p.paramSub, p.nextIsSub)
+				}
+				p.curP = 0
+				p.hasP = false
+				p.nextIsSub = true // next param is a sub-param of the one just pushed
 			case c >= 0x40 && c <= 0x7E:
 				if (p.hasP || len(p.params) > 0) && len(p.params) < maxCSIParams {
 					p.params = append(p.params, p.curP)
+					p.paramSub = append(p.paramSub, p.nextIsSub)
 				}
 				p.dispatchCSI(c)
 				p.state = stGround
@@ -225,6 +245,7 @@ func (p *Parser) Feed(b []byte) {
 				p.hasP = false
 				p.leader = 0
 				p.intermediate = 0
+				p.nextIsSub = false
 			case c >= 0x20 && c <= 0x2F:
 				// Intermediate byte (e.g. SP for DECSCUSR " q"). Last
 				// one wins — multi-intermediate sequences are rare and
@@ -693,6 +714,15 @@ func (p *Parser) dispatchCSI(final byte) {
 			row, col := p.g.CursorR+1, p.g.CursorC+1
 			p.onReply([]byte("\x1b[" + strconv.Itoa(row) + ";" + strconv.Itoa(col) + "R"))
 		}
+	case 'g':
+		// TBC — tabulation clear. Ps=0 (default): clear stop at cursor.
+		// Ps=3: clear all tab stops.
+		switch p.param(0, 0) {
+		case 0:
+			p.g.ClearTabStop(false)
+		case 3:
+			p.g.ClearTabStop(true)
+		}
 	case 'q':
 		// DECSCUSR — set cursor style + blink (CSI Ps SP q).
 		// Without the SP intermediate this is a different sequence
@@ -783,19 +813,13 @@ func (p *Parser) param(i, def int) int {
 	return p.params[i]
 }
 
-// applyExtendedColor handles SGR 38/48 sub-forms (;5;n and ;2;r;g;b)
-// starting at params[i] (the 38 or 48 itself). Returns the new value
-// of i — the outer loop's `i++` advances past the last param consumed.
-// On truncation, returns len(params)-1 so the outer loop exits cleanly.
-func applyExtendedColor(g *Grid, params []int, i int, isBG bool) int {
-	// Defensive: caller is always applySGR with i in [0, len(params)),
-	// but guard against future misuse (negative i, empty/nil params).
+// applyExtendedColor handles SGR 38/48/58 sub-forms (;5;n and ;2;r;g;b)
+// starting at params[i] (the 38/48/58 itself). target receives the result.
+// Returns the new value of i; the outer loop's `i++` advances past the last
+// param consumed. On truncation, returns len(params)-1.
+func applyExtendedColor(params []int, i int, target *uint32) int {
 	if i < 0 || i+1 >= len(params) {
 		return len(params) - 1
-	}
-	target := &g.CurFG
-	if isBG {
-		target = &g.CurBG
 	}
 	switch params[i+1] {
 	case 5:
@@ -815,7 +839,6 @@ func applyExtendedColor(g *Grid, params []int, i int, isBG bool) int {
 		)
 		return i + 4
 	default:
-		// Unknown selector; consume the rest of the SGR sequence.
 		return len(params) - 1
 	}
 }
@@ -843,6 +866,8 @@ func (p *Parser) applySGR() {
 		switch {
 		case n == 0:
 			g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+			g.CurULStyle = 0
+			g.CurULColor = DefaultColor
 		case n == 1:
 			g.CurAttrs |= AttrBold
 		case n == 2:
@@ -850,17 +875,42 @@ func (p *Parser) applySGR() {
 		case n == 3:
 			g.CurAttrs |= AttrItalic
 		case n == 4:
+			// SGR 4 with a colon sub-parameter selects the underline style:
+			// 4:0=none 4:1=single 4:2=double 4:3=curly 4:4=dotted 4:5=dashed.
+			// Plain SGR 4 (no sub-param) means single underline.
+			ulStyle := ULSingle
+			if i+1 < len(p.params) && i+1 < len(p.paramSub) && p.paramSub[i+1] {
+				sub := p.params[i+1]
+				i++ // consume sub-param; outer loop's i++ moves to next group
+				if sub == 0 {
+					// 4:0 = explicitly remove underline
+					g.CurAttrs &^= AttrUnderline
+					g.CurULStyle = 0
+					continue
+				}
+				if sub < 1 || sub > 5 {
+					continue // unknown sub-param: no-op per xterm convention
+				}
+				ulStyle = uint8(sub)
+			}
 			g.CurAttrs |= AttrUnderline
+			g.CurULStyle = ulStyle
 		case n == 7:
 			g.CurAttrs |= AttrInverse
 		case n == 9:
 			g.CurAttrs |= AttrStrikethrough
+		case n == 21:
+			// Doubly underlined (SGR 21). Sets double-underline style.
+			g.CurAttrs |= AttrUnderline
+			g.CurULStyle = ULDouble
 		case n == 22:
 			g.CurAttrs &^= AttrBold | AttrDim
 		case n == 23:
 			g.CurAttrs &^= AttrItalic
 		case n == 24:
 			g.CurAttrs &^= AttrUnderline
+			g.CurULStyle = 0
+			g.CurULColor = DefaultColor
 		case n == 27:
 			g.CurAttrs &^= AttrInverse
 		case n == 29:
@@ -882,7 +932,17 @@ func (p *Parser) applySGR() {
 			// in the next param. ;5;n  → 256-color palette index.
 			// ;2;r;g;b → 24-bit truecolor. Truncated forms consume
 			// whatever params remain (no panic, no half-applied).
-			i = applyExtendedColor(g, p.params, i, n == 48)
+			target := &g.CurFG
+			if n == 48 {
+				target = &g.CurBG
+			}
+			i = applyExtendedColor(p.params, i, target)
+		case n == 58:
+			// SGR 58: underline color. Same sub-forms as 38/48.
+			i = applyExtendedColor(p.params, i, &g.CurULColor)
+		case n == 59:
+			// SGR 59: reset underline color to default (= use fg).
+			g.CurULColor = DefaultColor
 		}
 	}
 }

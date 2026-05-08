@@ -45,6 +45,17 @@ const (
 	AttrStrikethrough
 )
 
+// Underline style constants for Cell.ULStyle and Grid.CurULStyle.
+// ULNone means no underline. The others select the decoration shape.
+const (
+	ULNone    uint8 = 0
+	ULSingle  uint8 = 1
+	ULDouble  uint8 = 2
+	ULCurly   uint8 = 3
+	ULDotted  uint8 = 4
+	ULDashed  uint8 = 5
+)
+
 // CursorShape selects the cursor glyph: filled block, baseline
 // underline, or vertical bar at the leading edge of the cell.
 type CursorShape uint8
@@ -163,25 +174,32 @@ func rgbColor(r, g, b uint8) uint32 {
 //	2 — wide head; the cell at column+1 is its right-half continuation
 //	0 — continuation cell (right half of a width-2 char to the left).
 //	    Ch == 0 in this state; the renderer skips it.
+//
+// ULColor uses the same packed uint32 encoding as FG/BG. DefaultColor
+// means "use the cell's foreground color." ULStyle selects the decoration
+// shape; 0 (ULNone) means no underline regardless of ULColor.
 type Cell struct {
-	Ch     rune
-	FG     uint32 // packed Color (palette index, RGB, or DefaultColor)
-	BG     uint32
-	Attrs  uint8
-	Width  uint8
-	LinkID uint16 // 0 = no link; non-zero indexes Grid.links
+	Ch      rune
+	FG      uint32 // packed Color (palette index, RGB, or DefaultColor)
+	BG      uint32
+	ULColor uint32 // packed underline color; DefaultColor = use FG
+	Attrs   uint8
+	Width   uint8
+	ULStyle uint8  // ULNone..ULDashed
+	LinkID  uint16 // 0 = no link; non-zero indexes Grid.links
 }
 
 func defaultCell() Cell {
-	return Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor, Width: 1}
+	return Cell{Ch: ' ', FG: DefaultColor, BG: DefaultColor, ULColor: DefaultColor, Width: 1}
 }
 
 // blankCell returns a space-filled cell carrying the supplied SGR
 // state. Used by erase / insert / scroll paths that need to clear
 // runs to the *current* attributes (so e.g. an Erase under inverse
-// fills with inverse background).
+// fills with inverse background). Blank cells never carry underline
+// decoration (invisible on spaces; ULStyle=0 signals that).
 func blankCell(fg, bg uint32, attrs uint8) Cell {
-	return Cell{Ch: ' ', FG: fg, BG: bg, Attrs: attrs, Width: 1}
+	return Cell{Ch: ' ', FG: fg, BG: bg, ULColor: DefaultColor, Attrs: attrs, Width: 1}
 }
 
 // savedCursor holds the snapshot taken by SaveCursor (DECSC / CSI s).
@@ -191,6 +209,8 @@ type savedCursor struct {
 	r, c       int
 	fg, bg     uint32
 	attrs      uint8
+	ulStyle    uint8
+	ulColor    uint32
 	autoWrap   bool
 	originMode bool
 	insertMode bool
@@ -207,6 +227,8 @@ type altSavedScreen struct {
 	cursorR, cursorC int
 	curFG, curBG     uint32
 	curAttrs         uint8
+	curULStyle       uint8
+	curULColor       uint32
 	autoWrap         bool
 	originMode       bool
 	insertMode       bool
@@ -227,6 +249,8 @@ type Grid struct {
 	CurFG          uint32 // packed Color
 	CurBG          uint32
 	CurAttrs       uint8
+	CurULStyle     uint8  // current underline style (ULNone..ULDashed)
+	CurULColor     uint32 // current underline color; DefaultColor = use fg
 	AutoWrap       bool // DEC ?7 — autowrap at right margin
 	OriginMode     bool // DEC ?6 — CUP/HVP/VPA relative to scroll region
 	InsertMode     bool // CSI 4 h/l — insert vs replace on Put
@@ -294,6 +318,15 @@ type Grid struct {
 	// at the new width. Reset to false whenever a row is filled with blank
 	// cells (erase, insert, scroll).
 	RowWrapped []bool // len = Rows, parallel to live cell buffer
+
+	// TabStops[c] is true when column c has a tab stop set. Initialized to
+	// every 8 columns (xterm default). ESC H sets; CSI g clears. Tab()
+	// advances to the next set stop, or to Cols-1 when none remains.
+	TabStops [MaxGridDim]bool
+
+	// Theme controls the 16 ANSI base colors and the default fg/bg used
+	// when rendering cells. Set via Term.SetTheme; defaults to DefaultTheme.
+	Theme Theme
 
 	// Alt-screen state. EnterAlt swaps g.Cells with a fresh blank buffer
 	// and stashes main-screen state in mainSaved; ExitAlt restores it.
@@ -445,12 +478,14 @@ func NewGrid(rows, cols int) *Grid {
 		RowWrapped:    make([]bool, rows),
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
+		CurULColor:    DefaultColor,
 		AutoWrap:      true,
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
 		CursorBlink:   false,
 		Top:      0,
 		Bottom:   rows - 1,
+		Theme:    DefaultTheme,
 		links:    make(map[uint16]string),
 		linkIDs:  make(map[string]uint16),
 		nextLink: 1,
@@ -458,13 +493,23 @@ func NewGrid(rows, cols int) *Grid {
 	for i := range g.Cells {
 		g.Cells[i] = defaultCell()
 	}
+	for c := 8; c < MaxGridDim; c += 8 {
+		g.TabStops[c] = true
+	}
 	return g
 }
+
+// maxLinkEntries caps the hyperlink registry so an OSC 8 stream with many
+// unique URLs can't grow the maps without bound.
+const maxLinkEntries = 4096
 
 // internLink returns the ID for url, creating one if needed. Called under Mu.
 func (g *Grid) internLink(url string) uint16 {
 	if id, ok := g.linkIDs[url]; ok {
 		return id
+	}
+	if len(g.linkIDs) >= maxLinkEntries {
+		return 0
 	}
 	id := g.nextLink
 	g.nextLink++
@@ -517,7 +562,7 @@ type physRow struct {
 // trailing padding from the last physical row of a logical line.
 func isDefaultBlank(c Cell) bool {
 	return c.Ch == ' ' && c.FG == DefaultColor && c.BG == DefaultColor &&
-		c.Attrs == 0 && c.Width == 1 && c.LinkID == 0
+		c.Attrs == 0 && c.Width == 1 && c.LinkID == 0 && c.ULStyle == 0
 }
 
 // rewrapLine re-wraps a flat slice of cells (the content of one logical
@@ -559,7 +604,7 @@ func rewrapLine(cells []Cell, newCols int) []physRow {
 		cur = append(cur, c)
 		if w == 2 {
 			// Re-emit continuation cell.
-			cur = append(cur, Cell{Ch: 0, FG: c.FG, BG: c.BG, Attrs: c.Attrs, Width: 0})
+			cur = append(cur, Cell{Ch: 0, FG: c.FG, BG: c.BG, Attrs: c.Attrs, Width: 0, ULStyle: c.ULStyle, ULColor: c.ULColor})
 		}
 		i++
 	}
@@ -711,6 +756,20 @@ func logicalReflow(
 			cursorLineRewrapped = rewrapped
 		}
 		allNew = append(allNew, rewrapped...)
+		// Trim oldest pre-cursor rows to bound allNew growth when reflowing
+		// deep scrollback to narrow columns (worst case: oldCols/newCols
+		// expansion per row). Only safe before the cursor line is added;
+		// cursorNewPhysStart is set in the same iteration so indices remain
+		// relative to the (possibly trimmed) slice.
+		if li < cursorLineIdx {
+			capRows := newRows + scrollbackCap
+			if capRows < newRows*2 {
+				capRows = newRows * 2
+			}
+			if len(allNew) > capRows {
+				allNew = allNew[len(allNew)-capRows:]
+			}
+		}
 	}
 
 	// --- Cursor position in new layout ---
@@ -940,6 +999,7 @@ func (g *Grid) Put(ch rune) {
 		*c = Cell{
 			Ch: ch, FG: g.CurFG, BG: g.CurBG,
 			Attrs: g.CurAttrs, Width: uint8(w), LinkID: g.CurLinkID,
+			ULStyle: g.CurULStyle, ULColor: g.CurULColor,
 		}
 	}
 	if w == 2 {
@@ -947,6 +1007,7 @@ func (g *Grid) Put(ch rune) {
 			*c = Cell{
 				Ch: 0, FG: g.CurFG, BG: g.CurBG,
 				Attrs: g.CurAttrs, Width: 0, LinkID: g.CurLinkID,
+				ULStyle: g.CurULStyle, ULColor: g.CurULColor,
 			}
 		}
 	}
@@ -1021,14 +1082,37 @@ func (g *Grid) Backspace() {
 	}
 }
 
-// Tab advances to next column that's a multiple of 8.
+// Tab advances the cursor to the next tab stop. Scans TabStops from
+// CursorC+1; if no stop exists within the row, clamps to Cols-1.
 func (g *Grid) Tab() {
 	if g.CursorC < 0 {
 		g.CursorC = 0
 	}
-	g.CursorC = ((g.CursorC / 8) + 1) * 8
-	if g.CursorC >= g.Cols {
-		g.CursorC = g.Cols - 1
+	for c := g.CursorC + 1; c < g.Cols; c++ {
+		if g.TabStops[c] {
+			g.CursorC = c
+			return
+		}
+	}
+	g.CursorC = g.Cols - 1
+}
+
+// SetTabStop sets a tab stop at the current cursor column. Implements ESC H (HTS).
+func (g *Grid) SetTabStop() {
+	if g.CursorC >= 0 && g.CursorC < MaxGridDim {
+		g.TabStops[g.CursorC] = true
+	}
+}
+
+// ClearTabStop clears the tab stop at the current cursor column (all==false)
+// or clears all tab stops (all==true). Implements CSI g (TBC).
+func (g *Grid) ClearTabStop(all bool) {
+	if all {
+		g.TabStops = [MaxGridDim]bool{}
+		return
+	}
+	if g.CursorC >= 0 && g.CursorC < MaxGridDim {
+		g.TabStops[g.CursorC] = false
 	}
 }
 
@@ -1161,6 +1245,8 @@ func (g *Grid) SaveCursor() {
 		fg:         g.CurFG,
 		bg:         g.CurBG,
 		attrs:      g.CurAttrs,
+		ulStyle:    g.CurULStyle,
+		ulColor:    g.CurULColor,
 		autoWrap:   g.AutoWrap,
 		originMode: g.OriginMode,
 		insertMode: g.InsertMode,
@@ -1174,12 +1260,16 @@ func (g *Grid) RestoreCursor() {
 	if !g.saved.valid {
 		g.MoveCursor(0, 0)
 		g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+		g.CurULStyle = 0
+		g.CurULColor = DefaultColor
 		return
 	}
 	g.MoveCursor(g.saved.r, g.saved.c)
 	g.CurFG = g.saved.fg
 	g.CurBG = g.saved.bg
 	g.CurAttrs = g.saved.attrs
+	g.CurULStyle = g.saved.ulStyle
+	g.CurULColor = g.saved.ulColor
 	g.AutoWrap = g.saved.autoWrap
 	g.OriginMode = g.saved.originMode
 	g.InsertMode = g.saved.insertMode
@@ -1481,6 +1571,8 @@ func (g *Grid) EnterAlt() {
 		curFG:      g.CurFG,
 		curBG:      g.CurBG,
 		curAttrs:   g.CurAttrs,
+		curULStyle: g.CurULStyle,
+		curULColor: g.CurULColor,
 		autoWrap:   g.AutoWrap,
 		originMode: g.OriginMode,
 		insertMode: g.InsertMode,
@@ -1497,6 +1589,8 @@ func (g *Grid) EnterAlt() {
 	g.RowWrapped = make([]bool, g.Rows)
 	g.CursorR, g.CursorC = 0, 0
 	g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
+	g.CurULStyle = 0
+	g.CurULColor = DefaultColor
 	g.AutoWrap = true
 	g.OriginMode = false
 	g.InsertMode = false
@@ -1520,6 +1614,8 @@ func (g *Grid) ExitAlt() {
 	g.CurFG = g.mainSaved.curFG
 	g.CurBG = g.mainSaved.curBG
 	g.CurAttrs = g.mainSaved.curAttrs
+	g.CurULStyle = g.mainSaved.curULStyle
+	g.CurULColor = g.mainSaved.curULColor
 	g.AutoWrap = g.mainSaved.autoWrap
 	g.OriginMode = g.mainSaved.originMode
 	g.InsertMode = g.mainSaved.insertMode

@@ -2,6 +2,7 @@ package term
 
 import (
 	"math"
+	"strconv"
 	"testing"
 )
 
@@ -1955,5 +1956,257 @@ func TestGrid_Bell_IncrementsCount(t *testing.T) {
 	g.Bell()
 	if g.BellCount != 3 {
 		t.Fatalf("BellCount after 3 bells = %d, want 3", g.BellCount)
+	}
+}
+
+// --- Phase 20: Extended Underline Styles & Colors ---
+
+func TestGrid_Put_PropagatesULStyle(t *testing.T) {
+	g := NewGrid(2, 10)
+	g.CurULStyle = ULCurly
+	g.CurULColor = rgbColor(255, 0, 128)
+	g.Put('X')
+	cell := g.At(0, 0)
+	if cell == nil {
+		t.Fatal("At(0,0) returned nil")
+	}
+	if cell.ULStyle != ULCurly {
+		t.Errorf("Put: ULStyle = %d, want ULCurly (%d)", cell.ULStyle, ULCurly)
+	}
+	if cell.ULColor != rgbColor(255, 0, 128) {
+		t.Errorf("Put: ULColor = %#x, want %#x", cell.ULColor, rgbColor(255, 0, 128))
+	}
+}
+
+func TestGrid_Put_BlankCellNoUL(t *testing.T) {
+	// Blank cells from erase should never carry underline decoration.
+	g := NewGrid(2, 10)
+	g.CurULStyle = ULDashed
+	g.EraseInLine(2)
+	for c := range 10 {
+		cell := g.At(0, c)
+		if cell == nil {
+			continue
+		}
+		if cell.ULStyle != ULNone {
+			t.Errorf("erased cell[0,%d]: ULStyle = %d, want 0", c, cell.ULStyle)
+		}
+	}
+}
+
+func TestGrid_SaveRestoreCursor_ULState(t *testing.T) {
+	g := NewGrid(2, 10)
+	g.CurULStyle = ULDouble
+	g.CurULColor = rgbColor(0, 128, 255)
+	g.SaveCursor()
+
+	// mutate
+	g.CurULStyle = ULDotted
+	g.CurULColor = DefaultColor
+
+	g.RestoreCursor()
+	if g.CurULStyle != ULDouble {
+		t.Errorf("RestoreCursor: CurULStyle = %d, want ULDouble (%d)", g.CurULStyle, ULDouble)
+	}
+	if g.CurULColor != rgbColor(0, 128, 255) {
+		t.Errorf("RestoreCursor: CurULColor = %#x, want %#x", g.CurULColor, rgbColor(0, 128, 255))
+	}
+}
+
+func TestGrid_DefaultCell_ULColor(t *testing.T) {
+	// defaultCell() must have ULColor == DefaultColor and ULStyle == 0.
+	c := defaultCell()
+	if c.ULStyle != ULNone {
+		t.Errorf("defaultCell: ULStyle = %d, want 0", c.ULStyle)
+	}
+	if c.ULColor != DefaultColor {
+		t.Errorf("defaultCell: ULColor = %#x, want DefaultColor", c.ULColor)
+	}
+}
+
+func TestGrid_TabDefaultStops(t *testing.T) {
+	g := NewGrid(1, 80)
+	// Default stops at 8, 16, 24, ...
+	for _, want := range []int{8, 16, 24, 32} {
+		if !g.TabStops[want] {
+			t.Errorf("default stop missing at col %d", want)
+		}
+	}
+	// Column 0 is not a default stop.
+	if g.TabStops[0] {
+		t.Error("col 0 should not be a default stop")
+	}
+}
+
+func TestGrid_Tab_AdvancesToNextStop(t *testing.T) {
+	g := NewGrid(1, 80)
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != 8 {
+		t.Errorf("Tab from 0: got %d, want 8", g.CursorC)
+	}
+	g.Tab()
+	if g.CursorC != 16 {
+		t.Errorf("Tab from 8: got %d, want 16", g.CursorC)
+	}
+}
+
+func TestGrid_Tab_ClampsWhenNoStop(t *testing.T) {
+	// Grid narrower than first default stop: no stop in [1, Cols-1].
+	g := NewGrid(1, 5)
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != 4 {
+		t.Errorf("Tab with no stop: got %d, want Cols-1=4", g.CursorC)
+	}
+}
+
+func TestGrid_SetTabStop(t *testing.T) {
+	g := NewGrid(1, 80)
+	g.CursorC = 5
+	g.SetTabStop()
+	if !g.TabStops[5] {
+		t.Error("SetTabStop: stop not set at col 5")
+	}
+	// Tab from col 0 should land at 5, then 8.
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != 5 {
+		t.Errorf("Tab after SetTabStop(5): got %d, want 5", g.CursorC)
+	}
+	g.Tab()
+	if g.CursorC != 8 {
+		t.Errorf("Tab after SetTabStop(5) from 5: got %d, want 8", g.CursorC)
+	}
+}
+
+func TestGrid_ClearTabStop_AtCursor(t *testing.T) {
+	g := NewGrid(1, 80)
+	// Default stop at 8; clear it.
+	g.CursorC = 8
+	g.ClearTabStop(false)
+	if g.TabStops[8] {
+		t.Error("ClearTabStop(false): stop at 8 should be cleared")
+	}
+	// Tab from 0 should now skip to 16.
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != 16 {
+		t.Errorf("Tab after clearing stop at 8: got %d, want 16", g.CursorC)
+	}
+}
+
+func TestGrid_ClearTabStop_All(t *testing.T) {
+	g := NewGrid(1, 80)
+	g.ClearTabStop(true)
+	for c := 0; c < MaxGridDim; c++ {
+		if g.TabStops[c] {
+			t.Errorf("ClearTabStop(true): stop still set at col %d", c)
+		}
+	}
+	// Tab from 0 with no stops should clamp to Cols-1.
+	g.CursorC = 0
+	g.Tab()
+	if g.CursorC != g.Cols-1 {
+		t.Errorf("Tab with all stops cleared: got %d, want %d", g.CursorC, g.Cols-1)
+	}
+}
+
+func TestGrid_InternLink_CapReturnsZero(t *testing.T) {
+	g := NewGrid(5, 20)
+	// Fill registry to maxLinkEntries distinct URLs.
+	for i := range maxLinkEntries {
+		url := "https://example.com/" + strconv.Itoa(i)
+		id := g.internLink(url)
+		if id == 0 {
+			t.Fatalf("internLink returned 0 at entry %d (before cap %d)", i, maxLinkEntries)
+		}
+	}
+	// Next unique URL must return 0 (registry full).
+	id := g.internLink("https://overflow.example.com")
+	if id != 0 {
+		t.Errorf("internLink beyond cap: got %d, want 0", id)
+	}
+	// Existing URL still resolves correctly.
+	id2 := g.internLink("https://example.com/0")
+	if id2 == 0 {
+		t.Error("existing URL in full registry should still return its ID, not 0")
+	}
+}
+
+func TestGrid_ScrollViewTop_PinsToOldestRow(t *testing.T) {
+	g := NewGrid(3, 5)
+	g.ScrollbackCap = 10
+	for range 5 {
+		g.scrollUpRegion(1)
+	}
+	sb := len(g.Scrollback)
+	if sb == 0 {
+		t.Skip("scrollback not populated")
+	}
+	g.ScrollViewTop()
+	if g.ViewOffset != sb {
+		t.Errorf("ViewOffset = %d, want %d (len(Scrollback))", g.ViewOffset, sb)
+	}
+	// Empty scrollback: ScrollViewTop is a no-op (ViewOffset stays 0).
+	g2 := NewGrid(3, 5)
+	g2.ScrollViewTop()
+	if g2.ViewOffset != 0 {
+		t.Errorf("empty scrollback: ViewOffset = %d, want 0", g2.ViewOffset)
+	}
+}
+
+func TestGrid_ViewportMatches_WithScrollback(t *testing.T) {
+	const rows, cols = 4, 10
+	g := NewGrid(rows, cols)
+	g.ScrollbackCap = 10
+	putRow(g, "hello")
+	g.scrollUpRegion(1)
+	if len(g.Scrollback) == 0 {
+		t.Skip("scrollback not populated")
+	}
+	// Scroll back so the "hello" row is visible in the viewport.
+	g.ViewOffset = 1
+	matches := g.ViewportMatches("hello")
+	if len(matches) == 0 {
+		t.Error("expected match for 'hello' in scrollback viewport, got none")
+	}
+	// At live view the "hello" row is not visible (live rows are blank).
+	g.ViewOffset = 0
+	matches = g.ViewportMatches("hello")
+	if len(matches) != 0 {
+		t.Errorf("expected no matches in live view, got %d", len(matches))
+	}
+}
+
+func TestGrid_Resize_Reflow_DeepScrollbackNarrow_CursorSurvives(t *testing.T) {
+	// Fill a wide grid with scrollback, then shrink to 1 column.
+	// Each wide row explodes into oldCols new rows; the allNew trim must
+	// keep the cursor row valid and scrollback within its cap.
+	const rows, cols = 5, 20
+	g := NewGrid(rows, cols)
+	g.ScrollbackCap = 50
+	for range 20 {
+		for c := range cols {
+			if cell := g.At(0, c); cell != nil {
+				cell.Ch = 'x'
+			}
+		}
+		g.scrollUpRegion(1)
+	}
+	g.CursorR, g.CursorC = rows-1, cols/2
+	g.Resize(rows, 1)
+
+	if g.CursorR < 0 || g.CursorR >= g.Rows {
+		t.Errorf("cursor row %d out of bounds [0,%d)", g.CursorR, g.Rows)
+	}
+	if g.CursorC < 0 || g.CursorC >= g.Cols {
+		t.Errorf("cursor col %d out of bounds [0,%d)", g.CursorC, g.Cols)
+	}
+	if g.At(g.CursorR, g.CursorC) == nil {
+		t.Error("cursor cell nil after narrow reflow")
+	}
+	if len(g.Scrollback) > g.ScrollbackCap {
+		t.Errorf("scrollback len %d exceeds cap %d", len(g.Scrollback), g.ScrollbackCap)
 	}
 }
