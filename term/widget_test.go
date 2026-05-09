@@ -754,3 +754,123 @@ func TestTerm_OnKeyDown_ModifiedCursorKeys(t *testing.T) {
 		}
 	}
 }
+
+// --- Kitty Keyboard Protocol (Phase 27) ---
+
+func TestKittyKeySeq_Disabled(t *testing.T) {
+	// flags==0 means legacy mode; must return nil for all inputs.
+	if got := kittyKeySeq(13, 0, 0); got != nil {
+		t.Fatalf("flags=0: got %q, want nil", got)
+	}
+}
+
+func TestKittyKeySeq_NoMods(t *testing.T) {
+	cases := []struct {
+		cp   int
+		want string
+	}{
+		{13, "\x1b[13u"},  // Enter
+		{9, "\x1b[9u"},   // Tab
+		{27, "\x1b[27u"}, // Escape
+		{127, "\x1b[127u"}, // Backspace
+	}
+	for _, c := range cases {
+		got := kittyKeySeq(c.cp, 0, 1)
+		if string(got) != c.want {
+			t.Errorf("cp=%d: got %q, want %q", c.cp, got, c.want)
+		}
+	}
+}
+
+func TestKittyKeySeq_WithMods(t *testing.T) {
+	cases := []struct {
+		cp   int
+		mods gui.Modifier
+		want string
+	}{
+		{13, gui.ModCtrl, "\x1b[13;5u"},              // Ctrl+Enter → mod=5
+		{127, gui.ModShift | gui.ModCtrl, "\x1b[127;6u"}, // Shift+Ctrl+Backspace → mod=6
+		{99, gui.ModCtrl, "\x1b[99;5u"},              // Ctrl+C
+		{97, gui.ModAlt, "\x1b[97;3u"},               // Alt+A → mod=3
+		{65, gui.ModSuper, "\x1b[65;9u"},             // Super+A → mod=9
+	}
+	for _, c := range cases {
+		got := kittyKeySeq(c.cp, c.mods, 1)
+		if string(got) != c.want {
+			t.Errorf("cp=%d mods=%v: got %q, want %q", c.cp, c.mods, got, c.want)
+		}
+	}
+}
+
+func TestTerm_KittyKey_Backspace(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.KittyKeyFlags = 1
+	e := &gui.Event{KeyCode: gui.KeyBackspace}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1b[127u" {
+		t.Fatalf("KKP backspace: got %q, want %q", got, "\x1b[127u")
+	}
+}
+
+func TestTerm_KittyKey_Enter(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.KittyKeyFlags = 1
+	e := &gui.Event{KeyCode: gui.KeyEnter}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1b[13u" {
+		t.Fatalf("KKP enter: got %q, want %q", got, "\x1b[13u")
+	}
+}
+
+func TestTerm_KittyKey_Tab(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.KittyKeyFlags = 1
+	e := &gui.Event{KeyCode: gui.KeyTab}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1b[9u" {
+		t.Fatalf("KKP tab: got %q, want %q", got, "\x1b[9u")
+	}
+}
+
+func TestTerm_KittyKey_Escape(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.KittyKeyFlags = 1
+	e := &gui.Event{KeyCode: gui.KeyEscape}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1b[27u" {
+		t.Fatalf("KKP escape: got %q, want %q", got, "\x1b[27u")
+	}
+}
+
+func TestTerm_KittyKey_CtrlC(t *testing.T) {
+	term, buf := newTestTermCapture()
+	term.grid.KittyKeyFlags = 1
+	// Ctrl+C: KeyCode=KeyC, Modifiers=ModCtrl. Codepoint for 'c' is 99.
+	e := &gui.Event{KeyCode: gui.KeyC, Modifiers: gui.ModCtrl}
+	term.onKeyDown(nil, e, &gui.Window{})
+	if got := string(*buf); got != "\x1b[99;5u" {
+		t.Fatalf("KKP Ctrl+C: got %q, want %q", got, "\x1b[99;5u")
+	}
+}
+
+func TestTerm_KittyKey_LegacyFallback(t *testing.T) {
+	// When KKP is disabled (flags=0), legacy sequences still emitted.
+	cases := []struct {
+		key  gui.KeyCode
+		want string
+	}{
+		{gui.KeyBackspace, "\x7f"},
+		{gui.KeyEnter, "\r"},
+		{gui.KeyTab, "\t"},
+		{gui.KeyEscape, "\x1b"},
+	}
+	for _, c := range cases {
+		term, buf := newTestTermCapture()
+		// flags=0 by default
+		e := &gui.Event{KeyCode: c.key}
+		term.onKeyDown(nil, e, &gui.Window{})
+		if got := string(*buf); got != c.want {
+			t.Errorf("legacy key=%v: got %q, want %q", c.key, got, c.want)
+		}
+	}
+}

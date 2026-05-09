@@ -376,6 +376,17 @@ type Grid struct {
 	SelAnchor ContentPos
 	SelHead   ContentPos
 	SelActive bool
+
+	// Kitty Keyboard Protocol state. KittyKeyFlags is the current effective
+	// flags bitset (0 = legacy mode). Flag bits:
+	//   1 (bit 0) — disambiguate escape codes (Tab≠Ctrl+I, Enter≠Ctrl+M, …)
+	//   2 (bit 1) — report event types (press/repeat/release)
+	//   4 (bit 2) — report alternate keys
+	//   8 (bit 3) — report all keys as escape codes
+	//  16 (bit 4) — report associated text
+	// kittyFlagStack supports CSI > u (push) / CSI < u (pop) nesting.
+	KittyKeyFlags  uint32
+	kittyFlagStack []uint32
 }
 
 // SelPos identifies a viewport cell (row, col). Kept for callers that
@@ -386,6 +397,39 @@ type SelPos struct{ Row, Col int }
 // Rows 0..len(Scrollback)-1 index scrollback oldest-first;
 // rows len(Scrollback)..len(Scrollback)+Rows-1 index the live grid.
 type ContentPos struct{ Row, Col int }
+
+// PushKittyKeyFlags saves the current KittyKeyFlags on the stack and ORs in
+// the new flags. Called by CSI > flags u. The stack is capped at 8 entries
+// so runaway nesting can't grow it without bound.
+func (g *Grid) PushKittyKeyFlags(flags uint32) {
+	const maxStack = 8
+	if len(g.kittyFlagStack) < maxStack {
+		g.kittyFlagStack = append(g.kittyFlagStack, g.KittyKeyFlags)
+	}
+	g.KittyKeyFlags |= flags
+}
+
+// PopKittyKeyFlags pops n entries from the KKP flag stack, restoring the
+// last pushed flags each time. Called by CSI < n u. Popping past an empty
+// stack sets flags to 0 (legacy mode).
+func (g *Grid) PopKittyKeyFlags(n int) {
+	if n < 1 {
+		n = 1
+	}
+	for range n {
+		if len(g.kittyFlagStack) == 0 {
+			g.KittyKeyFlags = 0
+			return
+		}
+		last := len(g.kittyFlagStack) - 1
+		g.KittyKeyFlags = g.kittyFlagStack[last]
+		g.kittyFlagStack = g.kittyFlagStack[:last]
+	}
+}
+
+// SetKittyKeyFlags sets KittyKeyFlags to flags without touching the stack.
+// Called by CSI = flags u.
+func (g *Grid) SetKittyKeyFlags(flags uint32) { g.KittyKeyFlags = flags }
 
 // selOrder returns the selection bounds in forward order (start <= end).
 func (g *Grid) selOrder() (start, end ContentPos) {

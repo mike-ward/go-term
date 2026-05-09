@@ -314,8 +314,9 @@ type Term struct {
 }
 
 type keyModes struct {
-	appCursor bool
-	appKeypad bool
+	appCursor     bool
+	appKeypad     bool
+	kittyKeyFlags uint32
 }
 
 // New starts a shell in a PTY and returns a Term widget. The reader
@@ -1117,6 +1118,24 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 	}
 	t.snapToLive()
 	r := rune(e.CharCode)
+
+	// KKP flag 8: report all printable keys as CSI u escape codes.
+	// The codepoint is the base (unshifted) form; Shift is in the modifier.
+	t.grid.Mu.Lock()
+	kkpFlags := t.grid.KittyKeyFlags
+	t.grid.Mu.Unlock()
+	if kkpFlags&8 != 0 {
+		cp := int(r)
+		if r >= 'A' && r <= 'Z' && e.Modifiers.Has(gui.ModShift) {
+			cp = int(r-'A') + 'a'
+		}
+		if seq := kittyKeySeq(cp, e.Modifiers, kkpFlags); seq != nil {
+			t.writeBytes(seq)
+			e.IsHandled = true
+			return
+		}
+	}
+
 	var buf [4]byte
 	n := utf8.EncodeRune(buf[:], r)
 	if n > 0 {
@@ -1590,9 +1609,41 @@ func (t *Term) keyModes() keyModes {
 	t.grid.Mu.Lock()
 	defer t.grid.Mu.Unlock()
 	return keyModes{
-		appCursor: t.grid.AppCursorKeys,
-		appKeypad: t.grid.AppKeypad,
+		appCursor:     t.grid.AppCursorKeys,
+		appKeypad:     t.grid.AppKeypad,
+		kittyKeyFlags: t.grid.KittyKeyFlags,
 	}
+}
+
+// kittyKeySeq encodes a key in Kitty Keyboard Protocol format: CSI codepoint u
+// or CSI codepoint ; modifiers u. Returns nil when flags == 0 (legacy mode).
+// The modifier parameter follows the KKP spec: 1=none, 2=shift, 3=shift+alt,
+// 5=ctrl, 6=shift+ctrl, 9=super, … (1 + sum of modifier bits).
+func kittyKeySeq(codepoint int, mods gui.Modifier, flags uint32) []byte {
+	if flags == 0 {
+		return nil
+	}
+	mod := 1
+	if mods.Has(gui.ModShift) {
+		mod += 1
+	}
+	if mods.Has(gui.ModAlt) {
+		mod += 2
+	}
+	if mods.Has(gui.ModCtrl) {
+		mod += 4
+	}
+	if mods.Has(gui.ModSuper) {
+		mod += 8
+	}
+	b := []byte("\x1b[")
+	b = strconv.AppendInt(b, int64(codepoint), 10)
+	if mod != 1 {
+		b = append(b, ';')
+		b = strconv.AppendInt(b, int64(mod), 10)
+	}
+	b = append(b, 'u')
+	return b
 }
 
 func keypadSeq(k gui.KeyCode) []byte {
@@ -1829,17 +1880,32 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	case gui.KeyPageDown:
 		out = []byte("\x1b[6~")
 	case gui.KeyEnter, gui.KeyKPEnter:
+		// Application keypad Enter takes priority; KKP applies to regular Enter.
 		if modes.appKeypad && e.KeyCode == gui.KeyKPEnter {
 			out = []byte("\x1bOM")
+		} else if kkp := kittyKeySeq(13, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+			out = kkp
 		} else {
 			out = []byte{'\r'}
 		}
 	case gui.KeyBackspace:
-		out = []byte{0x7F}
+		if kkp := kittyKeySeq(127, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+			out = kkp
+		} else {
+			out = []byte{0x7F}
+		}
 	case gui.KeyTab:
-		out = []byte{'\t'}
+		if kkp := kittyKeySeq(9, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+			out = kkp
+		} else {
+			out = []byte{'\t'}
+		}
 	case gui.KeyEscape:
-		out = []byte{0x1B}
+		if kkp := kittyKeySeq(27, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+			out = kkp
+		} else {
+			out = []byte{0x1B}
+		}
 	case gui.KeyUp:
 		if mod := modParam(shift, false, ctrl); mod != 0 {
 			out = modSS3('A', mod)
@@ -1911,10 +1977,15 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			out = []byte{byte('a' + (e.KeyCode - gui.KeyA))}
 			break
 		}
-		// Ctrl+letter → control byte. Letter keys are KeyA..KeyZ.
+		// Ctrl+letter → control byte, or KKP CSI u when active.
 		if e.Modifiers.Has(gui.ModCtrl) &&
 			e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
-			out = []byte{byte(e.KeyCode-gui.KeyA) + 1}
+			if kkp := kittyKeySeq(int('a')+int(e.KeyCode-gui.KeyA),
+				e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+				out = kkp
+			} else {
+				out = []byte{byte(e.KeyCode-gui.KeyA) + 1}
+			}
 		}
 	}
 	// Alt/Meta key: prefix any outbound sequence with ESC.

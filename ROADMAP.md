@@ -642,10 +642,26 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Modern TUI apps (Neovim, Emacs) need to distinguish `Tab` from `Ctrl+I` and handle complex chords like `Ctrl+Enter`.
 
-- [ ] `parser.go`: Handle `CSI > u` for enabling/disabling extended keyboard reporting modes.
-- [ ] `widget.go`: Update `onKeyDown` to emit `CSI u` encoded sequences when the host enables the protocol.
-- [ ] Support for reporting key release events and modifier-only events if requested.
-- [ ] Tests: Round-trip verification for complex key combinations.
+- [x] `parser.go`: Handle `CSI > u` (push flags), `CSI < u` (pop), `CSI = u` (set),
+      `CSI ? u` (query with reply). Leaders `>`, `<`, `=` added to `dispatchCSI`.
+      `grid.go`: `KittyKeyFlags uint32` + `kittyFlagStack []uint32` + `PushKittyKeyFlags`,
+      `PopKittyKeyFlags`, `SetKittyKeyFlags` methods (stack capped at 8).
+- [x] `widget.go`: `kittyKeySeq` helper encodes `CSI codepoint ; modifiers u`.
+      `onKeyDown` emits KKP sequences for Backspace (127), Enter (13), Tab (9),
+      Escape (27), and Ctrl+letters when `KittyKeyFlags != 0`; falls back to legacy
+      byte when flags == 0. `onChar` intercepts printable keys under flag 8 (all-
+      as-escape), mapping shifted letters to their base codepoint.
+      `keyModes` struct gains `kittyKeyFlags uint32` so the lock is taken only once.
+- [x] Key release and modifier-only events not implemented (go-gui does not surface
+      key-up events; flag bit 2 is accepted but has no effect).
+- [x] Tests: `TestParser_KittyKeyPush`, `TestParser_KittyKeyPop`,
+      `TestParser_KittyKeyPopN`, `TestParser_KittyKeyPopEmpty`,
+      `TestParser_KittyKeySet`, `TestParser_KittyKeyQuery`,
+      `TestParser_KittyKeyQueryZero`, `TestKittyKeySeq_Disabled`,
+      `TestKittyKeySeq_NoMods`, `TestKittyKeySeq_WithMods`,
+      `TestTerm_KittyKey_Backspace`, `TestTerm_KittyKey_Enter`,
+      `TestTerm_KittyKey_Tab`, `TestTerm_KittyKey_Escape`,
+      `TestTerm_KittyKey_CtrlC`, `TestTerm_KittyKey_LegacyFallback`.
 
 **Demo test:** Run `showkey -a` or a test script in Neovim to verify distinct key codes.
 

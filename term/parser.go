@@ -660,6 +660,30 @@ func (p *Parser) dispatchCSI(final byte) {
 				p.applyDECMode(true)
 			case 'l':
 				p.applyDECMode(false)
+			case 'u':
+				// KKP query: reply CSI ? flags u with current flags.
+				if p.onReply != nil {
+					b := make([]byte, 0, 16)
+					b = append(b, "\x1b[?"...)
+					b = strconv.AppendUint(b, uint64(p.g.KittyKeyFlags), 10)
+					b = append(b, 'u')
+					p.onReply(b)
+				}
+			}
+		case '>':
+			// CSI > flags u — push current flags, OR in new flags.
+			if final == 'u' {
+				p.g.PushKittyKeyFlags(uint32(p.param(0, 0)))
+			}
+		case '<':
+			// CSI < n u — pop n levels from KKP flag stack.
+			if final == 'u' {
+				p.g.PopKittyKeyFlags(p.param(0, 1))
+			}
+		case '=':
+			// CSI = flags u — set KKP flags without stack push.
+			if final == 'u' {
+				p.g.SetKittyKeyFlags(uint32(p.param(0, 0)))
 			}
 		}
 		return

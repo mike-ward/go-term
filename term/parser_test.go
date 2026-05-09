@@ -1620,3 +1620,92 @@ func TestParser_HTS_TBC_RoundTrip(t *testing.T) {
 	}
 }
 
+// --- Kitty Keyboard Protocol (Phase 27) ---
+
+func TestParser_KittyKeyPush(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	// CSI > 1 u — push 0, set flags=1.
+	feed(t, g, p, []byte("\x1b[>1u"))
+	if g.KittyKeyFlags != 1 {
+		t.Fatalf("after CSI>1u: flags=%d, want 1", g.KittyKeyFlags)
+	}
+	// CSI > 2 u — push 1, OR in 2 → flags=3.
+	feed(t, g, p, []byte("\x1b[>2u"))
+	if g.KittyKeyFlags != 3 {
+		t.Fatalf("after CSI>2u: flags=%d, want 3", g.KittyKeyFlags)
+	}
+	if len(g.kittyFlagStack) != 2 {
+		t.Fatalf("stack depth=%d, want 2", len(g.kittyFlagStack))
+	}
+}
+
+func TestParser_KittyKeyPop(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b[>1u")) // push → flags=1
+	feed(t, g, p, []byte("\x1b[>2u")) // push → flags=3
+	feed(t, g, p, []byte("\x1b[<1u")) // pop → flags=1
+	if g.KittyKeyFlags != 1 {
+		t.Fatalf("after pop: flags=%d, want 1", g.KittyKeyFlags)
+	}
+	feed(t, g, p, []byte("\x1b[<1u")) // pop → flags=0
+	if g.KittyKeyFlags != 0 {
+		t.Fatalf("after second pop: flags=%d, want 0", g.KittyKeyFlags)
+	}
+}
+
+func TestParser_KittyKeyPopN(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b[>1u")) // push 0 → flags=1
+	feed(t, g, p, []byte("\x1b[>2u")) // push 1 → flags=3
+	feed(t, g, p, []byte("\x1b[>4u")) // push 3 → flags=7
+	feed(t, g, p, []byte("\x1b[<2u")) // pop 2 → flags=1
+	if g.KittyKeyFlags != 1 {
+		t.Fatalf("after pop 2: flags=%d, want 1", g.KittyKeyFlags)
+	}
+}
+
+func TestParser_KittyKeyPopEmpty(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	g.KittyKeyFlags = 7
+	feed(t, g, p, []byte("\x1b[<1u")) // pop from empty stack → flags=0
+	if g.KittyKeyFlags != 0 {
+		t.Fatalf("pop empty: flags=%d, want 0", g.KittyKeyFlags)
+	}
+}
+
+func TestParser_KittyKeySet(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b[>1u"))  // push → flags=1
+	feed(t, g, p, []byte("\x1b[=5u"))  // set (no push) → flags=5
+	if g.KittyKeyFlags != 5 {
+		t.Fatalf("after CSI=5u: flags=%d, want 5", g.KittyKeyFlags)
+	}
+	// Stack should still have 1 entry (from the push).
+	if len(g.kittyFlagStack) != 1 {
+		t.Fatalf("stack depth=%d, want 1 (set does not push)", len(g.kittyFlagStack))
+	}
+}
+
+func TestParser_KittyKeyQuery(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	g.KittyKeyFlags = 3
+	var got []byte
+	p.SetReplyHandler(func(b []byte) { got = append(got, b...) })
+	feed(t, g, p, []byte("\x1b[?u"))
+	want := "\x1b[?3u"
+	if string(got) != want {
+		t.Fatalf("query reply: got %q, want %q", got, want)
+	}
+}
+
+func TestParser_KittyKeyQueryZero(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	var got []byte
+	p.SetReplyHandler(func(b []byte) { got = append(got, b...) })
+	feed(t, g, p, []byte("\x1b[?u"))
+	want := "\x1b[?0u"
+	if string(got) != want {
+		t.Fatalf("query zero: got %q, want %q", got, want)
+	}
+}
+
