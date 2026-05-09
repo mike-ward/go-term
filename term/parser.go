@@ -420,6 +420,23 @@ func (p *Parser) dispatchOSC() {
 		} else {
 			p.g.CurLinkID = p.g.internLink(uri)
 		}
+	case 133:
+		// Semantic shell integration (FinalTerm / iTerm2 protocol).
+		// Payload: single letter A–D optionally followed by ";key=value" pairs.
+		// Only the first byte determines the mark kind; extra params ignored.
+		if len(pt) == 0 {
+			return
+		}
+		switch pt[0] {
+		case 'A':
+			p.g.AddMark(MarkPromptStart)
+		case 'B':
+			p.g.AddMark(MarkCommandStart)
+		case 'C':
+			p.g.AddMark(MarkOutputStart)
+		case 'D':
+			p.g.AddMark(MarkCommandEnd)
+		}
 	case 52:
 		// Clipboard write: OSC 52;c;base64data ST
 		// c = clipboard target selector (we accept any value, treat as

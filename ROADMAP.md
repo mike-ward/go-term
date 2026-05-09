@@ -629,10 +629,10 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Unlocks power-user features like jumping between prompts and capturing command output.
 
-- [ ] `parser.go`: Handle `OSC 133;A` (Prompt start), `B` (Command start), `C` (Command end/exit code), `D` (Output end).
-- [ ] `grid.go`: Store command boundaries as "Marks" in the scrollback and live buffer.
-- [ ] `widget.go`: Add keyboard shortcuts (e.g., Cmd+Up/Down) to jump to the previous/next command mark.
-- [ ] Tests: Verify mark placement and retrieval across resizes and reflows.
+- [x] `parser.go`: Handle `OSC 133;A` (Prompt start), `B` (Command start), `C` (Command end/exit code), `D` (Output end).
+- [x] `grid.go`: Store command boundaries as "Marks" in the scrollback and live buffer.
+- [x] `widget.go`: Add keyboard shortcuts (e.g., Cmd+Up/Down) to jump to the previous/next command mark.
+- [x] Tests: Verify mark placement and retrieval across resizes and reflows.
 
 **Demo test:** `source shell-integration.zsh` (generic script) and verify command jumping works.
 

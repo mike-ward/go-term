@@ -236,6 +236,27 @@ type altSavedScreen struct {
 	saved            savedCursor
 }
 
+// MarkKind classifies an OSC 133 semantic shell-integration mark.
+type MarkKind uint8
+
+const (
+	MarkPromptStart  MarkKind = iota // OSC 133;A — beginning of prompt
+	MarkCommandStart                  // OSC 133;B — start of user input
+	MarkOutputStart                   // OSC 133;C — command submitted, output begins
+	MarkCommandEnd                    // OSC 133;D — command finished (optional exit code)
+)
+
+// Mark records a command-boundary position in content coordinates.
+// Row is a content row index (scrollback + live), stable across ViewOffset
+// changes. Adjusted when scrollback is trimmed or the grid is resized.
+type Mark struct {
+	Row  int
+	Kind MarkKind
+}
+
+// maxMarks caps the mark ring to avoid unbounded growth in very long sessions.
+const maxMarks = 10000
+
 // Grid is a fixed-size character grid. All public methods are safe for
 // concurrent callers via Mu; the parser writes under Mu, OnDraw reads
 // under Mu.
@@ -334,6 +355,11 @@ type Grid struct {
 	// when rendering cells. Set via Term.SetTheme; defaults to DefaultTheme.
 	Theme Theme
 
+	// Marks records OSC 133 semantic shell-integration boundaries in
+	// content-row coordinates (same space as ContentPos). Appended by
+	// AddMark; adjusted by scrollback trim and Resize; capped at maxMarks.
+	Marks []Mark
+
 	// Alt-screen state. EnterAlt swaps g.Cells with a fresh blank buffer
 	// and stashes main-screen state in mainSaved; ExitAlt restores it.
 	// While AltActive, scrollback writes are suppressed (kitty/iTerm/
@@ -388,6 +414,74 @@ func (g *Grid) MouseReporting() bool {
 // Bell increments BellCount. Called by the parser on 0x07 (BEL). Caller
 // holds Mu.
 func (g *Grid) Bell() { g.BellCount++ }
+
+// AddMark records an OSC 133 command boundary at the cursor's current
+// content row. Caller holds Mu. Marks in the alt screen are not recorded
+// (full-screen apps like vim/htop don't emit OSC 133).
+func (g *Grid) AddMark(kind MarkKind) {
+	if g.AltActive {
+		return
+	}
+	row := len(g.Scrollback) + g.CursorR
+	g.Marks = append(g.Marks, Mark{Row: row, Kind: kind})
+	if len(g.Marks) > maxMarks {
+		g.Marks = g.Marks[len(g.Marks)-maxMarks:]
+	}
+}
+
+// PrevMark returns the content row of the last mark of kind strictly
+// before row, and true. Returns 0, false when no such mark exists.
+// Caller holds Mu.
+func (g *Grid) PrevMark(row int, kind MarkKind) (int, bool) {
+	for i := len(g.Marks) - 1; i >= 0; i-- {
+		if g.Marks[i].Kind == kind && g.Marks[i].Row < row {
+			return g.Marks[i].Row, true
+		}
+	}
+	return 0, false
+}
+
+// NextMark returns the content row of the first mark of kind strictly
+// after row, and true. Returns 0, false when no such mark exists.
+// Caller holds Mu.
+func (g *Grid) NextMark(row int, kind MarkKind) (int, bool) {
+	for _, m := range g.Marks {
+		if m.Kind == kind && m.Row > row {
+			return m.Row, true
+		}
+	}
+	return 0, false
+}
+
+// trimMarks removes extra rows from the front of all mark row indices and
+// drops marks that fall below 0. Called after scrollback is trimmed.
+// Caller holds Mu.
+func (g *Grid) trimMarks(extra int) {
+	j := 0
+	for _, m := range g.Marks {
+		m.Row -= extra
+		if m.Row >= 0 {
+			g.Marks[j] = m
+			j++
+		}
+	}
+	g.Marks = g.Marks[:j]
+}
+
+// shiftMarks applies delta to all mark row indices, dropping marks that
+// fall outside [0, total). Called after resize changes scrollback depth.
+// Caller holds Mu.
+func (g *Grid) shiftMarks(delta, total int) {
+	j := 0
+	for _, m := range g.Marks {
+		m.Row += delta
+		if m.Row >= 0 && m.Row < total {
+			g.Marks[j] = m
+			j++
+		}
+	}
+	g.Marks = g.Marks[:j]
+}
 
 func (g *Grid) markDirty(r int) {
 	if r >= 0 && r < len(g.Dirty) {
@@ -982,6 +1076,12 @@ func (g *Grid) Resize(rows, cols int) {
 		g.SelAnchor.Row = clamp(g.SelAnchor.Row+delta, 0, total-1)
 		g.SelHead.Row = clamp(g.SelHead.Row+delta, 0, total-1)
 	}
+	// Shift mark rows by the same delta, dropping any that fell off.
+	if len(g.Marks) > 0 {
+		delta := len(g.Scrollback) - oldSbLen
+		total := len(g.Scrollback) + rows
+		g.shiftMarks(delta, total)
+	}
 }
 
 // At returns a pointer to the cell at (r,c) or nil if out of range.
@@ -1360,6 +1460,7 @@ func (g *Grid) scrollUpRegion(n int) {
 		if extra := len(g.Scrollback) - g.ScrollbackCap; extra > 0 {
 			g.Scrollback = g.Scrollback[extra:]
 			g.ScrollbackWrapped = g.ScrollbackWrapped[extra:]
+			g.trimMarks(extra)
 		}
 	}
 	// Shift surviving rows up.

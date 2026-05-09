@@ -1501,6 +1501,87 @@ func TestParser_TBC_ClearAll(t *testing.T) {
 	}
 }
 
+func TestParser_OSC133_PromptStart(t *testing.T) {
+	g, p := newParserGrid(4, 80)
+	feed(t, g, p, []byte("\x1b]133;A\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if len(g.Marks) != 1 {
+		t.Fatalf("want 1 mark, got %d", len(g.Marks))
+	}
+	if g.Marks[0].Kind != MarkPromptStart {
+		t.Errorf("kind: got %d, want MarkPromptStart", g.Marks[0].Kind)
+	}
+	// Cursor at row 0, no scrollback → content row 0.
+	if g.Marks[0].Row != 0 {
+		t.Errorf("row: got %d, want 0", g.Marks[0].Row)
+	}
+}
+
+func TestParser_OSC133_AllKinds(t *testing.T) {
+	tests := []struct {
+		seq  string
+		kind MarkKind
+	}{
+		{"\x1b]133;A\x07", MarkPromptStart},
+		{"\x1b]133;B\x07", MarkCommandStart},
+		{"\x1b]133;C\x07", MarkOutputStart},
+		{"\x1b]133;D\x07", MarkCommandEnd},
+	}
+	for _, tt := range tests {
+		g, p := newParserGrid(4, 80)
+		feed(t, g, p, []byte(tt.seq))
+		g.Mu.Lock()
+		n := len(g.Marks)
+		var kind MarkKind
+		if n > 0 {
+			kind = g.Marks[0].Kind
+		}
+		g.Mu.Unlock()
+		if n != 1 {
+			t.Errorf("seq %q: want 1 mark, got %d", tt.seq, n)
+			continue
+		}
+		if kind != tt.kind {
+			t.Errorf("seq %q: kind got %d, want %d", tt.seq, kind, tt.kind)
+		}
+	}
+}
+
+func TestParser_OSC133_UnknownSubcommandDropped(t *testing.T) {
+	g, p := newParserGrid(4, 80)
+	feed(t, g, p, []byte("\x1b]133;Z\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if len(g.Marks) != 0 {
+		t.Errorf("unknown subcommand: want 0 marks, got %d", len(g.Marks))
+	}
+}
+
+func TestParser_OSC133_ExtraParamsIgnored(t *testing.T) {
+	g, p := newParserGrid(4, 80)
+	// D;exitcode=0 is common from zsh/fish — only 'D' matters.
+	feed(t, g, p, []byte("\x1b]133;D;exitcode=0\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if len(g.Marks) != 1 || g.Marks[0].Kind != MarkCommandEnd {
+		t.Errorf("D with extra params: want 1 MarkCommandEnd, got %v", g.Marks)
+	}
+}
+
+func TestParser_OSC133_AltScreenSuppressed(t *testing.T) {
+	g, p := newParserGrid(4, 80)
+	g.Mu.Lock()
+	g.EnterAlt()
+	g.Mu.Unlock()
+	feed(t, g, p, []byte("\x1b]133;A\x07"))
+	g.Mu.Lock()
+	defer g.Mu.Unlock()
+	if len(g.Marks) != 0 {
+		t.Errorf("alt screen: want 0 marks, got %d", len(g.Marks))
+	}
+}
+
 func TestParser_HTS_TBC_RoundTrip(t *testing.T) {
 	g, p := newParserGrid(1, 80)
 	// Clear all, then set custom stops at 5 and 10.

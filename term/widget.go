@@ -1735,6 +1735,13 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		return
 	}
 
+	// Cmd+Up/Down: jump between OSC 133 prompt marks (shell integration).
+	if cmd && !ctrl && !alt && (e.KeyCode == gui.KeyUp || e.KeyCode == gui.KeyDown) {
+		t.jumpToMark(e.KeyCode == gui.KeyUp, w)
+		e.IsHandled = true
+		return
+	}
+
 	// While in search mode, intercept navigation and editing keys.
 	if t.searchActive {
 		switch e.KeyCode {
@@ -1954,6 +1961,40 @@ func (t *Term) scrollToBottom(w *gui.Window) {
 	t.showScrollbar()
 	t.bumpVersion()
 	w.UpdateWindow()
+}
+
+// jumpToMark scrolls the viewport to the previous (backward=true) or next
+// (backward=false) MarkPromptStart mark. No-op when no marks exist or no
+// mark is found in that direction. Suppressed while the alt screen is active.
+func (t *Term) jumpToMark(backward bool, w *gui.Window) {
+	t.grid.Mu.Lock()
+	if t.grid.AltActive {
+		t.grid.Mu.Unlock()
+		return
+	}
+	sb := len(t.grid.Scrollback)
+	off := clamp(t.grid.ViewOffset, 0, sb)
+	viewTop := sb - off
+	var row int
+	var ok bool
+	if backward {
+		row, ok = t.grid.PrevMark(viewTop, MarkPromptStart)
+	} else {
+		row, ok = t.grid.NextMark(viewTop, MarkPromptStart)
+	}
+	if ok {
+		if row >= sb {
+			t.grid.ViewOffset = 0
+		} else {
+			t.grid.ViewOffset = sb - row
+		}
+	}
+	t.grid.Mu.Unlock()
+	if ok {
+		t.showScrollbar()
+		t.bumpVersion()
+		w.UpdateWindow()
+	}
 }
 
 // searchJump finds the next (forward=true) or previous (forward=false) match
