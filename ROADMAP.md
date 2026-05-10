@@ -702,9 +702,16 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Allows scripts and tools to interact with or query the terminal state (e.g., changing themes per-project).
 
-- [ ] `parser.go`: Implement OSC sequences for querying/setting terminal state (e.g., Background color, window title, or font size).
-- [ ] `widget.go`: Handle requests for state that requires UI-thread synchronization.
-- [ ] Tests: Verify state changes and host replies for query sequences.
+- [x] `parser.go`: OSC 10/11/12 set (rgb:/# format) and query (?). `parseXColor`
+      parses all X11 component widths (1–4 hex digits). `oscHexWord` formats
+      16-bit components for replies. Reply sent via `onReply` as OSC string.
+- [x] `widget.go`: `drawCursor` block case uses `CursorColor` when set (OSC 12),
+      falling back to cell-inversion. Color changes mark all rows dirty so the
+      readLoop triggers a redraw without extra wiring.
+- [x] Tests: `TestParseXColor` (table-driven, all formats + invalid),
+      `TestParser_OSC10_SetForeground`, `TestParser_OSC11_SetBackground`,
+      `TestParser_OSC12_SetCursorColor`, `TestParser_OSC10_Query`,
+      `TestParser_OSC11_Query`, `TestParser_OSCDynColor_InvalidIgnored`.
 
 **Demo test:** `printf '\x1b]11;rgb:ff/00/00\x07'` to change the background to red.
 
@@ -731,7 +738,7 @@ pixels, so it survives scrolling and resizing.
 - [ ] `grid.go`: Cells covered by graphics need "placeholder" state to avoid text overstrike.
 - [ ] Tests: Verify Sixel decoding and correct placement relative to scrolling.
 
-**Demo test:** `img2sixel logo.png` renders the image inside the terminal.
+**Demo test:** `img2sixel_logo.png` renders the image inside the terminal.
 
 ## Critical files
 

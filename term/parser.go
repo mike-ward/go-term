@@ -418,6 +418,21 @@ func (p *Parser) dispatchOSC() {
 		// Working directory notification (iTerm/VTE convention).
 		// Payload is typically "file://host/path"; embedders parse.
 		p.g.Cwd = pt
+	case 10, 11, 12:
+		// Dynamic colors: 10=foreground, 11=background, 12=cursor.
+		// "?" queries the current color; anything else sets it.
+		if pt == "?" {
+			r, g, b := p.g.dynColorRGB(ps)
+			reply := "\x1b]" + strconv.Itoa(ps) + ";rgb:" +
+				oscHexWord(r) + "/" + oscHexWord(g) + "/" + oscHexWord(b) + "\x1b\\"
+			if p.onReply != nil {
+				p.onReply([]byte(reply))
+			}
+			return
+		}
+		if c, ok := parseXColor(pt); ok {
+			p.g.SetDynColor(ps, c)
+		}
 	case 8:
 		// Hyperlink: OSC 8;params;URI ST
 		// params (before the ';') may carry an id= hint for multiplexers;
@@ -470,6 +485,56 @@ func (p *Parser) dispatchOSC() {
 			p.onClipboard(data)
 		}
 	}
+}
+
+// parseXColor parses an X11 color string into a packed rgbColor.
+// Accepts "rgb:H/H/H" through "rgb:HHHH/HHHH/HHHH" and "#RRGGBB".
+func parseXColor(s string) (uint32, bool) {
+	if strings.HasPrefix(s, "rgb:") {
+		parts := strings.SplitN(s[4:], "/", 3)
+		if len(parts) != 3 {
+			return 0, false
+		}
+		var ch [3]uint8
+		for i, p := range parts {
+			if len(p) == 0 || len(p) > 4 {
+				return 0, false
+			}
+			n, err := strconv.ParseUint(p, 16, 64)
+			if err != nil {
+				return 0, false
+			}
+			// Scale to 8-bit. XParseColor convention: 1-digit repeats
+			// the nibble, 2-digit is exact, 3/4-digit take the high byte.
+			switch len(p) {
+			case 1:
+				ch[i] = uint8(n * 0x11)
+			case 2:
+				ch[i] = uint8(n)
+			case 3:
+				ch[i] = uint8(n >> 4)
+			case 4:
+				ch[i] = uint8(n >> 8)
+			}
+		}
+		return rgbColor(ch[0], ch[1], ch[2]), true
+	}
+	if len(s) == 7 && s[0] == '#' {
+		n, err := strconv.ParseUint(s[1:], 16, 32)
+		if err != nil {
+			return 0, false
+		}
+		return rgbColor(uint8(n>>16), uint8(n>>8), uint8(n)), true
+	}
+	return 0, false
+}
+
+// oscHexWord expands an 8-bit color component to a 4-hex-digit string
+// by repeating the byte (e.g. 0xAB → "abab"), matching xterm convention.
+func oscHexWord(n uint8) string {
+	v := uint16(n)<<8 | uint16(n)
+	const hx = "0123456789abcdef"
+	return string([]byte{hx[v>>12], hx[(v>>8)&0xF], hx[(v>>4)&0xF], hx[v&0xF]})
 }
 
 func appendReply(out []byte, body []byte) []byte {

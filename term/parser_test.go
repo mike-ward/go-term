@@ -3,6 +3,7 @@ package term
 import (
 	"bytes"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -1749,5 +1750,103 @@ func TestParser_KittyKeyQueryZero(t *testing.T) {
 	want := "\x1b[?0u"
 	if string(got) != want {
 		t.Fatalf("query zero: got %q, want %q", got, want)
+	}
+}
+
+func TestParseXColor(t *testing.T) {
+	cases := []struct {
+		in   string
+		r, g, b uint8
+		ok   bool
+	}{
+		{"rgb:ff/00/80", 0xFF, 0x00, 0x80, true},
+		{"rgb:ffff/0000/8080", 0xFF, 0x00, 0x80, true},
+		{"rgb:f/0/8", 0xFF, 0x00, 0x88, true}, // 1-digit: shift left 4
+		{"#ff0080", 0xFF, 0x00, 0x80, true},
+		{"rgb:gg/00/00", 0, 0, 0, false},
+		{"rgb:ff/00", 0, 0, 0, false},
+		{"#ff008", 0, 0, 0, false},
+		{"red", 0, 0, 0, false},
+	}
+	for _, tc := range cases {
+		c, ok := parseXColor(tc.in)
+		if ok != tc.ok {
+			t.Errorf("parseXColor(%q) ok=%v, want %v", tc.in, ok, tc.ok)
+			continue
+		}
+		if !ok {
+			continue
+		}
+		r, g, b := uint8(c>>16), uint8(c>>8), uint8(c)
+		if r != tc.r || g != tc.g || b != tc.b {
+			t.Errorf("parseXColor(%q) = rgb(%d,%d,%d), want rgb(%d,%d,%d)",
+				tc.in, r, g, b, tc.r, tc.g, tc.b)
+		}
+	}
+}
+
+func TestParser_OSC11_SetBackground(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b]11;rgb:ff/00/00\x07"))
+	g.Mu.Lock()
+	bg := g.Theme.DefaultBG
+	g.Mu.Unlock()
+	if bg.R != 0xFF || bg.G != 0 || bg.B != 0 {
+		t.Fatalf("DefaultBG = rgb(%d,%d,%d), want rgb(255,0,0)", bg.R, bg.G, bg.B)
+	}
+}
+
+func TestParser_OSC10_SetForeground(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b]10;#00ff80\x07"))
+	g.Mu.Lock()
+	fg := g.Theme.DefaultFG
+	g.Mu.Unlock()
+	if fg.R != 0x00 || fg.G != 0xFF || fg.B != 0x80 {
+		t.Fatalf("DefaultFG = rgb(%d,%d,%d), want rgb(0,255,128)", fg.R, fg.G, fg.B)
+	}
+}
+
+func TestParser_OSC12_SetCursorColor(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	feed(t, g, p, []byte("\x1b]12;rgb:00/80/ff\x07"))
+	g.Mu.Lock()
+	cc := g.CursorColor
+	g.Mu.Unlock()
+	if uint8(cc>>16) != 0x00 || uint8(cc>>8) != 0x80 || uint8(cc) != 0xFF {
+		t.Fatalf("CursorColor = %06x, want 0080ff", cc&0xFFFFFF)
+	}
+}
+
+func TestParser_OSC10_Query(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	// DefaultTheme fg is rgb(229,229,229) → e5e5/e5e5/e5e5
+	var got []byte
+	p.SetReplyHandler(func(b []byte) { got = append(got, b...) })
+	feed(t, g, p, []byte("\x1b]10;?\x07"))
+	if !strings.HasPrefix(string(got), "\x1b]10;rgb:") {
+		t.Fatalf("OSC 10 query reply = %q, want prefix \\x1b]10;rgb:", got)
+	}
+}
+
+func TestParser_OSC11_Query(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	var got []byte
+	p.SetReplyHandler(func(b []byte) { got = append(got, b...) })
+	feed(t, g, p, []byte("\x1b]11;?\x07"))
+	if !strings.HasPrefix(string(got), "\x1b]11;rgb:") {
+		t.Fatalf("OSC 11 query reply = %q, want prefix \\x1b]11;rgb:", got)
+	}
+}
+
+func TestParser_OSCDynColor_InvalidIgnored(t *testing.T) {
+	g, p := newParserGrid(4, 8)
+	origFG := g.Theme.DefaultFG
+	feed(t, g, p, []byte("\x1b]10;notacolor\x07"))
+	g.Mu.Lock()
+	fg := g.Theme.DefaultFG
+	g.Mu.Unlock()
+	if fg != origFG {
+		t.Fatalf("invalid color changed DefaultFG: got rgb(%d,%d,%d)", fg.R, fg.G, fg.B)
 	}
 }

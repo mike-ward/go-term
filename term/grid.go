@@ -12,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/mike-ward/go-gui/gui"
 	"github.com/rivo/uniseg"
 )
 
@@ -309,6 +310,9 @@ type Grid struct {
 	// Cfg.CursorBlink without overriding shape.
 	CursorShape CursorShape
 	CursorBlink bool
+	// CursorColor is the fill color for the block cursor, set via OSC 12.
+	// DefaultColor means "invert the cell under the cursor" (the default).
+	CursorColor uint32
 
 	// Mouse reporting modes. Multiple may be active at once; the
 	// widget emits the broadest report any of them enables. SGR
@@ -564,6 +568,43 @@ func (g *Grid) markAllDirty() {
 	}
 }
 
+// SetDynColor updates the OSC dynamic color for ps (10=foreground,
+// 11=background, 12=cursor). c must be an rgbColor-tagged packed value.
+// Marks all rows dirty so the next render picks up the change.
+// Called from the parser while Mu is held.
+func (g *Grid) SetDynColor(ps int, c uint32) {
+	col := gui.RGB(uint8(c>>16), uint8(c>>8), uint8(c))
+	switch ps {
+	case 10:
+		g.Theme.DefaultFG = col
+	case 11:
+		g.Theme.DefaultBG = col
+	case 12:
+		g.CursorColor = c
+	}
+	g.markAllDirty()
+}
+
+// dynColorRGB returns the r,g,b components of the dynamic color for ps.
+// 10=foreground, 11=background, 12=cursor (falls back to DefaultFG when
+// CursorColor is unset). Called from the parser while Mu is held.
+func (g *Grid) dynColorRGB(ps int) (r, gr, b uint8) {
+	switch ps {
+	case 10:
+		c := g.Theme.DefaultFG
+		return c.R, c.G, c.B
+	case 11:
+		c := g.Theme.DefaultBG
+		return c.R, c.G, c.B
+	default: // 12 = cursor
+		if g.CursorColor != DefaultColor {
+			return uint8(g.CursorColor >> 16), uint8(g.CursorColor >> 8), uint8(g.CursorColor)
+		}
+		c := g.Theme.DefaultFG
+		return c.R, c.G, c.B
+	}
+}
+
 // HasDirtyRows reports whether any row is marked dirty since the last
 // ClearDirty call. Called under Mu by the widget's readLoop.
 func (g *Grid) HasDirtyRows() bool {
@@ -686,6 +727,7 @@ func NewGrid(rows, cols int) *Grid {
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
 		CursorBlink:   false,
+		CursorColor:   DefaultColor,
 		Top:           0,
 		Bottom:        rows - 1,
 		Theme:         DefaultTheme,

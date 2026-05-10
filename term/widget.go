@@ -1025,7 +1025,11 @@ func (t *Term) drawCursor(dc *gui.DrawContext, col, row int, cell Cell,
 		}
 		dc.FilledRect(x, y, w, t.cellH, t.grid.Theme.fg(cell))
 	default: // CursorBlock
-		dc.FilledRect(x, y, t.cellW, t.cellH, t.grid.Theme.fg(cell))
+		fillColor := t.grid.Theme.fg(cell)
+		if t.grid.CursorColor != DefaultColor {
+			fillColor = gui.RGB(uint8(t.grid.CursorColor>>16), uint8(t.grid.CursorColor>>8), uint8(t.grid.CursorColor))
+		}
+		dc.FilledRect(x, y, t.cellW, t.cellH, fillColor)
 		cs := style
 		cs.Color = t.grid.Theme.bg(cell)
 		dc.Text(x, y, runeString(cell.Ch), cs)
@@ -1123,7 +1127,7 @@ func (t *Term) drawSearchBar(dc *gui.DrawContext, rows, cols int, style gui.Text
 	case t.searchRegex:
 		label = "/re/ " + t.searchQuery + "▌"
 	default:
-		label = "Find: " + t.searchQuery + "▌"
+		label = "Find (^R=regex): " + t.searchQuery + "▌"
 	}
 	cs := style
 	cs.Color = gui.RGB(220, 220, 220)
