@@ -298,10 +298,11 @@ type Grid struct {
 	// (?1006) is an encoding flag layered on top — without it, the
 	// widget drops reports rather than fall back to legacy X10
 	// byte-encoding.
-	MouseTrack    bool // ?1000 — button press/release
-	MouseTrackBtn bool // ?1002 — press/release + drag (button held)
-	MouseTrackAny bool // ?1003 — any motion, even with no button
-	MouseSGR      bool // ?1006 — SGR-style "<b;c;rM/m" encoding
+	MouseTrack     bool // ?1000 — button press/release
+	MouseTrackBtn  bool // ?1002 — press/release + drag (button held)
+	MouseTrackAny  bool // ?1003 — any motion, even with no button
+	MouseSGR       bool // ?1006 — SGR-style "<b;c;rM/m" encoding
+	MouseSGRPixels bool // ?1016 — pixel-precise coordinates in SGR reports
 
 	// Cwd is the most recent value reported via OSC 7 (e.g.
 	// "file://host/path"). Embedders read it through Term.Cwd().

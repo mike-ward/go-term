@@ -829,6 +829,8 @@ func (p *Parser) applyDECMode(set bool) {
 			p.g.MouseTrackAny = set
 		case 1006: // mouse: SGR encoding
 			p.g.MouseSGR = set
+		case 1016: // mouse: SGR pixel-precise coordinates
+			p.g.MouseSGRPixels = set
 		}
 	}
 }

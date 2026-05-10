@@ -1090,3 +1090,47 @@ func TestTerm_KittyKey_LegacyFallback(t *testing.T) {
 		}
 	}
 }
+
+func TestParser_MousePixelMode_Toggle(t *testing.T) {
+	g := NewGrid(5, 10)
+	p := NewParser(g)
+	p.Feed([]byte("\x1b[?1016h"))
+	if !g.MouseSGRPixels {
+		t.Error("?1016h should set MouseSGRPixels")
+	}
+	p.Feed([]byte("\x1b[?1016l"))
+	if g.MouseSGRPixels {
+		t.Error("?1016l should clear MouseSGRPixels")
+	}
+}
+
+func TestWriteMouse_CellVsPixelCoords(t *testing.T) {
+	cases := []struct {
+		name   string
+		col    int
+		row    int
+		pixX   float32
+		pixY   float32
+		pixels bool
+		press  bool
+		want   string
+	}{
+		// Cell mode: col+1 / row+1
+		{"cell press", 4, 9, 50.0, 90.0, false, true, "\x1b[<0;5;10M"},
+		{"cell release", 0, 0, 0, 0, false, false, "\x1b[<0;1;1m"},
+		// Pixel mode: int(pixX)+1 / int(pixY)+1
+		{"pixel press", 4, 9, 50.7, 90.3, true, true, "\x1b[<0;51;91M"},
+		{"pixel release", 0, 0, 9.9, 19.1, true, false, "\x1b[<0;10;20m"},
+		// Pixel mode at origin maps to (1,1) per 1-based spec
+		{"pixel origin", 3, 3, 0, 0, true, true, "\x1b[<0;1;1M"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tm, buf := newTestTermCapture()
+			tm.writeMouse(0, c.col, c.row, c.pixX, c.pixY, c.pixels, c.press)
+			if got := string(*buf); got != c.want {
+				t.Errorf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}

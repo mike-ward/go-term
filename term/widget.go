@@ -1198,6 +1198,7 @@ type mouseSnap struct {
 	drag   bool // ?1002
 	any    bool // ?1003
 	sgr    bool // ?1006
+	pixels bool // ?1016 — pixel-precise SGR coordinates
 	live   bool // ViewOffset == 0
 }
 
@@ -1209,6 +1210,7 @@ func (t *Term) mouseSnap() mouseSnap {
 		drag:   t.grid.MouseTrackBtn,
 		any:    t.grid.MouseTrackAny,
 		sgr:    t.grid.MouseSGR,
+		pixels: t.grid.MouseSGRPixels,
 		live:   t.grid.ViewOffset == 0,
 	}
 }
@@ -1218,11 +1220,17 @@ func (t *Term) mouseSnap() mouseSnap {
 // encoding on, and a live viewport.
 func (m mouseSnap) shouldReport() bool { return m.report && m.sgr && m.live }
 
-// writeMouse emits an SGR-1006 mouse report. Allocates a small stack-
-// sized buffer; the per-event cost is the strconv.AppendInt path.
-func (t *Term) writeMouse(cb, col, row int, press bool) {
-	var buf [24]byte
-	out := encodeMouseSGR(buf[:0], cb, col, row, press)
+// writeMouse emits an SGR mouse report. When pixels is true (?1016 active),
+// pixX/pixY (0-based widget pixels) are used; otherwise col/row (0-based
+// cell indices) are used. Both forms report 1-based coordinates per spec.
+func (t *Term) writeMouse(cb, col, row int, pixX, pixY float32, pixels, press bool) {
+	var buf [32]byte
+	var out []byte
+	if pixels {
+		out = encodeMouseSGR(buf[:0], cb, int(pixX), int(pixY), press)
+	} else {
+		out = encodeMouseSGR(buf[:0], cb, col, row, press)
+	}
 	if err := t.writeHost(out); err != nil {
 		log.Printf("term: pty mouse: %v", err)
 	}
@@ -1246,7 +1254,7 @@ func (t *Term) onClick(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			return
 		}
 		cb := base + mouseModBits(e.Modifiers)
-		t.writeMouse(cb, c, r, true)
+		t.writeMouse(cb, c, r, e.MouseX, e.MouseY, snap.pixels, true)
 		t.dragging = true
 		t.dragButton = e.MouseButton
 		t.dragReport = true
@@ -1298,12 +1306,12 @@ func (t *Term) onMouseMove(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 				return
 			}
 			cb := base + mouseModBits(e.Modifiers) + 32
-			t.writeMouse(cb, c, r, true)
+			t.writeMouse(cb, c, r, e.MouseX, e.MouseY, snap.pixels, true)
 			t.lastMouseR, t.lastMouseC = r, c
 			return
 		case !t.dragging && snap.any:
 			cb := 35 + mouseModBits(e.Modifiers) // 3+32 = motion, no button
-			t.writeMouse(cb, c, r, true)
+			t.writeMouse(cb, c, r, e.MouseX, e.MouseY, snap.pixels, true)
 			t.lastMouseR, t.lastMouseC = r, c
 			return
 		}
@@ -1384,7 +1392,7 @@ func (t *Term) onMouseUp(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			base, ok := mouseSGRBaseButton(t.dragButton)
 			if ok {
 				cb := base + mouseModBits(e.Modifiers)
-				t.writeMouse(cb, c, r, false)
+				t.writeMouse(cb, c, r, e.MouseX, e.MouseY, snap.pixels, false)
 			}
 		}
 		t.dragging = false
@@ -1493,7 +1501,7 @@ func (t *Term) onMouseScroll(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		if e.ScrollY < 0 {
 			base = 65
 		}
-		t.writeMouse(base+mouseModBits(e.Modifiers), c, r, true)
+		t.writeMouse(base+mouseModBits(e.Modifiers), c, r, e.MouseX, e.MouseY, snap.pixels, true)
 		e.IsHandled = true
 		return
 	}

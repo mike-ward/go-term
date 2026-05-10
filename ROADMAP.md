@@ -678,9 +678,9 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** High-precision mouse coordinates for advanced TUI drawing/interactions and pixel-perfect clicking.
 
-- [ ] `parser.go`: Track DEC private mode `?1016 h/l` (SGR-Pixels).
-- [ ] `widget.go`: Update `encodeMouseSGR` to emit pixel-relative coordinates instead of 1-based cell coordinates when mode 1016 is active.
-- [ ] Tests: Verify pixel vs cell coordinate math.
+- [x] `parser.go`: Track DEC private mode `?1016 h/l` (SGR-Pixels).
+- [x] `widget.go`: Update `encodeMouseSGR` to emit pixel-relative coordinates instead of 1-based cell coordinates when mode 1016 is active.
+- [x] Tests: Verify pixel vs cell coordinate math.
 
 **Demo test:** A TUI app that requires pixel-perfect clicks (e.g., a drawing tool) behaves correctly.
 
