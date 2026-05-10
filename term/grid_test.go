@@ -2,6 +2,7 @@ package term
 
 import (
 	"math"
+	"regexp"
 	"strconv"
 	"testing"
 )
@@ -1957,6 +1958,164 @@ func TestGrid_ViewportMatches_AltActiveReturnsNil(t *testing.T) {
 	g.EnterAlt()
 	if m := g.ViewportMatches("hello"); m != nil {
 		t.Errorf("ViewportMatches during alt = %v, want nil", m)
+	}
+}
+
+func TestGrid_FindRegex_Forward(t *testing.T) {
+	g := NewGrid(3, 20)
+	putRow(g, "hello world")
+	sb := len(g.Scrollback)
+	re := regexp.MustCompile(`w\w+`)
+	pos, l, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
+	if !ok {
+		t.Fatal("FindRegex did not find 'w\\w+'")
+	}
+	if pos.Row != sb || pos.Col != 6 {
+		t.Errorf("FindRegex pos {%d,%d}, want {%d,6}", pos.Row, pos.Col, sb)
+	}
+	if l != 5 { // "world"
+		t.Errorf("FindRegex match len %d, want 5", l)
+	}
+}
+
+func TestGrid_FindRegex_Backward(t *testing.T) {
+	g := NewGrid(3, 20)
+	putRow(g, "foo bar foo")
+	sb := len(g.Scrollback)
+	re := regexp.MustCompile(`foo`)
+	// Start after the second "foo" → backward search should find second "foo" first.
+	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb, Col: 11}, false)
+	if !ok {
+		t.Fatal("FindRegex backward did not find 'foo'")
+	}
+	if pos.Col != 8 {
+		t.Errorf("FindRegex backward col %d, want 8", pos.Col)
+	}
+}
+
+func TestGrid_FindRegex_NoMatch(t *testing.T) {
+	g := NewGrid(3, 20)
+	putRow(g, "hello world")
+	re := regexp.MustCompile(`\d+`)
+	_, _, ok := g.FindRegex(re, ContentPos{}, true)
+	if ok {
+		t.Error("FindRegex should return false for no match")
+	}
+}
+
+func TestGrid_FindRegex_Wrap(t *testing.T) {
+	g := NewGrid(2, 20)
+	putRow(g, "target99")
+	g.CursorR = 1
+	g.CursorC = 0
+	for range 20 {
+		g.Put(' ')
+	}
+	sb := len(g.Scrollback)
+	re := regexp.MustCompile(`target\d+`)
+	// Start past the match row; forward search should wrap.
+	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb + 1, Col: 0}, true)
+	if !ok {
+		t.Fatal("FindRegex did not wrap forward")
+	}
+	if pos.Row != sb || pos.Col != 0 {
+		t.Errorf("FindRegex wrap: {%d,%d}, want {%d,0}", pos.Row, pos.Col, sb)
+	}
+}
+
+func TestGrid_FindRegex_IPAddress(t *testing.T) {
+	g := NewGrid(3, 40)
+	putRow(g, "addr 192.168.1.1 end")
+	sb := len(g.Scrollback)
+	re := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}`)
+	pos, l, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
+	if !ok {
+		t.Fatal("FindRegex did not find IP address")
+	}
+	if pos.Col != 5 {
+		t.Errorf("FindRegex IP col %d, want 5", pos.Col)
+	}
+	if l != 11 { // "192.168.1.1"
+		t.Errorf("FindRegex IP len %d, want 11", l)
+	}
+}
+
+func TestGrid_FindRegex_InScrollback(t *testing.T) {
+	const rows, cols = 3, 20
+	g := NewGrid(rows, cols)
+	g.ScrollbackCap = 10
+	putRow(g, "error: 42")
+	g.scrollUpRegion(1)
+	if len(g.Scrollback) == 0 {
+		t.Skip("scrollback not populated")
+	}
+	sb := len(g.Scrollback)
+	re := regexp.MustCompile(`error: \d+`)
+	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
+	if !ok {
+		t.Fatal("FindRegex did not find match in scrollback")
+	}
+	if pos.Row >= sb {
+		t.Errorf("FindRegex found match in live grid (row %d), expected scrollback (row < %d)", pos.Row, sb)
+	}
+}
+
+func TestGrid_FindRegex_NilPattern(t *testing.T) {
+	g := NewGrid(3, 20)
+	putRow(g, "hello")
+	_, _, ok := g.FindRegex(nil, ContentPos{}, true)
+	if ok {
+		t.Error("FindRegex with nil pattern should return false")
+	}
+}
+
+func TestGrid_ViewportMatchesRegex_Basic(t *testing.T) {
+	g := NewGrid(2, 30)
+	putRow(g, "foo 123 bar 456")
+	re := regexp.MustCompile(`\d+`)
+	matches := g.ViewportMatchesRegex(re)
+	if len(matches) != 2 {
+		t.Fatalf("ViewportMatchesRegex found %d matches, want 2", len(matches))
+	}
+	if matches[0].Col != 4 || matches[0].Len != 3 {
+		t.Errorf("first match col=%d len=%d, want col=4 len=3", matches[0].Col, matches[0].Len)
+	}
+	if matches[1].Col != 12 || matches[1].Len != 3 {
+		t.Errorf("second match col=%d len=%d, want col=12 len=3", matches[1].Col, matches[1].Len)
+	}
+}
+
+func TestGrid_ViewportMatchesRegex_VariableLen(t *testing.T) {
+	g := NewGrid(2, 30)
+	putRow(g, "a bb ccc")
+	re := regexp.MustCompile(`[a-z]+`)
+	matches := g.ViewportMatchesRegex(re)
+	if len(matches) != 3 {
+		t.Fatalf("ViewportMatchesRegex found %d matches, want 3", len(matches))
+	}
+	wantLens := []int{1, 2, 3}
+	for i, m := range matches {
+		if m.Len != wantLens[i] {
+			t.Errorf("match %d len=%d, want %d", i, m.Len, wantLens[i])
+		}
+	}
+}
+
+func TestGrid_ViewportMatchesRegex_AltActiveReturnsNil(t *testing.T) {
+	g := NewGrid(2, 20)
+	putRow(g, "hello")
+	g.EnterAlt()
+	re := regexp.MustCompile(`hello`)
+	if m := g.ViewportMatchesRegex(re); m != nil {
+		t.Errorf("ViewportMatchesRegex during alt = %v, want nil", m)
+	}
+}
+
+func TestGrid_ViewportMatchesRegex_NilPatternReturnsNil(t *testing.T) {
+	g := NewGrid(2, 20)
+	putRow(g, "hello")
+	if m := g.ViewportMatchesRegex(nil); m != nil {
+		t.Errorf("ViewportMatchesRegex(nil) = %v, want nil", m)
 	}
 }
 

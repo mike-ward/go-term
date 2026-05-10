@@ -690,9 +690,9 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Finding patterns like IP addresses, Git hashes, or specific error formats in large logs.
 
-- [ ] `grid.go`: Upgrade the `Find` helper to support `regexp.Regexp` patterns.
-- [ ] `widget.go`: Update the search UI to allow toggling between plain-text and regex modes.
-- [ ] Tests: Verify complex regex matches across multi-line wrapped content.
+- [x] `grid.go`: Upgrade the `Find` helper to support `regexp.Regexp` patterns.
+- [x] `widget.go`: Update the search UI to allow toggling between plain-text and regex modes.
+- [x] Tests: Verify complex regex matches across multi-line wrapped content.
 
 **Demo test:** Cmd+F, toggle regex, search for `[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}` to find IPs.
 

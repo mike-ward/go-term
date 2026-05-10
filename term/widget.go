@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -284,8 +285,11 @@ type Term struct {
 	// onKeyDown, onDraw) — no lock required.
 	searchActive  bool
 	searchQuery   string
-	searchMatches []ContentPos // viewport matches refreshed each onDraw
-	searchIdx     int          // index of last jump target in searchMatches
+	searchMatches []SearchMatch // viewport matches refreshed each onDraw
+	searchIdx     int           // index of last jump target in searchMatches
+	searchRegex   bool          // true: match via re instead of plain text
+	searchRE      *regexp.Regexp
+	searchREErr   error
 
 	// Bell flash state. Both fields are main-thread only (written inside
 	// QueueCommand callbacks and read in onDraw). bellSeenCount tracks
@@ -775,19 +779,19 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 	// Pre-map search matches and selection to viewport rows to avoid O(N)
 	// checks inside the per-cell loop.
 	type vMatch struct{ col, len int }
-	var (
-		vMatchesByRow [][]vMatch
-		qRunes        []rune
-	)
+	var vMatchesByRow [][]vMatch
 	if t.searchActive && t.searchQuery != "" {
 		vMatchesByRow = make([][]vMatch, rows)
-		matches := g.ViewportMatches(t.searchQuery)
-		qRunes = []rune(t.searchQuery)
+		var matches []SearchMatch
+		if t.searchRegex && t.searchRE != nil {
+			matches = g.ViewportMatchesRegex(t.searchRE)
+		} else if !t.searchRegex {
+			matches = g.ViewportMatches(t.searchQuery)
+		}
 		t.searchMatches = matches
-		qLen := len(qRunes)
 		for _, m := range matches {
 			if vr, ok := g.ContentRowToViewport(m.Row); ok && vr < rows {
-				vMatchesByRow[vr] = append(vMatchesByRow[vr], vMatch{m.Col, qLen})
+				vMatchesByRow[vr] = append(vMatchesByRow[vr], vMatch{m.Col, m.Len})
 			}
 		}
 	}
@@ -1112,11 +1116,31 @@ func (t *Term) drawSearchBar(dc *gui.DrawContext, rows, cols int, style gui.Text
 		bgColor = gui.RGB(90, 20, 20)
 	}
 	dc.FilledRect(0, y, float32(cols)*t.cellW, t.cellH, bgColor)
-	label := "Find: " + t.searchQuery + "▌"
+	var label string
+	switch {
+	case t.searchRegex && t.searchREErr != nil:
+		label = "/re/ " + t.searchQuery + " [invalid]▌"
+	case t.searchRegex:
+		label = "/re/ " + t.searchQuery + "▌"
+	default:
+		label = "Find: " + t.searchQuery + "▌"
+	}
 	cs := style
 	cs.Color = gui.RGB(220, 220, 220)
 	cs.Typeface = glyph.TypefaceRegular
 	dc.Text(0, y, label, cs)
+}
+
+// recompileSearchRE compiles searchQuery into searchRE when regex mode is
+// active. Clears searchRE and searchREErr when not in regex mode or when the
+// query is empty.
+func (t *Term) recompileSearchRE() {
+	if t.searchRegex && t.searchQuery != "" {
+		t.searchRE, t.searchREErr = regexp.Compile(t.searchQuery)
+	} else {
+		t.searchRE = nil
+		t.searchREErr = nil
+	}
 }
 
 // onChar receives printable character input from the OS.
@@ -1127,6 +1151,7 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 	if t.searchActive {
 		if utf8.RuneCountInString(t.searchQuery) < MaxGridDim {
 			t.searchQuery += string(rune(e.CharCode))
+			t.recompileSearchRE()
 		}
 		e.IsHandled = true
 		t.bumpVersion()
@@ -1833,6 +1858,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			if len(t.searchQuery) > 0 {
 				rr := []rune(t.searchQuery)
 				t.searchQuery = string(rr[:len(rr)-1])
+				t.recompileSearchRE()
 				t.bumpVersion()
 				w.UpdateWindow()
 			}
@@ -1842,6 +1868,13 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 			t.searchMatches = nil
 			t.bumpVersion()
 			w.UpdateWindow()
+		case gui.KeyR:
+			if ctrl {
+				t.searchRegex = !t.searchRegex
+				t.recompileSearchRE()
+				t.bumpVersion()
+				w.UpdateWindow()
+			}
 		}
 		e.IsHandled = true
 		return
@@ -2205,11 +2238,19 @@ func (t *Term) searchJump(forward bool, w *gui.Window) {
 	sb := len(g.Scrollback)
 	var start ContentPos
 	if len(t.searchMatches) > 0 && t.searchIdx < len(t.searchMatches) {
-		start = t.searchMatches[t.searchIdx]
+		start = t.searchMatches[t.searchIdx].ContentPos
 	} else {
 		start = ContentPos{Row: sb - clamp(g.ViewOffset, 0, sb)}
 	}
-	pos, ok := g.Find(t.searchQuery, start, forward)
+	var (
+		pos ContentPos
+		ok  bool
+	)
+	if t.searchRegex && t.searchRE != nil {
+		pos, _, ok = g.FindRegex(t.searchRE, start, forward)
+	} else if !t.searchRegex {
+		pos, ok = g.Find(t.searchQuery, start, forward)
+	}
 	if ok {
 		liveRow := pos.Row - sb
 		if liveRow >= 0 {
