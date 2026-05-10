@@ -652,16 +652,23 @@ pixels, so it survives scrolling and resizing.
       byte when flags == 0. `onChar` intercepts printable keys under flag 8 (all-
       as-escape), mapping shifted letters to their base codepoint.
       `keyModes` struct gains `kittyKeyFlags uint32` so the lock is taken only once.
-- [x] Key release and modifier-only events not implemented (go-gui does not surface
-      key-up events; flag bit 2 is accepted but has no effect).
+- [x] Key release and modifier-only events implemented using go-gui's OnKeyUp callback.
+      Flag bit 2 (report event types) generates CSI codepoint ; modifiers :3 u (event-type
+      3 = release) for key releases. Modifier field is always emitted when event-type is
+      present (mod=1 for no modifiers). Functional and nav keys use KKP private-use-area
+      codepoints (Insert=57348, Delete=57349, arrows=57350-57353, PageUp/Down=57354-57355,
+      Home/End=57356-57357, F1-F12=57364-57375). Left vs. right modifiers use distinct
+      codepoints (e.g. Left Shift=57441, Right Shift=57447).
 - [x] Tests: `TestParser_KittyKeyPush`, `TestParser_KittyKeyPop`,
       `TestParser_KittyKeyPopN`, `TestParser_KittyKeyPopEmpty`,
       `TestParser_KittyKeySet`, `TestParser_KittyKeyQuery`,
       `TestParser_KittyKeyQueryZero`, `TestKittyKeySeq_Disabled`,
       `TestKittyKeySeq_NoMods`, `TestKittyKeySeq_WithMods`,
-      `TestTerm_KittyKey_Backspace`, `TestTerm_KittyKey_Enter`,
-      `TestTerm_KittyKey_Tab`, `TestTerm_KittyKey_Escape`,
-      `TestTerm_KittyKey_CtrlC`, `TestTerm_KittyKey_LegacyFallback`.
+      `TestKittyKeySeq_Release`, `TestTerm_KittyKey_Backspace`,
+      `TestTerm_KittyKey_Enter`, `TestTerm_KittyKey_Tab`,
+      `TestTerm_KittyKey_Escape`, `TestTerm_KittyKey_CtrlC`,
+      `TestTerm_KittyKey_Release`, `TestTerm_KittyKey_ModifierOnly`,
+      `TestTerm_KittyKey_ReleaseDisabled`, `TestTerm_KittyKey_LegacyFallback`.
 
 **Demo test:** Run `showkey -a` or a test script in Neovim to verify distinct key codes.
 

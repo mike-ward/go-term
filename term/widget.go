@@ -302,12 +302,12 @@ type Term struct {
 	// (onMouseScroll) except for the timer callback, which only touches
 	// momentumMu-protected fields.
 	momentumMu       sync.Mutex
-	momentumVel      float64      // EMA of recent scroll deltas (pixels)
-	momentumAcc      float64      // sub-cell pixel remainder for coast
-	momentumCellH    float32      // cellH snapshot at last scroll event
-	momentumCoasting bool         // true while goroutine is decelerating
+	momentumVel      float64       // EMA of recent scroll deltas (pixels)
+	momentumAcc      float64       // sub-cell pixel remainder for coast
+	momentumCellH    float32       // cellH snapshot at last scroll event
+	momentumCoasting bool          // true while goroutine is decelerating
 	momentumKick     chan struct{} // buffered 1; wakes momentumLoop
-	momentumTimer    *time.Timer  // reset on each scroll; fires kickMomentum
+	momentumTimer    *time.Timer   // reset on each scroll; fires kickMomentum
 
 	// runBuf reused across onDraw calls; grows once, never freed.
 	runBuf strings.Builder
@@ -544,6 +544,7 @@ func (t *Term) View(w *gui.Window) gui.View {
 		IDFocus:   focusID,
 		OnChar:    t.onChar,
 		OnKeyDown: t.onKeyDown,
+		OnKeyUp:   t.onKeyUp,
 		Content:   []gui.View{canvas},
 	}
 	if len(t.themeMenuItems) > 0 {
@@ -1129,7 +1130,7 @@ func (t *Term) onChar(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
 		if r >= 'A' && r <= 'Z' && e.Modifiers.Has(gui.ModShift) {
 			cp = int(r-'A') + 'a'
 		}
-		if seq := kittyKeySeq(cp, e.Modifiers, kkpFlags); seq != nil {
+		if seq := kittyKeySeq(cp, e.Modifiers, kkpFlags, false); seq != nil {
 			t.writeBytes(seq)
 			e.IsHandled = true
 			return
@@ -1619,8 +1620,11 @@ func (t *Term) keyModes() keyModes {
 // or CSI codepoint ; modifiers u. Returns nil when flags == 0 (legacy mode).
 // The modifier parameter follows the KKP spec: 1=none, 2=shift, 3=shift+alt,
 // 5=ctrl, 6=shift+ctrl, 9=super, … (1 + sum of modifier bits).
-func kittyKeySeq(codepoint int, mods gui.Modifier, flags uint32) []byte {
-	if flags == 0 {
+// When release is true, generates a key release sequence (event-type 3):
+// CSI codepoint ; modifiers : 3 u. The modifier field is mandatory when
+// event-type is present, even when mod==1 (no modifiers).
+func kittyKeySeq(codepoint int, mods gui.Modifier, flags uint32, release bool) []byte {
+	if flags == 0 || codepoint <= 0 {
 		return nil
 	}
 	mod := 1
@@ -1638,9 +1642,12 @@ func kittyKeySeq(codepoint int, mods gui.Modifier, flags uint32) []byte {
 	}
 	b := []byte("\x1b[")
 	b = strconv.AppendInt(b, int64(codepoint), 10)
-	if mod != 1 {
+	if mod != 1 || release {
 		b = append(b, ';')
 		b = strconv.AppendInt(b, int64(mod), 10)
+	}
+	if release {
+		b = append(b, ':', '3')
 	}
 	b = append(b, 'u')
 	return b
@@ -1883,25 +1890,25 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		// Application keypad Enter takes priority; KKP applies to regular Enter.
 		if modes.appKeypad && e.KeyCode == gui.KeyKPEnter {
 			out = []byte("\x1bOM")
-		} else if kkp := kittyKeySeq(13, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+		} else if kkp := kittyKeySeq(13, e.Modifiers, modes.kittyKeyFlags, false); kkp != nil {
 			out = kkp
 		} else {
 			out = []byte{'\r'}
 		}
 	case gui.KeyBackspace:
-		if kkp := kittyKeySeq(127, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+		if kkp := kittyKeySeq(127, e.Modifiers, modes.kittyKeyFlags, false); kkp != nil {
 			out = kkp
 		} else {
 			out = []byte{0x7F}
 		}
 	case gui.KeyTab:
-		if kkp := kittyKeySeq(9, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+		if kkp := kittyKeySeq(9, e.Modifiers, modes.kittyKeyFlags, false); kkp != nil {
 			out = kkp
 		} else {
 			out = []byte{'\t'}
 		}
 	case gui.KeyEscape:
-		if kkp := kittyKeySeq(27, e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+		if kkp := kittyKeySeq(27, e.Modifiers, modes.kittyKeyFlags, false); kkp != nil {
 			out = kkp
 		} else {
 			out = []byte{0x1B}
@@ -1981,7 +1988,7 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 		if e.Modifiers.Has(gui.ModCtrl) &&
 			e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
 			if kkp := kittyKeySeq(int('a')+int(e.KeyCode-gui.KeyA),
-				e.Modifiers, modes.kittyKeyFlags); kkp != nil {
+				e.Modifiers, modes.kittyKeyFlags, false); kkp != nil {
 				out = kkp
 			} else {
 				out = []byte{byte(e.KeyCode-gui.KeyA) + 1}
@@ -1998,6 +2005,101 @@ func (t *Term) onKeyDown(_ *gui.Layout, e *gui.Event, w *gui.Window) {
 	t.snapToLive()
 	t.writeBytes(out)
 	e.IsHandled = true
+}
+
+// onKeyUp generates KKP key-release sequences (event-type 3) when flag bit 2 is set.
+func (t *Term) onKeyUp(_ *gui.Layout, e *gui.Event, _ *gui.Window) {
+	modes := t.keyModes()
+	if modes.kittyKeyFlags&2 == 0 {
+		return
+	}
+
+	// KKP private-use-area codepoints (spec §7 table) for left/right modifiers,
+	// functional keys, nav keys, and F-keys. ASCII codepoints for printable keys.
+	var codepoint int
+	switch e.KeyCode {
+	case gui.KeyLeftShift:
+		codepoint = 57441
+	case gui.KeyRightShift:
+		codepoint = 57447
+	case gui.KeyLeftControl:
+		codepoint = 57442
+	case gui.KeyRightControl:
+		codepoint = 57448
+	case gui.KeyLeftAlt:
+		codepoint = 57443
+	case gui.KeyRightAlt:
+		codepoint = 57449
+	case gui.KeyLeftSuper:
+		codepoint = 57444
+	case gui.KeyRightSuper:
+		codepoint = 57450
+	case gui.KeyEnter, gui.KeyKPEnter:
+		codepoint = 13
+	case gui.KeyBackspace:
+		codepoint = 127
+	case gui.KeyTab:
+		codepoint = 9
+	case gui.KeyEscape:
+		codepoint = 27
+	case gui.KeyInsert:
+		codepoint = 57348
+	case gui.KeyDelete:
+		codepoint = 57349
+	case gui.KeyLeft:
+		codepoint = 57350
+	case gui.KeyRight:
+		codepoint = 57351
+	case gui.KeyUp:
+		codepoint = 57352
+	case gui.KeyDown:
+		codepoint = 57353
+	case gui.KeyPageUp:
+		codepoint = 57354
+	case gui.KeyPageDown:
+		codepoint = 57355
+	case gui.KeyHome:
+		codepoint = 57356
+	case gui.KeyEnd:
+		codepoint = 57357
+	case gui.KeyF1:
+		codepoint = 57364
+	case gui.KeyF2:
+		codepoint = 57365
+	case gui.KeyF3:
+		codepoint = 57366
+	case gui.KeyF4:
+		codepoint = 57367
+	case gui.KeyF5:
+		codepoint = 57368
+	case gui.KeyF6:
+		codepoint = 57369
+	case gui.KeyF7:
+		codepoint = 57370
+	case gui.KeyF8:
+		codepoint = 57371
+	case gui.KeyF9:
+		codepoint = 57372
+	case gui.KeyF10:
+		codepoint = 57373
+	case gui.KeyF11:
+		codepoint = 57374
+	case gui.KeyF12:
+		codepoint = 57375
+	default:
+		if e.KeyCode >= gui.KeyA && e.KeyCode <= gui.KeyZ {
+			codepoint = int('a') + int(e.KeyCode-gui.KeyA)
+		} else if e.KeyCode >= gui.Key0 && e.KeyCode <= gui.Key9 {
+			codepoint = int('0') + int(e.KeyCode-gui.Key0)
+		} else {
+			return
+		}
+	}
+
+	if seq := kittyKeySeq(codepoint, e.Modifiers, modes.kittyKeyFlags, true); seq != nil {
+		t.writeBytes(seq)
+		e.IsHandled = true
+	}
 }
 
 // scrollByPage moves the viewport one page (rows-1) in `dir` direction.
