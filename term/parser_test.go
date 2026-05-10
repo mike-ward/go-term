@@ -354,6 +354,49 @@ func TestParser_CursorSaveRestore_CSIsu(t *testing.T) {
 	}
 }
 
+func TestParser_DECCharset_SOAndSI(t *testing.T) {
+	g, p := newParserGrid(1, 4)
+	feed(t, g, p, []byte("\x1b)0\x0ex\x0fl"))
+	if got := g.At(0, 0).Ch; got != '│' {
+		t.Fatalf("SO x = %q, want %q", got, '│')
+	}
+	if got := g.At(0, 1).Ch; got != 'l' {
+		t.Fatalf("SI l = %q, want %q", got, 'l')
+	}
+}
+
+func TestParser_DECCharset_SaveRestore(t *testing.T) {
+	g, p := newParserGrid(1, 4)
+	feed(t, g, p, []byte("\x1b)0\x0e\x1b7"))
+	feed(t, g, p, []byte("\x0f"))
+	feed(t, g, p, []byte("\x1b8x"))
+	if got := g.At(0, 0).Ch; got != '│' {
+		t.Fatalf("restored charset x = %q, want %q", got, '│')
+	}
+}
+
+func TestParser_DECCharset_G0Designation_Translates(t *testing.T) {
+	g, p := newParserGrid(1, 4)
+	// ESC ( 0 designates G0 to DEC Special Graphics; G0 is active by default (ActiveG=0),
+	// so no SI/SO needed.
+	feed(t, g, p, []byte("\x1b(0x"))
+	if got := g.At(0, 0).Ch; got != '│' {
+		t.Fatalf("ESC(0 x = %q, want '│'", got)
+	}
+}
+
+func TestParser_DECCharset_RedesignateG1ToASCII(t *testing.T) {
+	g, p := newParserGrid(1, 4)
+	feed(t, g, p, []byte("\x1b)0\x0ex")) // ESC)0 + SO + 'x' → '│'
+	if got := g.At(0, 0).Ch; got != '│' {
+		t.Fatalf("DEC G1 x = %q, want '│'", got)
+	}
+	feed(t, g, p, []byte("\x1b)Bx")) // ESC)B re-designates G1 to ASCII; 'x' passes through
+	if got := g.At(0, 1).Ch; got != 'x' {
+		t.Fatalf("ASCII G1 x = %q, want 'x'", got)
+	}
+}
+
 func TestParser_RestoreWithoutSaveResets(t *testing.T) {
 	g, p := newParserGrid(5, 10)
 	g.MoveCursor(2, 3)
@@ -1351,7 +1394,7 @@ func TestParser_SGR4_ColonSubparam_Styles(t *testing.T) {
 		style   uint8
 		hasAttr bool
 	}{
-		{"\x1b[4:0m", ULNone, false},  // explicit no-underline
+		{"\x1b[4:0m", ULNone, false}, // explicit no-underline
 		{"\x1b[4:1m", ULSingle, true},
 		{"\x1b[4:2m", ULDouble, true},
 		{"\x1b[4:3m", ULCurly, true},
@@ -1675,8 +1718,8 @@ func TestParser_KittyKeyPopEmpty(t *testing.T) {
 
 func TestParser_KittyKeySet(t *testing.T) {
 	g, p := newParserGrid(4, 8)
-	feed(t, g, p, []byte("\x1b[>1u"))  // push → flags=1
-	feed(t, g, p, []byte("\x1b[=5u"))  // set (no push) → flags=5
+	feed(t, g, p, []byte("\x1b[>1u")) // push → flags=1
+	feed(t, g, p, []byte("\x1b[=5u")) // set (no push) → flags=5
 	if g.KittyKeyFlags != 5 {
 		t.Fatalf("after CSI=5u: flags=%d, want 5", g.KittyKeyFlags)
 	}
@@ -1708,4 +1751,3 @@ func TestParser_KittyKeyQueryZero(t *testing.T) {
 		t.Fatalf("query zero: got %q, want %q", got, want)
 	}
 }
-

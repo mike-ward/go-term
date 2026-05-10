@@ -146,6 +146,19 @@ func runeString(r rune) string {
 	return string(r)
 }
 
+func isGeometryGlyph(r rune) bool {
+	switch {
+	case r >= 0x2500 && r <= 0x25FF: // Box Drawing, Block Elements, Geometric Shapes
+		return true
+	case r >= 0x23BA && r <= 0x23BD: // Misc Technical horizontal scan lines (⎺⎻⎼⎽)
+		return true
+	case r >= 0x2800 && r <= 0x28FF: // Braille Patterns
+		return true
+	default:
+		return false
+	}
+}
+
 // Cfg configures a Term widget. All fields optional.
 type Cfg struct {
 	// TextStyle overrides the default monospace style. Zero value
@@ -690,6 +703,9 @@ func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runK
 	}
 	tf := base.Typeface
 	bold, italic := cell.Attrs&AttrBold != 0, cell.Attrs&AttrItalic != 0
+	if isGeometryGlyph(cell.Ch) {
+		bold = false
+	}
 	switch {
 	case bold && italic:
 		tf = glyph.TypefaceBoldItalic

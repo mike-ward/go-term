@@ -45,15 +45,21 @@ const (
 	AttrStrikethrough
 )
 
+// Charset designator bytes used in ESC ( F / ESC ) F sequences.
+const (
+	charsetASCII      byte = 'B' // ECMA-48 default (US ASCII)
+	charsetDECSpecial byte = '0' // DEC Special Graphics line-drawing set
+)
+
 // Underline style constants for Cell.ULStyle and Grid.CurULStyle.
 // ULNone means no underline. The others select the decoration shape.
 const (
-	ULNone    uint8 = 0
-	ULSingle  uint8 = 1
-	ULDouble  uint8 = 2
-	ULCurly   uint8 = 3
-	ULDotted  uint8 = 4
-	ULDashed  uint8 = 5
+	ULNone   uint8 = 0
+	ULSingle uint8 = 1
+	ULDouble uint8 = 2
+	ULCurly  uint8 = 3
+	ULDotted uint8 = 4
+	ULDashed uint8 = 5
 )
 
 // CursorShape selects the cursor glyph: filled block, baseline
@@ -211,6 +217,9 @@ type savedCursor struct {
 	attrs      uint8
 	ulStyle    uint8
 	ulColor    uint32
+	charsetG0  byte
+	charsetG1  byte
+	activeG    uint8
 	autoWrap   bool
 	originMode bool
 	insertMode bool
@@ -229,6 +238,9 @@ type altSavedScreen struct {
 	curAttrs         uint8
 	curULStyle       uint8
 	curULColor       uint32
+	charsetG0        byte
+	charsetG1        byte
+	activeG          uint8
 	autoWrap         bool
 	originMode       bool
 	insertMode       bool
@@ -241,9 +253,9 @@ type MarkKind uint8
 
 const (
 	MarkPromptStart  MarkKind = iota // OSC 133;A — beginning of prompt
-	MarkCommandStart                  // OSC 133;B — start of user input
-	MarkOutputStart                   // OSC 133;C — command submitted, output begins
-	MarkCommandEnd                    // OSC 133;D — command finished (optional exit code)
+	MarkCommandStart                 // OSC 133;B — start of user input
+	MarkOutputStart                  // OSC 133;C — command submitted, output begins
+	MarkCommandEnd                   // OSC 133;D — command finished (optional exit code)
 )
 
 // Mark records a command-boundary position in content coordinates.
@@ -272,16 +284,19 @@ type Grid struct {
 	CurAttrs       uint8
 	CurULStyle     uint8  // current underline style (ULNone..ULDashed)
 	CurULColor     uint32 // current underline color; DefaultColor = use fg
-	AutoWrap       bool // DEC ?7 — autowrap at right margin
-	OriginMode     bool // DEC ?6 — CUP/HVP/VPA relative to scroll region
-	InsertMode     bool // CSI 4 h/l — insert vs replace on Put
-	CursorVisible  bool // hidden via DEC ?25 l, shown via ?25 h
-	BracketedPaste bool // DEC ?2004 — wrap pasted text in markers
-	FocusReporting bool // DEC ?1004 — report focus in/out to host
-	SyncOutput     bool // DEC ?2026 — allow synchronized updates
-	SyncActive     bool // currently inside a synchronized update block
-	AppCursorKeys  bool // DEC ?1 — application cursor key mode
-	AppKeypad      bool // DECNKM — application keypad mode
+	CharsetG0      byte   // ESC ( F — designated set for GL when ActiveG=0
+	CharsetG1      byte   // ESC ) F — designated set for GL when ActiveG=1
+	ActiveG        uint8  // 0 = SI selects G0 into GL, 1 = SO selects G1
+	AutoWrap       bool   // DEC ?7 — autowrap at right margin
+	OriginMode     bool   // DEC ?6 — CUP/HVP/VPA relative to scroll region
+	InsertMode     bool   // CSI 4 h/l — insert vs replace on Put
+	CursorVisible  bool   // hidden via DEC ?25 l, shown via ?25 h
+	BracketedPaste bool   // DEC ?2004 — wrap pasted text in markers
+	FocusReporting bool   // DEC ?1004 — report focus in/out to host
+	SyncOutput     bool   // DEC ?2026 — allow synchronized updates
+	SyncActive     bool   // currently inside a synchronized update block
+	AppCursorKeys  bool   // DEC ?1 — application cursor key mode
+	AppKeypad      bool   // DECNKM — application keypad mode
 
 	// BellCount is incremented each time the terminal receives BEL (0x07).
 	// The widget watches for changes to trigger a visual flash.
@@ -329,10 +344,10 @@ type Grid struct {
 	// row is the last element. Cap of 0 disables scrollback (rows are
 	// dropped on scrollUp). ViewOffset > 0 freezes the viewport at
 	// `ViewOffset` rows back from live; OnDraw renders accordingly.
-	Scrollback       [][]Cell
+	Scrollback        [][]Cell
 	ScrollbackWrapped []bool // parallel to Scrollback; true = row was soft-wrapped
-	ScrollbackCap    int
-	ViewOffset       int
+	ScrollbackCap     int
+	ViewOffset        int
 
 	// RowWrapped[r] is true when row r ended with an autowrap (the cursor
 	// reached the right margin and wrapped onto row r+1). During Resize,
@@ -656,16 +671,18 @@ func NewGrid(rows, cols int) *Grid {
 		CurFG:         DefaultColor,
 		CurBG:         DefaultColor,
 		CurULColor:    DefaultColor,
+		CharsetG0:     charsetASCII,
+		CharsetG1:     charsetASCII,
 		AutoWrap:      true,
 		CursorVisible: true,
 		CursorShape:   CursorBlock,
 		CursorBlink:   false,
-		Top:      0,
-		Bottom:   rows - 1,
-		Theme:    DefaultTheme,
-		links:    make(map[uint16]string),
-		linkIDs:  make(map[string]uint16),
-		nextLink: 1,
+		Top:           0,
+		Bottom:        rows - 1,
+		Theme:         DefaultTheme,
+		links:         make(map[uint16]string),
+		linkIDs:       make(map[string]uint16),
+		nextLink:      1,
 	}
 	for i := range g.Cells {
 		g.Cells[i] = defaultCell()
@@ -1144,6 +1161,7 @@ func (g *Grid) At(r, c int) *Cell {
 // wraps early if only one column remains. Width-0 runes (combining
 // marks, ZWJ, etc.) are dropped — Phase 11 doesn't model combining.
 func (g *Grid) Put(ch rune) {
+	ch = g.translateRune(ch)
 	w := runeWidth(ch)
 	if w == 0 {
 		return
@@ -1200,6 +1218,80 @@ func (g *Grid) Put(ch rune) {
 	g.CursorC += w
 	if !g.AutoWrap && g.CursorC >= g.Cols {
 		g.CursorC = g.Cols - 1
+	}
+}
+
+// translateRune maps printable bytes through the active GL charset.
+// Today we honor the DEC Special Graphics set (`0`), which TUIs use for
+// box-drawing via SI/SO or ESC ( 0 / ESC ) 0 designation.
+func (g *Grid) translateRune(ch rune) rune {
+	if ch < 0x20 || ch > 0x7e {
+		return ch
+	}
+	charset := g.CharsetG0
+	if g.ActiveG == 1 {
+		charset = g.CharsetG1
+	}
+	if charset != charsetDECSpecial {
+		return ch
+	}
+	switch ch {
+	case '`':
+		return '◆'
+	case 'a':
+		return '▒'
+	case 'f':
+		return '°'
+	case 'g':
+		return '±'
+	case 'h':
+		return '␤'
+	case 'i':
+		return '␋'
+	case 'j':
+		return '┘'
+	case 'k':
+		return '┐'
+	case 'l':
+		return '┌'
+	case 'm':
+		return '└'
+	case 'n':
+		return '┼'
+	case 'o':
+		return '⎺'
+	case 'p':
+		return '⎻'
+	case 'q':
+		return '─'
+	case 'r':
+		return '⎼'
+	case 's':
+		return '⎽'
+	case 't':
+		return '├'
+	case 'u':
+		return '┤'
+	case 'v':
+		return '┴'
+	case 'w':
+		return '┬'
+	case 'x':
+		return '│'
+	case 'y':
+		return '≤'
+	case 'z':
+		return '≥'
+	case '{':
+		return 'π'
+	case '|':
+		return '≠'
+	case '}':
+		return '£'
+	case '~':
+		return '·'
+	default:
+		return ch
 	}
 }
 
@@ -1438,6 +1530,9 @@ func (g *Grid) SaveCursor() {
 		attrs:      g.CurAttrs,
 		ulStyle:    g.CurULStyle,
 		ulColor:    g.CurULColor,
+		charsetG0:  g.CharsetG0,
+		charsetG1:  g.CharsetG1,
+		activeG:    g.ActiveG,
 		autoWrap:   g.AutoWrap,
 		originMode: g.OriginMode,
 		insertMode: g.InsertMode,
@@ -1461,6 +1556,9 @@ func (g *Grid) RestoreCursor() {
 	g.CurAttrs = g.saved.attrs
 	g.CurULStyle = g.saved.ulStyle
 	g.CurULColor = g.saved.ulColor
+	g.CharsetG0 = g.saved.charsetG0
+	g.CharsetG1 = g.saved.charsetG1
+	g.ActiveG = g.saved.activeG
 	g.AutoWrap = g.saved.autoWrap
 	g.OriginMode = g.saved.originMode
 	g.InsertMode = g.saved.insertMode
@@ -1727,7 +1825,6 @@ func (g *Grid) ResetView() { g.ViewOffset = 0 }
 // ScrollViewTop moves the viewport to the oldest scrollback row.
 func (g *Grid) ScrollViewTop() { g.ViewOffset = len(g.Scrollback) }
 
-
 // ViewCellAt returns the cell visible at viewport position (r, c)
 // honoring ViewOffset. When the viewport row falls inside scrollback,
 // that row's stored cells are returned. Outside-range coords yield a
@@ -1771,6 +1868,9 @@ func (g *Grid) EnterAlt() {
 		curAttrs:   g.CurAttrs,
 		curULStyle: g.CurULStyle,
 		curULColor: g.CurULColor,
+		charsetG0:  g.CharsetG0,
+		charsetG1:  g.CharsetG1,
+		activeG:    g.ActiveG,
 		autoWrap:   g.AutoWrap,
 		originMode: g.OriginMode,
 		insertMode: g.InsertMode,
@@ -1789,6 +1889,9 @@ func (g *Grid) EnterAlt() {
 	g.CurFG, g.CurBG, g.CurAttrs = DefaultColor, DefaultColor, 0
 	g.CurULStyle = 0
 	g.CurULColor = DefaultColor
+	g.CharsetG0 = charsetASCII
+	g.CharsetG1 = charsetASCII
+	g.ActiveG = 0
 	g.AutoWrap = true
 	g.OriginMode = false
 	g.InsertMode = false
@@ -1815,6 +1918,9 @@ func (g *Grid) ExitAlt() {
 	g.CurAttrs = g.mainSaved.curAttrs
 	g.CurULStyle = g.mainSaved.curULStyle
 	g.CurULColor = g.mainSaved.curULColor
+	g.CharsetG0 = g.mainSaved.charsetG0
+	g.CharsetG1 = g.mainSaved.charsetG1
+	g.ActiveG = g.mainSaved.activeG
 	g.AutoWrap = g.mainSaved.autoWrap
 	g.OriginMode = g.mainSaved.originMode
 	g.InsertMode = g.mainSaved.insertMode

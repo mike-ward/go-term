@@ -1270,6 +1270,23 @@ func TestGrid_AltScreen_PreservesInsertOriginWrap(t *testing.T) {
 	}
 }
 
+func TestGrid_AltScreen_PreservesCharsetState(t *testing.T) {
+	g := NewGrid(3, 4)
+	g.CharsetG0 = '0'
+	g.CharsetG1 = 'B'
+	g.ActiveG = 1
+
+	g.EnterAlt()
+	if g.CharsetG0 != 'B' || g.CharsetG1 != 'B' || g.ActiveG != 0 {
+		t.Fatalf("alt defaults: G0=%q G1=%q active=%d", g.CharsetG0, g.CharsetG1, g.ActiveG)
+	}
+
+	g.ExitAlt()
+	if g.CharsetG0 != '0' || g.CharsetG1 != 'B' || g.ActiveG != 1 {
+		t.Fatalf("restored charsets: G0=%q G1=%q active=%d", g.CharsetG0, g.CharsetG1, g.ActiveG)
+	}
+}
+
 func TestGrid_MoveCursorOrigin_WhenOriginModeOff(t *testing.T) {
 	g := NewGrid(5, 8)
 	g.SetScrollRegion(1, 3)
@@ -2010,6 +2027,45 @@ func TestGrid_SaveRestoreCursor_ULState(t *testing.T) {
 	}
 	if g.CurULColor != rgbColor(0, 128, 255) {
 		t.Errorf("RestoreCursor: CurULColor = %#x, want %#x", g.CurULColor, rgbColor(0, 128, 255))
+	}
+}
+
+func TestGrid_SaveRestoreCursor_CharsetState(t *testing.T) {
+	g := NewGrid(2, 10)
+	g.CharsetG0 = 'B'
+	g.CharsetG1 = '0'
+	g.ActiveG = 1
+	g.SaveCursor()
+
+	g.CharsetG0 = '0'
+	g.CharsetG1 = 'B'
+	g.ActiveG = 0
+
+	g.RestoreCursor()
+	if g.CharsetG0 != 'B' || g.CharsetG1 != '0' || g.ActiveG != 1 {
+		t.Fatalf("RestoreCursor charsets: G0=%q G1=%q active=%d", g.CharsetG0, g.CharsetG1, g.ActiveG)
+	}
+}
+
+func TestGrid_TranslateRune_DECGraphicsFullTable(t *testing.T) {
+	g := NewGrid(1, 1)
+	g.CharsetG0 = '0'
+	g.ActiveG = 0
+	cases := []struct {
+		in, want rune
+	}{
+		{'`', '◆'}, {'a', '▒'}, {'f', '°'}, {'g', '±'},
+		{'h', '␤'}, {'i', '␋'}, {'j', '┘'}, {'k', '┐'},
+		{'l', '┌'}, {'m', '└'}, {'n', '┼'}, {'o', '⎺'},
+		{'p', '⎻'}, {'q', '─'}, {'r', '⎼'}, {'s', '⎽'},
+		{'t', '├'}, {'u', '┤'}, {'v', '┴'}, {'w', '┬'},
+		{'x', '│'}, {'y', '≤'}, {'z', '≥'}, {'{', 'π'},
+		{'|', '≠'}, {'}', '£'}, {'~', '·'},
+	}
+	for _, tc := range cases {
+		if got := g.translateRune(tc.in); got != tc.want {
+			t.Errorf("translateRune(%q) = %q, want %q", tc.in, got, tc.want)
+		}
 	}
 }
 

@@ -125,6 +125,12 @@ func (p *Parser) Feed(b []byte) {
 			case c == 0x0D: // CR
 				p.g.CarriageReturn()
 				i++
+			case c == 0x0E: // SO — shift out: invoke G1 into GL
+				p.g.ActiveG = 1
+				i++
+			case c == 0x0F: // SI — shift in: invoke G0 into GL
+				p.g.ActiveG = 0
+				i++
 			case c == 0x1B: // ESC
 				p.state = stEsc
 				i++
@@ -196,8 +202,14 @@ func (p *Parser) Feed(b []byte) {
 			}
 			i++
 		case stEscInter:
-			// Swallow the final byte of an ESC intermediate sequence
-			// like ESC ( B, then return to ground.
+			// Finalize ESC intermediate sequences such as ESC ( 0 and
+			// ESC ) B, then return to ground.
+			switch p.escInter {
+			case '(':
+				p.g.CharsetG0 = c
+			case ')':
+				p.g.CharsetG1 = c
+			}
 			p.escInter = 0
 			p.state = stGround
 			i++

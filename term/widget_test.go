@@ -409,6 +409,80 @@ func TestCellRunKey_BoldItalic(t *testing.T) {
 	}
 }
 
+func TestCellRunKey_GeometryGlyphsIgnoreBoldTypeface(t *testing.T) {
+	cases := []struct {
+		name string
+		ch   rune
+	}{
+		{"box-drawing", '│'},
+		{"block-elements", '█'},
+		{"braille", '⣿'},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGrid(4, 8)
+			base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+			cell := Cell{Ch: tc.ch, Width: 1, Attrs: AttrBold}
+			k := cellRunKey(cell, base, g, -1, -1)
+			if k.typeface != glyph.TypefaceRegular {
+				t.Fatalf("geometry glyph %q should not switch to bold typeface, got %v", tc.ch, k.typeface)
+			}
+		})
+	}
+}
+
+func TestCellRunKey_NonGeometryGlyphStillBolds(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	cell := Cell{Ch: 'A', Width: 1, Attrs: AttrBold}
+	k := cellRunKey(cell, base, g, -1, -1)
+	if k.typeface != glyph.TypefaceBold {
+		t.Fatalf("text glyph should still bold, got %v", k.typeface)
+	}
+}
+
+func TestCellRunKey_GeometryGlyph_BoldItalicUsesItalic(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	cell := Cell{Ch: '│', Width: 1, Attrs: AttrBold | AttrItalic}
+	k := cellRunKey(cell, base, g, -1, -1)
+	// Bold is suppressed; italic is not — TypefaceItalic expected.
+	if k.typeface != glyph.TypefaceItalic {
+		t.Fatalf("geometry glyph bold+italic: got %v, want TypefaceItalic", k.typeface)
+	}
+}
+
+func TestIsGeometryGlyph_Boundaries(t *testing.T) {
+	cases := []struct {
+		r    rune
+		want bool
+		desc string
+	}{
+		{0x24FF, false, "just below Box Drawing"},
+		{0x2500, true, "first Box Drawing"},
+		{0x257F, true, "last Box Drawing"},
+		{0x2580, true, "first Block Elements"},
+		{0x259F, true, "last Block Elements"},
+		{0x25A0, true, "first Geometric Shapes"},
+		{0x25C6, true, "◆ (DEC Special Graphics diamond)"},
+		{0x25FF, true, "last Geometric Shapes"},
+		{0x2600, false, "just above Geometric Shapes"},
+		{0x23B9, false, "just below scan lines"},
+		{0x23BA, true, "first scan line ⎺"},
+		{0x23BD, true, "last scan line ⎽"},
+		{0x23BE, false, "just above scan lines"},
+		{0x27FF, false, "just below Braille"},
+		{0x2800, true, "first Braille"},
+		{0x28FF, true, "last Braille"},
+		{0x2900, false, "just above Braille"},
+	}
+	for _, tc := range cases {
+		if got := isGeometryGlyph(tc.r); got != tc.want {
+			t.Errorf("isGeometryGlyph(%U) %s: got %v, want %v", tc.r, tc.desc, got, tc.want)
+		}
+	}
+}
+
 func TestCellRunKey_Underline(t *testing.T) {
 	g := NewGrid(4, 8)
 	base := gui.TextStyle{}
@@ -861,10 +935,10 @@ func TestKittyKeySeq_Release(t *testing.T) {
 		mods gui.Modifier
 		want string
 	}{
-		{13, 0, "\x1b[13;1:3u"},             // Enter release, no mods
-		{9, gui.ModShift, "\x1b[9;2:3u"},    // Shift+Tab release
-		{27, gui.ModCtrl, "\x1b[27;5:3u"},   // Ctrl+Escape release
-		{65, gui.ModAlt, "\x1b[65;3:3u"},    // Alt+A release
+		{13, 0, "\x1b[13;1:3u"},           // Enter release, no mods
+		{9, gui.ModShift, "\x1b[9;2:3u"},  // Shift+Tab release
+		{27, gui.ModCtrl, "\x1b[27;5:3u"}, // Ctrl+Escape release
+		{65, gui.ModAlt, "\x1b[65;3:3u"},  // Alt+A release
 	}
 	for _, c := range cases {
 		got := kittyKeySeq(c.cp, c.mods, 1, true)
