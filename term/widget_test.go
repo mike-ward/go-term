@@ -394,9 +394,6 @@ func TestCellRunKey_PlainCell(t *testing.T) {
 	if k.typeface != glyph.TypefaceRegular {
 		t.Errorf("typeface: got %v, want regular", k.typeface)
 	}
-	if k.linkID != 0 {
-		t.Error("no link expected")
-	}
 }
 
 func TestCellRunKey_BoldItalic(t *testing.T) {
@@ -511,8 +508,20 @@ func TestCellRunKey_LinkForcesUnderline(t *testing.T) {
 	if k.ulStyle == ULNone {
 		t.Error("linked cell: expected underline forced on by linkID")
 	}
-	if k.linkID != 42 {
-		t.Errorf("linkID: got %d, want 42", k.linkID)
+}
+
+// TestCellRunKey_DifferentLinksSameStyleCoalesce asserts the intent
+// behind dropping linkID from runKey: two cells in different links
+// but with the same visual style produce equal keys, allowing the
+// foreground pass to coalesce them into one dc.Text call (and one
+// go-glyph layout-cache entry).
+func TestCellRunKey_DifferentLinksSameStyleCoalesce(t *testing.T) {
+	g := NewGrid(4, 8)
+	base := gui.TextStyle{}
+	a := Cell{Ch: 'x', Width: 1, LinkID: 1}
+	b := Cell{Ch: 'y', Width: 1, LinkID: 2}
+	if cellRunKey(a, base, g, -1, -1) != cellRunKey(b, base, g, -1, -1) {
+		t.Error("same-style cells in different links must produce equal keys")
 	}
 }
 

@@ -688,13 +688,22 @@ func (t *Term) showScrollbar() {
 // runKey captures the rendering-relevant properties of a cell for
 // run-coalescing in the foreground pass. Two cells with equal runKey
 // can be drawn in a single dc.Text call.
+//
+// Hyperlink ID is deliberately not part of the key: adjacent cells
+// belonging to different links but rendered with the same visual style
+// (color, underline, typeface) can coalesce into one dc.Text call, and
+// thus one go-glyph layout-cache entry. With OSC 8 streams like ls
+// --hyperlink, every filename has a unique link ID — keying on it
+// fragments runs that visually merge anyway. Hover-induced recolor
+// already lives in the color field, so hovered vs non-hovered cells
+// break the run correctly. Click hit-testing reads Cell.LinkID
+// directly via ViewCellAt and is unaffected.
 type runKey struct {
 	color         gui.Color
 	ulColor       gui.Color
 	typeface      glyph.Typeface
 	ulStyle       uint8 // ULNone..ULDashed; drives underline rendering
 	strikethrough bool
-	linkID        uint16
 }
 
 // cellRunKey computes the runKey for cell, applying attribute and
@@ -737,7 +746,6 @@ func cellRunKey(cell Cell, base gui.TextStyle, g *Grid, hoverR, hoverC int) runK
 		typeface:      tf,
 		ulStyle:       ulStyle,
 		strikethrough: cell.Attrs&AttrStrikethrough != 0,
-		linkID:        cell.LinkID,
 	}
 }
 
@@ -885,13 +893,25 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			runOpen = false
 			return
 		}
+		text := t.runBuf.String()
+		// Trim trailing spaces when no decoration spans them: "abc   " and
+		// "abc" share a layout-cache entry, so trimming keeps cache hits
+		// stable as tail padding wobbles frame to frame.
+		if runStyle.ulStyle == ULNone && !runStyle.strikethrough {
+			text = strings.TrimRight(text, " ")
+			if text == "" {
+				runOpen = false
+				t.runBuf.Reset()
+				runCols = 0
+				return
+			}
+		}
 		cs := style
 		cs.Color = runStyle.color
 		cs.Typeface = runStyle.typeface
 		cs.Underline = false
 		cs.Strikethrough = runStyle.strikethrough
-		dc.Text(float32(runStart)*t.cellW, float32(r)*t.cellH,
-			t.runBuf.String(), cs)
+		dc.Text(float32(runStart)*t.cellW, float32(r)*t.cellH, text, cs)
 		if runStyle.ulStyle != ULNone {
 			t.drawUnderlineDecor(dc,
 				float32(runStart)*t.cellW, float32(r)*t.cellH,
@@ -980,7 +1000,7 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 
 	// Scrollbar: pill-shaped thumb on the right edge. Visible while scrolled
 	// back or within scrollbarDuration of the last scroll event.
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	if (now.Before(t.scrollbarUntil) || g.ViewOffset > 0) && sb > 0 && dc.Width >= scrollbarWidth {
 		thumbY, thumbH := scrollbarGeometry(sb, g.Rows, g.ViewOffset, dc.Height)
 		dc.FilledRoundedRect(dc.Width-scrollbarWidth, thumbY, scrollbarWidth, thumbH,
@@ -2206,7 +2226,7 @@ func (t *Term) jumpToMark(backward bool, w *gui.Window) {
 		t.grid.Mu.Unlock()
 		return
 	}
-	sb := len(t.grid.Scrollback)
+	sb := t.grid.Scrollback.Len()
 	off := clamp(t.grid.ViewOffset, 0, sb)
 	viewTop := sb - off
 	var row int
@@ -2239,7 +2259,7 @@ func (t *Term) searchJump(forward bool, w *gui.Window) {
 	}
 	g := t.grid
 	g.Mu.Lock()
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	var start ContentPos
 	if len(t.searchMatches) > 0 && t.searchIdx < len(t.searchMatches) {
 		start = t.searchMatches[t.searchIdx].ContentPos

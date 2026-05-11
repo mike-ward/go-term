@@ -748,15 +748,15 @@ func TestParser_DEC1049_SuppressesScrollback(t *testing.T) {
 	for i := 0; i < 8; i++ {
 		feed(t, g, p, []byte("x\r\n"))
 	}
-	if len(g.Scrollback) != 0 {
+	if g.Scrollback.Len() != 0 {
 		t.Errorf("scrollback grew under ?1049: %d rows",
-			len(g.Scrollback))
+			g.Scrollback.Len())
 	}
 	feed(t, g, p, []byte("\x1b[?1049l"))
 	for i := 0; i < 5; i++ {
 		feed(t, g, p, []byte("y\r\n"))
 	}
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Errorf("scrollback inert after ?1049l")
 	}
 }

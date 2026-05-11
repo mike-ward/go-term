@@ -25,6 +25,9 @@ main
 # Output
 *.out
 
+# pprof profiles
+*.pprof
+
 # iOS c-archive build artifacts
 *.a
 examples/ios_demo/ios/libgoguiapp.h

@@ -364,19 +364,19 @@ func TestGrid_ScrollbackFillTrim(t *testing.T) {
 	g.scrollUpRegion(1)
 	g.scrollUpRegion(1)
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) != 2 {
-		t.Fatalf("len(Scrollback) = %d, want 2 (trim)", len(g.Scrollback))
+	if g.Scrollback.Len() != 2 {
+		t.Fatalf("len(Scrollback) = %d, want 2 (trim)", g.Scrollback.Len())
 	}
-	if g.Scrollback[0][0].Ch != 'B' || g.Scrollback[1][0].Ch != 'C' {
+	if g.Scrollback.Row(0)[0].Ch != 'B' || g.Scrollback.Row(1)[0].Ch != 'C' {
 		t.Errorf("scrollback ordering: %v %v",
-			g.Scrollback[0][0].Ch, g.Scrollback[1][0].Ch)
+			g.Scrollback.Row(0)[0].Ch, g.Scrollback.Row(1)[0].Ch)
 	}
 	// Cap=0 disables scrollback entirely.
 	g2 := NewGrid(2, 2)
 	g2.At(0, 0).Ch = 'X'
 	g2.scrollUpRegion(1)
-	if len(g2.Scrollback) != 0 {
-		t.Errorf("cap=0 must not retain rows: %d", len(g2.Scrollback))
+	if g2.Scrollback.Len() != 0 {
+		t.Errorf("cap=0 must not retain rows: %d", g2.Scrollback.Len())
 	}
 }
 
@@ -387,8 +387,8 @@ func TestGrid_ScrollViewClamp(t *testing.T) {
 	for range 4 {
 		g.scrollUpRegion(1)
 	}
-	if len(g.Scrollback) != 4 {
-		t.Fatalf("setup: len=%d", len(g.Scrollback))
+	if g.Scrollback.Len() != 4 {
+		t.Fatalf("setup: len=%d", g.Scrollback.Len())
 	}
 	g.ScrollView(2)
 	if g.ViewOffset != 2 {
@@ -528,8 +528,8 @@ func TestGrid_Resize_ReflowsScrollback(t *testing.T) {
 	}
 	// Scroll row off the top into scrollback; this also pushes RowWrapped[0].
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) != 1 {
-		t.Fatalf("setup: scrollback len %d, want 1", len(g.Scrollback))
+	if g.Scrollback.Len() != 1 {
+		t.Fatalf("setup: scrollback len %d, want 1", g.Scrollback.Len())
 	}
 
 	// Shrink to 2 cols: 'abcd' is one logical line and re-wraps as ['ab','cd'].
@@ -537,15 +537,15 @@ func TestGrid_Resize_ReflowsScrollback(t *testing.T) {
 	// the cursor near the bottom, so the split puts 'ab' in scrollback and
 	// 'cd' in the live buffer.
 	g.Resize(2, 2)
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Fatalf("shrink: scrollback empty, want at least 1 row")
 	}
-	if len(g.Scrollback[0]) != 2 {
-		t.Errorf("shrink: scrollback[0] width %d, want 2", len(g.Scrollback[0]))
+	if len(g.Scrollback.Row(0)) != 2 {
+		t.Errorf("shrink: scrollback[0] width %d, want 2", len(g.Scrollback.Row(0)))
 	}
-	if g.Scrollback[0][0].Ch != 'a' || g.Scrollback[0][1].Ch != 'b' {
+	if g.Scrollback.Row(0)[0].Ch != 'a' || g.Scrollback.Row(0)[1].Ch != 'b' {
 		t.Errorf("shrink: scrollback[0] = %v %v, want a b",
-			g.Scrollback[0][0].Ch, g.Scrollback[0][1].Ch)
+			g.Scrollback.Row(0)[0].Ch, g.Scrollback.Row(0)[1].Ch)
 	}
 	if g.At(0, 0).Ch != 'c' || g.At(0, 1).Ch != 'd' {
 		t.Errorf("shrink: live[0] = %v %v, want c d",
@@ -684,7 +684,7 @@ func TestGrid_Resize_AdjustsSelectionByScrollbackDelta(t *testing.T) {
 		t.Error("Resize should preserve active selection (Phase 17)")
 	}
 	// Rows must be clamped to [0, total-1] after reflow.
-	total := len(g.Scrollback) + g.Rows
+	total := g.Scrollback.Len() + g.Rows
 	if g.SelAnchor.Row < 0 || g.SelAnchor.Row >= total {
 		t.Errorf("SelAnchor.Row %d out of [0,%d)", g.SelAnchor.Row, total)
 	}
@@ -759,7 +759,7 @@ func TestGrid_ScrollView_SaturatingAdd(t *testing.T) {
 	for range 5 {
 		g.scrollUpRegion(1)
 	}
-	if got := len(g.Scrollback); got != 5 {
+	if got := g.Scrollback.Len(); got != 5 {
 		t.Fatalf("setup: scrollback len=%d", got)
 	}
 	// Positive overflow: ViewOffset+delta would wrap past MaxInt.
@@ -834,8 +834,8 @@ func TestGrid_ScrollUpRegion_Partial(t *testing.T) {
 		}
 	}
 	// Partial region must not push to scrollback.
-	if len(g.Scrollback) != 0 {
-		t.Errorf("partial-region scroll polluted scrollback: %d", len(g.Scrollback))
+	if g.Scrollback.Len() != 0 {
+		t.Errorf("partial-region scroll polluted scrollback: %d", g.Scrollback.Len())
 	}
 }
 
@@ -847,7 +847,7 @@ func TestGrid_ScrollUpRegion_FullScreenScrollback(t *testing.T) {
 	}
 	// Default region == full screen.
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) != 1 || g.Scrollback[0][0].Ch != 'A' {
+	if g.Scrollback.Len() != 1 || g.Scrollback.Row(0)[0].Ch != 'A' {
 		t.Errorf("full-screen scroll didn't push: %+v", g.Scrollback)
 	}
 }
@@ -881,7 +881,7 @@ func TestGrid_ScrollDownRegion_Partial(t *testing.T) {
 			t.Errorf("row %d = %q, want %q", i, got, w)
 		}
 	}
-	if len(g.Scrollback) != 0 {
+	if g.Scrollback.Len() != 0 {
 		t.Errorf("scrollDown polluted scrollback")
 	}
 }
@@ -1172,9 +1172,9 @@ func TestGrid_AltSuppressesScrollback(t *testing.T) {
 		g.Put('a' + rune(i))
 		g.Newline()
 	}
-	if len(g.Scrollback) != 0 {
+	if g.Scrollback.Len() != 0 {
 		t.Errorf("scrollback grew while alt active: %d rows",
-			len(g.Scrollback))
+			g.Scrollback.Len())
 	}
 	g.ExitAlt()
 	// Main scrollback writes still work after exit.
@@ -1182,7 +1182,7 @@ func TestGrid_AltSuppressesScrollback(t *testing.T) {
 		g.Put('m')
 		g.Newline()
 	}
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Errorf("scrollback not restored after ExitAlt")
 	}
 }
@@ -1486,8 +1486,9 @@ func TestGrid_ScrollUp_ShiftsWrappedFlags(t *testing.T) {
 	g.RowWrapped[2] = false
 	g.scrollUpRegion(1)
 	// The wrapped flag from row 0 should now be in scrollback.
-	if len(g.ScrollbackWrapped) != 1 || !g.ScrollbackWrapped[0] {
-		t.Errorf("ScrollbackWrapped = %v, want [true]", g.ScrollbackWrapped)
+	if g.Scrollback.Len() != 1 || !g.Scrollback.Wrapped(0) {
+		t.Errorf("Scrollback wrap = len %d wrapped(0)=%v, want 1/true",
+			g.Scrollback.Len(), g.Scrollback.Len() > 0 && g.Scrollback.Wrapped(0))
 	}
 	// After shifting, row 0 gets the old row 1's flag (false).
 	if g.RowWrapped[0] {
@@ -1502,9 +1503,10 @@ func TestGrid_ScrollUp_TrimsScrollbackWrapped(t *testing.T) {
 		g.RowWrapped[0] = true
 		g.scrollUpRegion(1)
 	}
-	if len(g.ScrollbackWrapped) != len(g.Scrollback) {
-		t.Errorf("ScrollbackWrapped len %d != Scrollback len %d",
-			len(g.ScrollbackWrapped), len(g.Scrollback))
+	// Ring keeps wrap flags structurally in sync with rows; just check
+	// cap was honored.
+	if g.Scrollback.Len() != 2 {
+		t.Errorf("scrollback len %d, want 2 (cap)", g.Scrollback.Len())
 	}
 }
 
@@ -1750,7 +1752,7 @@ func putRow(g *Grid, s string) {
 func TestGrid_ContentCellAt_Live(t *testing.T) {
 	g := NewGrid(3, 5)
 	putRow(g, "hello")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	cell := g.ContentCellAt(sb, 0)
 	if cell.Ch != 'h' {
 		t.Errorf("ContentCellAt live row 0 col 0 = %q, want 'h'", cell.Ch)
@@ -1766,7 +1768,7 @@ func TestGrid_ContentCellAt_Scrollback(t *testing.T) {
 	putRow(g, "first")
 	g.Newline() // scrolls "first" into scrollback
 	putRow(g, "secnd")
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Skip("no scrollback produced")
 	}
 	cell := g.ContentCellAt(0, 0)
@@ -1794,7 +1796,7 @@ func TestGrid_ContentCellAt_OutOfRange(t *testing.T) {
 
 func TestGrid_ContentRowToViewport_Live(t *testing.T) {
 	g := NewGrid(3, 5)
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	// ViewOffset=0: live rows visible.
 	vr, ok := g.ContentRowToViewport(sb)
 	if !ok || vr != 0 {
@@ -1823,7 +1825,7 @@ func TestGrid_ContentRowToViewport_Scrollback(t *testing.T) {
 	putRow(g, "first")
 	g.Newline()
 	putRow(g, "secnd")
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Skip("no scrollback produced")
 	}
 	// Freeze viewport at 1 row back so scrollback row 0 is visible.
@@ -1840,7 +1842,7 @@ func TestGrid_ContentRowToViewport_Scrollback(t *testing.T) {
 func TestGrid_Find_Basic(t *testing.T) {
 	g := NewGrid(3, 10)
 	putRow(g, "hello")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	pos, ok := g.Find("hello", ContentPos{Row: sb, Col: -1}, true)
 	if !ok {
 		t.Fatal("Find did not find 'hello'")
@@ -1853,7 +1855,7 @@ func TestGrid_Find_Basic(t *testing.T) {
 func TestGrid_Find_CaseInsensitive(t *testing.T) {
 	g := NewGrid(3, 10)
 	putRow(g, "HELLO")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	pos, ok := g.Find("hello", ContentPos{Row: sb, Col: -1}, true)
 	if !ok {
 		t.Fatal("Find case-insensitive did not match")
@@ -1898,7 +1900,7 @@ func TestGrid_Find_Wrap_Forward(t *testing.T) {
 	for range 10 {
 		g.Put(' ')
 	}
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	// Start search from row 1 (past the match), forward → should wrap and find.
 	pos, ok := g.Find("target", ContentPos{Row: sb + 1, Col: 0}, true)
 	if !ok {
@@ -1918,7 +1920,7 @@ func TestGrid_Find_Wrap_Backward(t *testing.T) {
 	for _, r := range "target" {
 		g.Put(r)
 	}
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	// Start from row 0, backward → wraps around and finds "target" on row 1.
 	pos, ok := g.Find("target", ContentPos{Row: sb, Col: 0}, false)
 	if !ok {
@@ -1964,7 +1966,7 @@ func TestGrid_ViewportMatches_AltActiveReturnsNil(t *testing.T) {
 func TestGrid_FindRegex_Forward(t *testing.T) {
 	g := NewGrid(3, 20)
 	putRow(g, "hello world")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	re := regexp.MustCompile(`w\w+`)
 	pos, l, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
 	if !ok {
@@ -1981,7 +1983,7 @@ func TestGrid_FindRegex_Forward(t *testing.T) {
 func TestGrid_FindRegex_Backward(t *testing.T) {
 	g := NewGrid(3, 20)
 	putRow(g, "foo bar foo")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	re := regexp.MustCompile(`foo`)
 	// Start after the second "foo" → backward search should find second "foo" first.
 	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb, Col: 11}, false)
@@ -2011,7 +2013,7 @@ func TestGrid_FindRegex_Wrap(t *testing.T) {
 	for range 20 {
 		g.Put(' ')
 	}
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	re := regexp.MustCompile(`target\d+`)
 	// Start past the match row; forward search should wrap.
 	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb + 1, Col: 0}, true)
@@ -2026,7 +2028,7 @@ func TestGrid_FindRegex_Wrap(t *testing.T) {
 func TestGrid_FindRegex_IPAddress(t *testing.T) {
 	g := NewGrid(3, 40)
 	putRow(g, "addr 192.168.1.1 end")
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	re := regexp.MustCompile(`[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}`)
 	pos, l, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
 	if !ok {
@@ -2046,10 +2048,10 @@ func TestGrid_FindRegex_InScrollback(t *testing.T) {
 	g.ScrollbackCap = 10
 	putRow(g, "error: 42")
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Skip("scrollback not populated")
 	}
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	re := regexp.MustCompile(`error: \d+`)
 	pos, _, ok := g.FindRegex(re, ContentPos{Row: sb, Col: -1}, true)
 	if !ok {
@@ -2355,7 +2357,7 @@ func TestGrid_ScrollViewTop_PinsToOldestRow(t *testing.T) {
 	for range 5 {
 		g.scrollUpRegion(1)
 	}
-	sb := len(g.Scrollback)
+	sb := g.Scrollback.Len()
 	if sb == 0 {
 		t.Skip("scrollback not populated")
 	}
@@ -2377,7 +2379,7 @@ func TestGrid_ViewportMatches_WithScrollback(t *testing.T) {
 	g.ScrollbackCap = 10
 	putRow(g, "hello")
 	g.scrollUpRegion(1)
-	if len(g.Scrollback) == 0 {
+	if g.Scrollback.Len() == 0 {
 		t.Skip("scrollback not populated")
 	}
 	// Scroll back so the "hello" row is visible in the viewport.
@@ -2421,8 +2423,8 @@ func TestGrid_Resize_Reflow_DeepScrollbackNarrow_CursorSurvives(t *testing.T) {
 	if g.At(g.CursorR, g.CursorC) == nil {
 		t.Error("cursor cell nil after narrow reflow")
 	}
-	if len(g.Scrollback) > g.ScrollbackCap {
-		t.Errorf("scrollback len %d exceeds cap %d", len(g.Scrollback), g.ScrollbackCap)
+	if g.Scrollback.Len() > g.ScrollbackCap {
+		t.Errorf("scrollback len %d exceeds cap %d", g.Scrollback.Len(), g.ScrollbackCap)
 	}
 }
 
@@ -2605,7 +2607,7 @@ func TestGrid_Marks_ShiftOnResize(t *testing.T) {
 		g.RowWrapped[i] = false
 	}
 	g.CursorR, g.CursorC = 3, 0
-	oldSbLen := len(g.Scrollback)
+	oldSbLen := g.Scrollback.Len()
 	g.Resize(4, 10) // same dims → no-op, marks unchanged
 	if len(g.Marks) != 1 {
 		t.Fatalf("no-op resize: want 1 mark, got %d", len(g.Marks))
