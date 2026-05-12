@@ -165,7 +165,7 @@ func TestEncodePNGFile_WritesPNG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	var magic [8]byte
 	_, _ = f.Read(magic[:])
 	if string(magic[:]) != "\x89PNG\r\n\x1a\n" {

@@ -70,9 +70,7 @@ var sixelDefaultPalette = [16]color.NRGBA{
 // drops the graphic silently in that case.
 func decodeSixel(data []byte) *image.NRGBA {
 	var pal [256]color.NRGBA
-	for i, c := range sixelDefaultPalette {
-		pal[i] = c
-	}
+	copy(pal[:], sixelDefaultPalette[:])
 	for i := 16; i < 256; i++ {
 		v := uint8(((i - 16) * 0xFF) / (256 - 16))
 		pal[i] = color.NRGBA{v, v, v, 0xFF}
