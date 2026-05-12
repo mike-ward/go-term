@@ -6,6 +6,7 @@
 package term
 
 import (
+	"math"
 	"regexp"
 	"slices"
 	"strings"
@@ -527,6 +528,17 @@ type Grid struct {
 	// kittyFlagStack supports CSI > u (push) / CSI < u (pop) nesting.
 	KittyKeyFlags  uint32
 	kittyFlagStack []uint32
+
+	// Graphics holds decoded images (Phase 32). Origin is in content
+	// coordinates so images travel through scrollback alongside the
+	// text near them. Capped at maxGraphics; oldest evicted first.
+	Graphics []Graphic
+
+	// CellPxW, CellPxH are advisory cell-pixel sizes set by the widget
+	// after its first measurement (under Mu in onDraw). Used to convert
+	// pixel-space image dimensions into cell-space cursor advancement
+	// at AddGraphic time. Zero before the first measurement.
+	CellPxW, CellPxH float32
 }
 
 // SelPos identifies a viewport cell (row, col). Kept for callers that
@@ -678,6 +690,102 @@ func (g *Grid) markDirty(r int) {
 	if r >= 0 && r < len(g.Dirty) {
 		g.Dirty[r] = true
 	}
+}
+
+// trimGraphics drops `extra` rows from the front of all graphic origins,
+// discarding any whose covered range falls entirely above row 0. Called
+// after scrollback is trimmed. Caller holds Mu.
+func (g *Grid) trimGraphics(extra int) {
+	if extra <= 0 || len(g.Graphics) == 0 {
+		return
+	}
+	j := 0
+	for _, gr := range g.Graphics {
+		gr.OriginR -= extra
+		if gr.OriginR+gr.Rows > 0 {
+			g.Graphics[j] = gr
+			j++
+		}
+	}
+	g.Graphics = g.Graphics[:j]
+}
+
+// shiftGraphics applies delta to all graphic origin rows, dropping those
+// that fall entirely outside [0, total). Called after a resize changes
+// scrollback depth. Caller holds Mu.
+func (g *Grid) shiftGraphics(delta, total int) {
+	if len(g.Graphics) == 0 {
+		return
+	}
+	j := 0
+	for _, gr := range g.Graphics {
+		gr.OriginR += delta
+		if gr.OriginR+gr.Rows > 0 && gr.OriginR < total {
+			g.Graphics[j] = gr
+			j++
+		}
+	}
+	g.Graphics = g.Graphics[:j]
+}
+
+// AddGraphic registers a decoded image at the cursor's current content
+// position and blanks the cells it covers. cellPxW/cellPxH from the
+// most recent measurement determine the cell rectangle; if those are
+// zero (no frame drawn yet) a single-cell footprint is used. Caller
+// holds Mu.
+func (g *Grid) AddGraphic(src string, widthPx, heightPx int) (int, int) {
+	if src == "" || widthPx <= 0 || heightPx <= 0 {
+		return 0, 0
+	}
+	cols, rows := 1, 1
+	if g.CellPxW > 0 && g.CellPxH > 0 {
+		cols = int(math.Ceil(float64(widthPx) / float64(g.CellPxW)))
+		rows = int(math.Ceil(float64(heightPx) / float64(g.CellPxH)))
+		if cols < 1 {
+			cols = 1
+		}
+		if rows < 1 {
+			rows = 1
+		}
+	}
+	originR := g.Scrollback.Len() + g.CursorR
+	originC := g.CursorC
+	if originC+cols > g.Cols {
+		cols = g.Cols - originC
+		if cols <= 0 {
+			return 0, 0
+		}
+	}
+	if len(g.Graphics) >= maxGraphics {
+		copy(g.Graphics, g.Graphics[1:])
+		g.Graphics = g.Graphics[:maxGraphics-1]
+	}
+	g.Graphics = append(g.Graphics, Graphic{
+		Src:      src,
+		OriginR:  originR,
+		OriginC:  originC,
+		Cols:     cols,
+		Rows:     rows,
+		WidthPx:  widthPx,
+		HeightPx: heightPx,
+	})
+	blank := blankCell(DefaultColor, DefaultColor, 0)
+	for r := range rows {
+		lr := g.CursorR + r
+		if lr < 0 || lr >= g.Rows {
+			continue
+		}
+		for c := range cols {
+			cc := originC + c
+			if cc < 0 || cc >= g.Cols {
+				continue
+			}
+			g.Cells[lr*g.Cols+cc] = blank
+		}
+		g.RowWrapped[lr] = false
+		g.markDirty(lr)
+	}
+	return cols, rows
 }
 
 func (g *Grid) markAllDirty() {
@@ -1320,6 +1428,14 @@ func (g *Grid) Resize(rows, cols int) {
 		total := g.Scrollback.Len() + rows
 		g.shiftMarks(delta, total)
 	}
+	// Graphics travel with their content rows across resize. Width-relative
+	// reflow isn't attempted — origin is preserved, oversize images get
+	// clipped at draw time.
+	if len(g.Graphics) > 0 {
+		delta := g.Scrollback.Len() - oldSbLen
+		total := g.Scrollback.Len() + rows
+		g.shiftGraphics(delta, total)
+	}
 }
 
 // repopulateScrollback resets the ring to (ScrollbackCap, cols) and
@@ -1795,6 +1911,7 @@ func (g *Grid) scrollUpRegion(n int) {
 		}
 		if evicted > 0 {
 			g.trimMarks(evicted)
+			g.trimGraphics(evicted)
 		}
 	}
 	// Shift surviving rows up.

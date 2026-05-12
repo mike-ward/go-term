@@ -26,6 +26,11 @@ const (
 // silently swallowed up to its terminator.
 const maxOSCBytes = 4096
 
+// maxDCSBytes caps DCS payloads. Sixel images can be sizable (a small
+// 320×240 sample is ~50 KB of sixel data); 1 MiB tolerates real-world
+// frames while keeping a malicious stream bounded.
+const maxDCSBytes = 1 << 20
+
 // da1Reply is the Primary Device Attribute response: VT100 with
 // advanced video. Apps like fish probe with CSI c at startup and
 // stall briefly waiting for it.
@@ -73,7 +78,17 @@ type Parser struct {
 	onTitle     func(string)
 	onReply     func([]byte)
 	onClipboard func([]byte)
+
+	// graphicsDir is the directory where decoded Sixel PNGs are written.
+	// Empty = os.TempDir(). Set via SetGraphicsDir; the widget creates a
+	// per-Term subdirectory and removes it on Close.
+	graphicsDir string
 }
+
+// SetGraphicsDir tells the parser where to write decoded Sixel images.
+// Empty string falls back to os.TempDir(). The widget creates a private
+// subdir per Term so cleanup on Close removes only its own files.
+func (p *Parser) SetGraphicsDir(dir string) { p.graphicsDir = dir }
 
 // SetTitleHandler registers a callback for OSC 0/1/2. Pass nil to
 // disable. Called while Grid.Mu is held.
@@ -272,7 +287,7 @@ func (p *Parser) Feed(b []byte) {
 			case 0x1B:
 				p.state = stDCSEsc
 			default:
-				if len(p.dcs) < maxOSCBytes {
+				if len(p.dcs) < maxDCSBytes {
 					p.dcs = append(p.dcs, c)
 				}
 			}
@@ -711,6 +726,11 @@ func (p *Parser) replyXTGETTCAP(body []byte) {
 
 func (p *Parser) dispatchDCS() {
 	if len(p.dcs) < 2 {
+		// Bare "Pq…" (no params, no data) is a malformed sixel introducer;
+		// also covers the single-char DCS form.
+		if len(p.dcs) == 1 && p.dcs[0] == 'q' {
+			p.handleSixel(nil)
+		}
 		return
 	}
 	switch {
@@ -725,6 +745,51 @@ func (p *Parser) dispatchDCS() {
 		case '2':
 			p.g.SyncActive = false
 		}
+	default:
+		// Sixel: DCS introducer is `Pp1;Pp2;Pp3 q <data>`. Params are
+		// digits and semicolons, terminated by 'q' (the sixel final
+		// byte). Anything else falls through.
+		if q := indexSixelFinal(p.dcs); q >= 0 {
+			p.handleSixel(p.dcs[q+1:])
+		}
+	}
+}
+
+// indexSixelFinal returns the index of the 'q' final byte that
+// introduces a Sixel data stream, or -1 if the payload prefix is not a
+// valid sixel param list. The prefix may be empty (bare 'q') or a
+// sequence of digits / semicolons.
+func indexSixelFinal(dcs []byte) int {
+	for i, b := range dcs {
+		switch {
+		case b == 'q':
+			return i
+		case b >= '0' && b <= '9', b == ';':
+			// param byte; keep scanning
+		default:
+			return -1
+		}
+	}
+	return -1
+}
+
+// handleSixel decodes a Sixel payload (bytes after the 'q' introducer)
+// and stashes the resulting image as a Grid graphic anchored at the
+// cursor. Cursor advances past the image's vertical extent so following
+// text starts below it (xterm convention). Decode failures are silent.
+func (p *Parser) handleSixel(data []byte) {
+	img := decodeSixel(data)
+	if img == nil {
+		return
+	}
+	b := img.Bounds()
+	path := encodePNGFile(img, p.graphicsDir)
+	if path == "" {
+		return
+	}
+	_, rows := p.g.AddGraphic(path, b.Dx(), b.Dy())
+	for range rows {
+		p.g.Newline()
 	}
 }
 

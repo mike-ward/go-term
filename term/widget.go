@@ -3,6 +3,7 @@ package term
 import (
 	"log"
 	"math"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -314,6 +315,11 @@ type Term struct {
 	// theme switching. Built once in New; nil when no themes are configured.
 	themeMenuItems []gui.MenuItemCfg
 
+	// gfxDir is a per-Term scratch directory for Sixel-decoded PNGs.
+	// Created lazily in New; removed (best-effort) in Close so a long
+	// session that prints many graphics doesn't pollute /tmp forever.
+	gfxDir string
+
 	// Momentum scroll state. momentumVel/Acc/CellH/Coasting protected by
 	// momentumMu. momentumTimer and momentumKick owned by the GUI goroutine
 	// (onMouseScroll) except for the timer callback, which only touches
@@ -383,6 +389,10 @@ func New(w *gui.Window, cfg Cfg) (*Term, error) {
 	t.writeHost = func(b []byte) error {
 		_, err := t.pty.Write(b)
 		return err
+	}
+	if dir, err := os.MkdirTemp("", "go-term-gfx-*"); err == nil {
+		t.gfxDir = dir
+		t.parser.SetGraphicsDir(dir)
 	}
 	t.parser.SetTitleHandler(t.onParserTitle)
 	t.parser.SetReplyHandler(t.onParserReply)
@@ -597,6 +607,9 @@ func (t *Term) Close() error {
 		return nil
 	}
 	close(t.blinkDone)
+	if t.gfxDir != "" {
+		_ = os.RemoveAll(t.gfxDir)
+	}
 	return t.pty.Close()
 }
 
@@ -774,6 +787,10 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			log.Printf("term: pty resize: %v", err)
 		}
 	}
+	// Publish the measured cell pixel size so Sixel decode can size graphics
+	// in cell-space at AddGraphic time.
+	t.grid.CellPxW = t.cellW
+	t.grid.CellPxH = t.cellH
 	t.grid.ClearDirty()
 
 	// Fast path: live viewport with no selection and no active search reads
@@ -971,6 +988,26 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 			}
 		}
 		flushRun(r)
+	}
+
+	// Graphics pass: paint decoded Sixel (or other) images on top of the
+	// background fill, under the cursor. Cells covered by an image are
+	// blanked at AddGraphic time so the text passes wrote nothing there.
+	// Each image's content-row origin maps to a viewport row via
+	// ContentRowToViewport; off-screen graphics are skipped.
+	if len(g.Graphics) > 0 {
+		for _, gr := range g.Graphics {
+			vr, ok := g.ContentRowToViewport(gr.OriginR)
+			if !ok {
+				continue
+			}
+			x := float32(gr.OriginC) * t.cellW
+			y := float32(vr) * t.cellH
+			w := float32(gr.Cols) * t.cellW
+			h := float32(gr.Rows) * t.cellH
+			dc.Image(x, y, w, h, gr.Src,
+				gui.Opt[float32]{}, gui.Color{})
+		}
 	}
 
 	now := time.Now()

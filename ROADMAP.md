@@ -717,7 +717,7 @@ pixels, so it survives scrolling and resizing.
 
 ---
 
-## Phase 31 — Disk-Backed Scrollback
+## Phase 31 — Disk-Backed Scrollback (SKIP)
 
 **Why:** Effectively "infinite" scrollback without high RAM usage or stalling on large `cat` operations.
 
@@ -733,12 +733,58 @@ pixels, so it survives scrolling and resizing.
 
 **Why:** Essential for modern terminal-parity; allows image previews and plot visualization.
 
-- [ ] `parser.go`: Handle DCS `q` for Sixel data streams.
-- [ ] `term/graphics.go`: New layer for managing a pixel-buffer (sidecar to the cell grid) and rendering it in `onDraw`.
-- [ ] `grid.go`: Cells covered by graphics need "placeholder" state to avoid text overstrike.
-- [ ] Tests: Verify Sixel decoding and correct placement relative to scrolling.
+- [x] `parser.go`: `maxDCSBytes = 1 MiB` cap (separated from OSC's
+      4 KiB — sixel frames are large). `dispatchDCS` recognizes the
+      sixel introducer via `indexSixelFinal` — scans optional
+      `Pp1;Pp2;Pp3` params followed by `q`, calls `handleSixel` on the
+      body. Decode failures drop silently. Cursor advances past the
+      image's vertical cell extent via `Newline()` so following text
+      lands below.
+- [x] `term/graphics.go`: New `Graphic` type (content-row origin, cell
+      footprint, PNG data URL). `decodeSixel` parses `#` color
+      register select/define (RGB + HLS, with DEC's blue-anchored hue
+      rotation), `!N` RLE, `$` CR, `-` LF, and `?`..`~` sixel chars
+      into a growable `*image.NRGBA`. Caps: 4096×4096 per image, 256
+      retained graphics per Grid. `encodePNGDataURL` wraps the NRGBA
+      in `data:image/png;base64,…`, ready for `dc.Image`. Define
+      side-effect selects the new register as current (per DEC).
+- [x] `grid.go`: `Graphics []Graphic` field; `CellPxW/CellPxH`
+      advisory fields published by the widget each frame so
+      `AddGraphic` can convert pixel sizes to cell rectangles.
+      `AddGraphic` anchors at the cursor's content row, blanks the
+      covered cells (so text passes don't overstrike), and evicts the
+      oldest graphic when over `maxGraphics`. `trimGraphics` /
+      `shiftGraphics` mirror the mark-adjustment logic — wired into
+      `scrollUpRegion` eviction and `Resize` reflow so images travel
+      with their text through history.
+- [x] `widget.go`: `onDraw` writes `t.cellW`/`t.cellH` into the grid
+      under Mu after the resize-check, then renders graphics between
+      the foreground text pass and the cursor pass via `dc.Image`.
+      `ContentRowToViewport` maps each origin row; off-screen
+      graphics skipped.
+- [x] Tests: `TestDecodeSixel_SinglePixel`, `…_ColorDefRGB`,
+      `…_RunLength`, `…_BandAdvance`, `…_CarriageReturn`,
+      `…_RasterAttrsSkipped`, `…_OutOfRangeColorIgnored`,
+      `…_EmptyPayload`, `TestEncodePNGDataURL_NilEmpty`,
+      `TestParser_DCS_SixelDispatch`, `…_SixelWithParams`,
+      `…_SixelBlanksCells`, `…_SixelOversizedDropped`,
+      `TestGrid_TrimGraphics_EvictsOffTop`, `…_PartialKeep`,
+      `TestGrid_ShiftGraphics_DropsOutOfRange`,
+      `TestGrid_AddGraphic_CapEvictsOldest`,
+      `TestIndexSixelFinal`, `TestHLSToRGB_Cardinals`.
 
 **Demo test:** `img2sixel_logo.png` renders the image inside the terminal.
+
+**Known limitation (Phase 32 minimal):** Graphics anchor to a
+content-row *index* (same model as OSC 133 Marks), not to specific
+surrounding text. On resize, `shiftGraphics` applies a single
+`newScrollback - oldScrollback` delta to all origins, so an image
+drifts relative to nearby text whenever rows above it reflow
+differently than the global average (e.g. wrapping a long line above
+the image when narrowing). Fixing this properly requires per-row
+attribution in the reflow walker — a shared fix with the OSC 133
+prompt-jump precision issue, deferred until either of those becomes
+a real annoyance.
 
 ## Critical files
 
