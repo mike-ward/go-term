@@ -202,6 +202,13 @@ const cursorBlinkPeriod = 500 * time.Millisecond
 // defaultScrollbackRows is the cap applied when Cfg.ScrollbackRows == 0.
 const defaultScrollbackRows = 5000
 
+// resizeDebounce is the minimum stable interval before a pending size
+// change is actually applied to the grid + PTY. Picked to be longer
+// than a single 60Hz frame (16.7 ms) so a continuous mouse drag never
+// triggers a reflow mid-gesture, but short enough that the post-drag
+// apply feels instant.
+const resizeDebounce = 50 * time.Millisecond
+
 // bellFlashDuration is how long the visual-bell overlay remains visible.
 const bellFlashDuration = 100 * time.Millisecond
 
@@ -334,6 +341,31 @@ type Term struct {
 
 	// runBuf reused across onDraw calls; grows once, never freed.
 	runBuf strings.Builder
+
+	// Pending-resize state. Live mouse drags fire onDraw at the display
+	// refresh rate with continuously changing dims; running grid.Resize
+	// (full scrollback reflow) on every frame allocates ~24 MB per call
+	// at the default 5000-row scrollback and starves the main thread on
+	// Grid.Mu, eventually appearing to hang. We coalesce by deferring
+	// the actual reflow until the target dims have been stable for
+	// resizeDebounce. Main-thread only (onDraw is the sole writer).
+	pendingResizeRows  int
+	pendingResizeCols  int
+	pendingResizeSince time.Time
+	// resizeTimer wakes the main thread to apply a pending resize after
+	// the debounce window even if the mouse stops moving (no further
+	// onDraw events would otherwise fire). Single shared timer reset
+	// each pending frame to avoid spawning goroutines.
+	resizeTimer *time.Timer
+
+	// pendingReplies buffers parser-originated reply bytes (DA, DECRQSS,
+	// XTGETTCAP, ...) emitted during parser.Feed. Drained by readLoop
+	// after Grid.Mu is released so writeHost (which can block when the
+	// PTY slave-side input buffer is full) cannot deadlock against
+	// onDraw waiting for the same lock. Owned by the readLoop goroutine
+	// — append (via onParserReply called from inside Feed) and drain
+	// both happen there.
+	pendingReplies [][]byte
 }
 
 type keyModes struct {
@@ -496,12 +528,55 @@ func (t *Term) onParserTitle(title string) {
 	})
 }
 
-// onParserReply writes parser-originated bytes (e.g. DA1 reply) back
-// to the PTY. Called under Grid.Mu; pty.Write is independent of that
-// lock so this is safe.
+// scheduleResizeWake arms (or resets) a one-shot timer that bumps the
+// draw version and asks go-gui for a redraw after d. Used by onDraw
+// when a resize is being debounced — without this, no further onDraw
+// would fire once the mouse stops moving and the debounced size would
+// never be applied. Main-thread only (called from inside onDraw under
+// Grid.Mu, but only mutates resizeTimer which is main-thread owned).
+func (t *Term) scheduleResizeWake(d time.Duration) {
+	wake := func() {
+		if t.closed.Load() {
+			return
+		}
+		t.bumpVersion()
+		t.win.QueueCommand(func(w *gui.Window) { w.UpdateWindow() })
+	}
+	if t.resizeTimer == nil {
+		t.resizeTimer = time.AfterFunc(d, wake)
+		return
+	}
+	t.resizeTimer.Reset(d)
+}
+
+// onParserReply queues parser-originated bytes (e.g. DA1 reply) for
+// writing back to the PTY after readLoop releases Grid.Mu. Called from
+// inside parser.Feed which runs under Mu on the readLoop goroutine —
+// writing to the PTY directly here would risk a deadlock when the
+// slave-side input buffer is full (shell not reading), since onDraw on
+// the main thread would be blocked waiting for the same Mu.
 func (t *Term) onParserReply(b []byte) {
-	if err := t.writeHost(b); err != nil {
-		log.Printf("term: pty reply: %v", err)
+	if len(b) == 0 {
+		return
+	}
+	cp := make([]byte, len(b))
+	copy(cp, b)
+	t.pendingReplies = append(t.pendingReplies, cp)
+}
+
+// flushPendingReplies writes all queued parser replies to the PTY.
+// Called by readLoop after Grid.Mu is released. Errors are logged and
+// the queue is drained even on partial failure.
+func (t *Term) flushPendingReplies() {
+	if len(t.pendingReplies) == 0 {
+		return
+	}
+	pending := t.pendingReplies
+	t.pendingReplies = nil
+	for _, b := range pending {
+		if err := t.writeHost(b); err != nil {
+			log.Printf("term: pty reply: %v", err)
+		}
 	}
 }
 
@@ -607,6 +682,9 @@ func (t *Term) Close() error {
 		return nil
 	}
 	close(t.blinkDone)
+	if t.resizeTimer != nil {
+		t.resizeTimer.Stop()
+	}
 	if t.gfxDir != "" {
 		_ = os.RemoveAll(t.gfxDir)
 	}
@@ -634,6 +712,10 @@ func (t *Term) readLoop() {
 				t.bumpVersion()
 			}
 			t.grid.Mu.Unlock()
+			// Drain parser replies (DA, DECRQSS, ...) outside Mu so a
+			// blocking pty.Write (slave-side input buffer full) cannot
+			// stall onDraw waiting for the same lock.
+			t.flushPendingReplies()
 			if redraw && dirty {
 				t.win.QueueCommand(func(w *gui.Window) {
 					if bellCount > t.bellSeenCount {
@@ -782,10 +864,27 @@ func (t *Term) onDraw(dc *gui.DrawContext) {
 
 	t.grid.Mu.Lock()
 	if rows != t.grid.Rows || cols != t.grid.Cols {
-		t.grid.Resize(rows, cols)
-		if err := t.pty.Resize(rows, cols); err != nil {
-			log.Printf("term: pty resize: %v", err)
+		now := time.Now()
+		if rows != t.pendingResizeRows ||
+			cols != t.pendingResizeCols ||
+			t.pendingResizeSince.IsZero() {
+			t.pendingResizeRows = rows
+			t.pendingResizeCols = cols
+			t.pendingResizeSince = now
 		}
+		if elapsed := now.Sub(t.pendingResizeSince); elapsed >= resizeDebounce {
+			t.grid.Resize(rows, cols)
+			if err := t.pty.Resize(rows, cols); err != nil {
+				log.Printf("term: pty resize: %v", err)
+			}
+			t.pendingResizeSince = time.Time{}
+		} else {
+			// Schedule a wake so the apply still happens after the
+			// mouse stops moving (no further frame events would fire).
+			t.scheduleResizeWake(resizeDebounce - elapsed)
+		}
+	} else if !t.pendingResizeSince.IsZero() {
+		t.pendingResizeSince = time.Time{}
 	}
 	// Publish the measured cell pixel size so Sixel decode can size graphics
 	// in cell-space at AddGraphic time.
