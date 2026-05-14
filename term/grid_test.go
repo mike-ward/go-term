@@ -2623,3 +2623,44 @@ func TestGrid_AddMark_AltScreenSuppressed(t *testing.T) {
 		t.Errorf("alt screen: want 0 marks, got %d", len(g.Marks))
 	}
 }
+
+func TestGrid_CursorMovementMarksDirty(t *testing.T) {
+	g := NewGrid(10, 10)
+	g.ClearDirty()
+
+	// Initial cursor is at 0,0. Move it to 5,5.
+	g.MoveCursor(5, 5)
+	if !g.Dirty[0] {
+		t.Errorf("MoveCursor: old row 0 not marked dirty")
+	}
+	if !g.Dirty[5] {
+		t.Errorf("MoveCursor: new row 5 not marked dirty")
+	}
+	if !g.HasDirtyRows() {
+		t.Errorf("MoveCursor: HasDirtyRows should be true")
+	}
+
+	g.ClearDirty()
+	g.CursorForward(2)
+	if !g.Dirty[5] {
+		t.Errorf("CursorForward: row 5 not marked dirty")
+	}
+
+	g.ClearDirty()
+	g.CursorDown(1)
+	if !g.Dirty[5] || !g.Dirty[6] {
+		t.Errorf("CursorDown: rows 5 and 6 not marked dirty")
+	}
+
+	g.ClearDirty()
+	g.Newline()
+	if !g.Dirty[6] || !g.Dirty[7] {
+		t.Errorf("Newline: rows 6 and 7 not marked dirty")
+	}
+
+	g.ClearDirty()
+	g.ReverseIndex()
+	if !g.Dirty[6] || !g.Dirty[7] {
+		t.Errorf("ReverseIndex: rows 6 and 7 not marked dirty")
+	}
+}

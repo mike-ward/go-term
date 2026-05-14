@@ -1635,7 +1635,9 @@ func (g *Grid) Newline() {
 	case g.CursorR == g.Bottom:
 		g.scrollUpRegion(1)
 	case g.CursorR+1 < g.Rows:
+		g.markDirty(g.CursorR)
 		g.CursorR++
+		g.markDirty(g.CursorR)
 	}
 }
 
@@ -1647,7 +1649,9 @@ func (g *Grid) ReverseIndex() {
 	case g.CursorR == g.Top:
 		g.scrollDownRegion(1)
 	case g.CursorR > 0:
+		g.markDirty(g.CursorR)
 		g.CursorR--
+		g.markDirty(g.CursorR)
 	}
 }
 
@@ -1725,7 +1729,9 @@ func (g *Grid) MoveCursor(r, c int) {
 	if c >= g.Cols {
 		c = g.Cols - 1
 	}
+	g.markDirty(g.CursorR)
 	g.CursorR, g.CursorC = r, c
+	g.markDirty(r)
 }
 
 // MoveCursorOrigin applies DECOM semantics: r is relative to Top when
@@ -1749,7 +1755,9 @@ func (g *Grid) MoveCursorOrigin(r, c int) {
 	if c >= g.Cols {
 		c = g.Cols - 1
 	}
+	g.markDirty(g.CursorR)
 	g.CursorR, g.CursorC = r, c
+	g.markDirty(r)
 }
 
 // CursorUp/Down/Forward/Back move the cursor by n cells, clamped.
