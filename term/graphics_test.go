@@ -306,8 +306,8 @@ func TestIndexSixelFinal(t *testing.T) {
 		{"0q", 1},
 		{"0;0;0q", 5},
 		{";q", 1},
-		{"$q", -1},  // '$' is DECRQSS, not sixel
-		{"+q", -1},  // '+' is XTGETTCAP
+		{"$q", -1}, // '$' is DECRQSS, not sixel
+		{"+q", -1}, // '+' is XTGETTCAP
 		{"abcq", -1},
 	}
 	for _, tt := range tests {

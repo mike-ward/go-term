@@ -79,8 +79,8 @@ func decodeSixel(data []byte) *image.NRGBA {
 	var (
 		cur       uint8
 		col       int
-		band      int  // 6-row band index; band 0 covers pixels y=0..5
-		repeat    int  // pending run-length (1 when not active)
+		band      int // 6-row band index; band 0 covers pixels y=0..5
+		repeat    int // pending run-length (1 when not active)
 		repActive bool
 		width     int
 		height    int
