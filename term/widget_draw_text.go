@@ -106,7 +106,15 @@ func cellRunKey(cell cell, base gui.TextStyle, g *grid, hoverR, hoverC int, cmdH
 		tf = glyph.TypefaceItalic
 	}
 	ulStyle := cell.ULStyle
-	ulColor := g.resolveColor(cell.ULColor, rawFG)
+	// An explicit SGR 58 color is honored as-is; the default means "follow the
+	// text", so it is resolved at the end from the color actually painted —
+	// after dim, hover recolor and the contrast clamp — instead of from the raw
+	// foreground. Resolving it here would underline dim text at full strength.
+	ulFollowsFG := cell.ULColor == defaultColor
+	var ulColor gui.Color
+	if !ulFollowsFG {
+		ulColor = g.resolveColor(cell.ULColor, rawFG)
+	}
 	if cell.LinkID != 0 {
 		if ulStyle == ulNone {
 			ulStyle = ulSingle
@@ -132,11 +140,15 @@ func cellRunKey(cell cell, base gui.TextStyle, g *grid, hoverR, hoverC int, cmdH
 	// then push back below the floor. Gated so a Term with the clamp off pays
 	// one float comparison and skips the bgOf resolve entirely.
 	//
-	// The underline color is deliberately left alone — it decorates text that
-	// has already been made legible, and clamping it too would flatten the
-	// distinction a colored underline exists to draw.
+	// An explicit SGR 58 underline color is deliberately left alone — it
+	// decorates text that has already been made legible, and clamping it too
+	// would flatten the distinction a colored underline exists to draw. A
+	// default underline color instead copies the clamped text color below.
 	if g.MinContrast > contrastDisabled {
 		color = g.applyMinContrast(color, g.bgOf(cell))
+	}
+	if ulFollowsFG {
+		ulColor = color
 	}
 	return runKey{
 		color:         color,
