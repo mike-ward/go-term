@@ -6,16 +6,39 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-07
+
+### Fixed
+
+- `falcon.exe` no longer opens a console window behind the terminal. The binary
+  is now linked `-H windowsgui`, which marks the PE as a GUI-subsystem image, so
+  the Windows loader stops allocating a console for the process.
+
+### Changed
+
+- Release archives cover both architectures on every platform. amd64-only
+  archives left arm64 Linux and Windows on ARM with nothing to download.
+- The macOS download is one universal `.dmg`, fused with `lipo` from an arm64
+  and an amd64 build. The previous build inherited the runner's architecture, so
+  the `.dmg` would not run on an Intel Mac at all.
+- Packaging moved into the Makefile, and the release workflow calls the same
+  targets, so a release can be rehearsed with `make release` before the tag is
+  pushed.
+- CI no longer installs SDL2, FreeType, HarfBuzz, Pango or fontconfig, and no
+  longer sets up an MSYS2 toolchain. The build is cgo-free on Linux and Windows:
+  the ConPTY layer is pure-Go syscalls, go-glyph shapes in pure Go, and go-gui
+  reaches GL through purego. None of those packages had a caller.
+
 ## [0.10.0] - 2026-09-02
 
 ### Added
 
-- Cursor appearance is now a user setting. `[general] cursor-style`
-  (`block`, `underline`, `bar`) and `cursor-blink` set the cursor a pane starts
-  with and the one `reset` returns to; `cursor-lock` makes go-term ignore an
-  application's `DECSCUSR`, pinning both. All three are also rows in the
-  command palette, applied to every open pane for the session. `term.Cfg`
-  gains `CursorStyle`, `CursorLocked`, and the live setters `SetCursorStyle`,
+- Cursor appearance is now a user setting. `[general] cursor-style` (`block`,
+  `underline`, `bar`) and `cursor-blink` set the cursor a pane starts with and
+  the one `reset` returns to; `cursor-lock` makes go-term ignore an
+  application's `DECSCUSR`, pinning both. All three are also rows in the command
+  palette, applied to every open pane for the session. `term.Cfg` gains
+  `CursorStyle`, `CursorLocked`, and the live setters `SetCursorStyle`,
   `SetCursorBlink`, `SetCursorLocked`.
 - Pane activity indicators: `term` now reports bells and OSC 133 command ends
   via `Cfg.OnActivity` / `ActivityKind`, and notifies command completion for
@@ -31,13 +54,13 @@ adheres to [Semantic Versioning](https://semver.org/).
   half of the old pointer moved to the new `CursorLocked`, which covers shape
   and blink together. `nil` becomes `false`; `*true` becomes
   `CursorBlink: true, CursorLocked: true`.
-- The internal `cursorShape` type is now the exported `term.CursorStyle`, so
-  the configured value and the grid state are one type.
-- `falcon` keeps config and workspace state under `~/.config/falcon` rather
-  than `~/.config/go-term`.
+- The internal `cursorShape` type is now the exported `term.CursorStyle`, so the
+  configured value and the grid state are one type.
+- `falcon` keeps config and workspace state under `~/.config/falcon` rather than
+  `~/.config/go-term`.
 - Blink, auto-scroll, and momentum tickers park when idle to reduce CPU/wakeups.
-- Dependencies: go-gui v0.59.2 → v0.66.1, go-glyph v1.20.1 → v1.24.0 (single-method
-  `View`, per-scope IDs, and related API migrations).
+- Dependencies: go-gui v0.59.2 → v0.66.1, go-glyph v1.20.1 → v1.24.0
+  (single-method `View`, per-scope IDs, and related API migrations).
 
 ### Fixed
 
@@ -60,11 +83,11 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ### API freeze
 
-v0.9.0 fixes the public surface that v1.0.0 will inherit. Every exported
-symbol now has a deliberate reason and a complete doc comment; what had no
-external consumer is unexported. This is the release to build against — the
-intent is that v1.0.0 (when go-gui reaches it) changes nothing here except
-removing the remaining deprecation shims.
+v0.9.0 fixes the public surface that v1.0.0 will inherit. Every exported symbol
+now has a deliberate reason and a complete doc comment; what had no external
+consumer is unexported. This is the release to build against — the intent is
+that v1.0.0 (when go-gui reaches it) changes nothing here except removing the
+remaining deprecation shims.
 
 **Unexported in `term`:** `DefaultColor` (internal packed-color encoding).
 `Fixture`/`CaptureFixture` stay public but are explicitly marked test
@@ -73,20 +96,20 @@ infrastructure with no compatibility guarantee.
 **Unexported in `term/workspace`:** `Tab`, `SplitDir`/`SplitVertical`/
 `SplitHorizontal`, and the keyboard-command methods an embedder never called —
 `AddTab`, `CloseTab`, `ClosePane`, `SplitPane`, `NextPane`, `PrevPane`,
-`GoToTab`, `MoveTabLeft/Right`, `NextTab`, `PrevTab`, `FocusPane`,
-`ToggleHelp`, `TogglePalette`, `ToggleThemeBrowser`, `ToggleRecording`,
-`ToggleBroadcast`, `Broadcasting`, `ReloadConfig`. The workspace keeps
-`Workspace`, `New`, `Restore`, `Close`, `View`, `Cfg`, `Save`,
-`DefaultWorkspacePath`, `DefaultConfigPath`, `LiveTermCount` and `ActivePane`
-(the last two because falcon, the reference embedder, uses them).
+`GoToTab`, `MoveTabLeft/Right`, `NextTab`, `PrevTab`, `FocusPane`, `ToggleHelp`,
+`TogglePalette`, `ToggleThemeBrowser`, `ToggleRecording`, `ToggleBroadcast`,
+`Broadcasting`, `ReloadConfig`. The workspace keeps `Workspace`, `New`,
+`Restore`, `Close`, `View`, `Cfg`, `Save`, `DefaultWorkspacePath`,
+`DefaultConfigPath`, `LiveTermCount` and `ActivePane` (the last two because
+falcon, the reference embedder, uses them).
 
 **`RunAction` reaches every action.** It dispatches through a real
 `Action → handler` table instead of synthesizing the action's chord, so an
 action a user unbinds from the keyboard is still invocable from a command
 palette. The copy-mode, search-bar and alt-screen mode gates move into the
-dispatch path, byte-for-byte the same rules the keyboard applies; the
-copy-mode key handlers now share one operation table with direct dispatch, so
-the two cannot diverge.
+dispatch path, byte-for-byte the same rules the keyboard applies; the copy-mode
+key handlers now share one operation table with direct dispatch, so the two
+cannot diverge.
 
 ### Added
 
@@ -142,10 +165,10 @@ the two cannot diverge.
 - `term`: mouse-wheel scrolling was far too slow on Windows and Linux, and
   mismatched Ghostty on retina displays. A wheel delta is now measured in lines
   and scaled by the cell height (and the retina sensitivity matched), so one
-  reported line moves exactly one grid row and a notch travels three — the
-  xterm / kitty / Windows Terminal convention.
-- `term`: Super+Shift+V paste no longer types a trailing `V` on Linux (the
-  synth char event duplicated the paste).
+  reported line moves exactly one grid row and a notch travels three — the xterm
+  / kitty / Windows Terminal convention.
+- `term`: Super+Shift+V paste no longer types a trailing `V` on Linux (the synth
+  char event duplicated the paste).
 - `term`: Windows pty teardown is bounded, so a live child cannot hang `Close`.
 - `term`: the bottom-row background only bleeds when the row is uniform.
 - `term`: cell origins snap to the device pixel grid, eliminating half-pixel
