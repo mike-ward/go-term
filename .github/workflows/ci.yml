@@ -24,18 +24,6 @@ jobs:
           cache: true
           cache-dependency-path: go-term/go.sum
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
-
       - name: Vet
         working-directory: go-term
         run: go vet ./...
@@ -62,17 +50,6 @@ jobs:
           go-version: "1.26"
           cache: true
           cache-dependency-path: go-term/go.sum
-
-      - name: Install system deps
-        run: |
-          brew install \
-            sdl2 \
-            freetype \
-            harfbuzz \
-            pango \
-            fontconfig \
-            glib \
-            hunspell
 
       - name: Vet
         working-directory: go-term
@@ -101,26 +78,10 @@ jobs:
           cache: true
           cache-dependency-path: go-term/go.sum
 
-      # msys2 provides the mingw gcc the GUI backend's cgo needs; without it
-      # the falcon build depends on whatever the runner image happens to ship.
-      # Pinned to commit 66cd2cc of the v2 tag (supply-chain hardening; bump
-      # by resolving refs/tags/v2 via `git ls-remote`).
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: MINGW64
-          update: false
-          release: false
-          path-type: inherit
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-pkg-config
-
-      # No system deps step: unlike the Linux/macOS jobs, nothing below the GUI
-      # backend needs SDL2/freetype/harfbuzz. The ConPTY layer (pty_windows.go)
-      # is pure-Go syscalls over golang.org/x/sys/windows, and go-glyph's
-      # shaping stack is pure Go, so CGO_ENABLED=0 covers term/ and internal/
-      # end to end. Disabling cgo also keeps these steps independent of the
-      # runner image's mingw toolchain.
+      # Nothing here needs a C toolchain. The ConPTY layer (pty_windows.go)
+      # is pure-Go syscalls over golang.org/x/sys/windows, go-glyph's
+      # shaping stack is pure Go, and go-gui reaches GL through purego, so
+      # CGO_ENABLED=0 covers term/, internal/ and falcon end to end.
       - name: Vet
         working-directory: go-term
         env:
@@ -143,11 +104,12 @@ jobs:
           CGO_ENABLED: "0"
         run: go test -count=1 ./term/... ./internal/...
 
-      # The GUI backend needs cgo (go-gl); gcc comes from the msys2 step
-      # above. Gates merges — falcon ships Windows binaries in the release
+      # Gates merges: falcon ships Windows binaries in the release
       # workflow, so this build must stay green per PR.
       - name: Build falcon
         working-directory: go-term
+        env:
+          CGO_ENABLED: "0"
         run: go build -tags prod ./examples/falcon
 
   lint:
@@ -166,18 +128,6 @@ jobs:
           cache-dependency-path: |
             go-term/go.sum
             go-term/tools/lint/go.sum
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
 
       - name: Lint
         working-directory: go-term
@@ -198,18 +148,6 @@ jobs:
           go-version: "1.26"
           cache: true
           cache-dependency-path: go-term/go.sum
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
 
       - name: Bench regress
         working-directory: go-term
@@ -244,18 +182,6 @@ jobs:
           cache: true
           cache-dependency-path: go-term/go.sum
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
-
       - name: Fuzz
         working-directory: go-term
         run: |
@@ -279,18 +205,6 @@ jobs:
           go-version: "1.26"
           cache: true
           cache-dependency-path: go-term/go.sum
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
 
       - name: Check parser/grid changes
         id: changed
@@ -330,18 +244,6 @@ jobs:
           go-version: "1.26"
           cache: true
           cache-dependency-path: go-term/go.sum
-
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
 
       - name: Bench
         working-directory: go-term

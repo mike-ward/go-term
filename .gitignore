@@ -23,6 +23,11 @@ main
 # suffix rather than by name so it survives a change to APP_NAME.
 *.app/
 
+# `make release` output. Same reason: the archives carry extensions
+# (.tar.gz, .zip, .dmg), so the unignore rule above would track them.
+/dist/
+/build/
+
 # Test binary
 *.test
 

@@ -1,5 +1,7 @@
 .PHONY: bench bench-verbose bench-save bench-regress test test-race vet lint \
-	lint-bin build clean app clean-app build-falcon cross-windows prepush
+	lint-bin build clean app clean-app build-falcon cross-windows prepush \
+	build-linux build-windows build-macos \
+	package-linux package-windows package-macos release
 
 # Repo-local bin for the pinned linter. The pinned VERSION itself lives in
 # tools/lint/go.mod -- see the $(LINT_BIN) rule below.
@@ -59,6 +61,15 @@ SIGN_FLAG    := $(if $(SIGN_IDENTITY),-sign "$(SIGN_IDENTITY)",)
 # Shipping builds exclude the go-gui F12 inspector overlay. Dev builds
 # (`go run .`, plain `go build`) keep it.
 PROD_TAGS    := -tags prod
+
+# Release packaging. BUILD holds intermediates, DIST the artifacts the
+# release workflow attaches.
+BUILD        := build
+DIST         := dist
+# Multi-size .ico (16 through 256); buildapp injects it as the exe's icon
+# resource. The Linux icon must be a .png, filed under hicolor's 256x256.
+APP_ICO      := examples/falcon/icon/falcon.ico
+APP_PNG      := examples/falcon/icon/falcon-256.png
 
 # Default benchmark run — quick pass over all benchmarks.
 # -run=^$ skips tests so stale timers don't fire during benchmark runs.
@@ -178,10 +189,114 @@ $(APP_NAME).app: $(BUILDAPP_BIN) $(APP_ICON)
 		-id github.com.go-gui-org.go-term -icon $(APP_ICON) \
 		$(SIGN_FLAG) -version $(BUNDLE_VER) $(DEMO_BIN)
 
+# ------------------------------------------------------- release builds
+#
+# These produce the same archives as .github/workflows/release.yml, so a
+# tag can be rehearsed locally before it is pushed. The `app` target above
+# stays the quick native bundle for day-to-day work; these are the
+# shipping path and go through GOWORK=off.
+#
+# Only macOS needs cgo, for the Metal backend. Everything else is cgo-free
+# -- the ConPTY layer is pure-Go syscalls, go-glyph's shaping stack is
+# pure Go, and go-gui reaches GL through purego -- so Linux and Windows
+# cross-compile from any host, both architectures.
+
+build-linux:
+	@mkdir -p $(BUILD)
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(PROD_TAGS) \
+	  -ldflags '$(LDFLAGS)' -o $(BUILD)/$(DEMO_BIN)-linux-amd64 ./examples/falcon
+	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build $(PROD_TAGS) \
+	  -ldflags '$(LDFLAGS)' -o $(BUILD)/$(DEMO_BIN)-linux-arm64 ./examples/falcon
+
+# -H windowsgui marks the PE as a GUI-subsystem image. Without it the
+# loader hands the process a console, so launching falcon puts an empty
+# terminal window behind the emulator's own. Safe for the ConPTY layer:
+# it builds its pseudoconsole from pipes via CreatePseudoConsole and never
+# calls AllocConsole or AttachConsole, so it needs no console of its own.
+build-windows:
+	@mkdir -p $(BUILD)
+	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build $(PROD_TAGS) \
+	  -ldflags '$(LDFLAGS) -H windowsgui' \
+	  -o $(BUILD)/$(DEMO_BIN)-windows-amd64.exe ./examples/falcon
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build $(PROD_TAGS) \
+	  -ldflags '$(LDFLAGS) -H windowsgui' \
+	  -o $(BUILD)/$(DEMO_BIN)-windows-arm64.exe ./examples/falcon
+
+# Universal binary, so one .dmg serves Apple silicon and Intel. Each half
+# needs its own cgo -arch flags; lipo then fuses them. macOS host only:
+# the Metal backend needs the macOS SDK.
+build-macos:
+	@mkdir -p $(BUILD)
+	CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+	  CGO_CFLAGS="-arch arm64" \
+	  CGO_LDFLAGS="-arch arm64 -Wl,-no_warn_duplicate_libraries" \
+	  $(GO) build $(PROD_TAGS) -ldflags '$(LDFLAGS)' \
+	  -o $(BUILD)/$(DEMO_BIN)-darwin-arm64 ./examples/falcon
+	CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 \
+	  CGO_CFLAGS="-arch x86_64" \
+	  CGO_LDFLAGS="-arch x86_64 -Wl,-no_warn_duplicate_libraries" \
+	  $(GO) build $(PROD_TAGS) -ldflags '$(LDFLAGS)' \
+	  -o $(BUILD)/$(DEMO_BIN)-darwin-amd64 ./examples/falcon
+	lipo -create -output $(BUILD)/$(DEMO_BIN)-macos \
+	  $(BUILD)/$(DEMO_BIN)-darwin-arm64 $(BUILD)/$(DEMO_BIN)-darwin-amd64
+
+# ---------------------------------------------------------- packaging
+#
+# buildapp takes the installed executable's name from the file's basename,
+# so each binary is staged under its plain name first. Otherwise
+# "falcon-linux-amd64" lands in the desktop entry's Exec= line.
+
+package-linux: build-linux $(BUILDAPP_BIN)
+	@mkdir -p $(BUILD)/pkg-linux-amd64 $(BUILD)/pkg-linux-arm64 $(DIST)
+	cp $(BUILD)/$(DEMO_BIN)-linux-amd64 $(BUILD)/pkg-linux-amd64/$(DEMO_BIN)
+	cp $(BUILD)/$(DEMO_BIN)-linux-arm64 $(BUILD)/pkg-linux-arm64/$(DEMO_BIN)
+	$(BUILDAPP_BIN) -platform linux -o $(DIST) -version '$(VERSION)' \
+	  -name $(APP_NAME) -id github.com.go-gui-org.go-term -icon $(APP_PNG) \
+	  $(BUILD)/pkg-linux-amd64/$(DEMO_BIN)
+	$(BUILDAPP_BIN) -platform linux -o $(DIST) -version '$(VERSION)' \
+	  -name $(APP_NAME) -id github.com.go-gui-org.go-term -icon $(APP_PNG) \
+	  $(BUILD)/pkg-linux-arm64/$(DEMO_BIN)
+
+# Replaces the old `zip falcon.exe`, which shipped an exe with no icon
+# resource at all despite falcon.ico sitting in the tree.
+package-windows: build-windows $(BUILDAPP_BIN)
+	@mkdir -p $(BUILD)/pkg-windows-amd64 $(BUILD)/pkg-windows-arm64 $(DIST)
+	cp $(BUILD)/$(DEMO_BIN)-windows-amd64.exe $(BUILD)/pkg-windows-amd64/$(DEMO_BIN).exe
+	cp $(BUILD)/$(DEMO_BIN)-windows-arm64.exe $(BUILD)/pkg-windows-arm64/$(DEMO_BIN).exe
+	$(BUILDAPP_BIN) -platform windows -o $(DIST) -version '$(VERSION)' \
+	  -name $(APP_NAME) -id github.com.go-gui-org.go-term -icon $(APP_ICO) \
+	  $(BUILD)/pkg-windows-amd64/$(DEMO_BIN).exe
+	$(BUILDAPP_BIN) -platform windows -o $(DIST) -version '$(VERSION)' \
+	  -name $(APP_NAME) -id github.com.go-gui-org.go-term -icon $(APP_ICO) \
+	  $(BUILD)/pkg-windows-arm64/$(DEMO_BIN).exe
+
+# No -bundle-deps, unlike the `app` target: falcon links nothing outside
+# /System and /usr/lib, so there is nothing to copy, and buildapp's
+# dependency rewriter fails outright on a universal binary
+# (install_name_tool -id against the fat Mach-O exits 1).
+package-macos: build-macos $(BUILDAPP_BIN)
+	@mkdir -p $(BUILD)/pkg-macos $(DIST)
+	cp $(BUILD)/$(DEMO_BIN)-macos $(BUILD)/pkg-macos/$(DEMO_BIN)
+	rm -rf '$(BUILD)/$(APP_NAME).app'
+	$(BUILDAPP_BIN) -platform darwin -o $(BUILD) \
+	  -name $(APP_NAME) -id github.com.go-gui-org.go-term \
+	  -icon $(APP_ICON) $(SIGN_FLAG) -version $(BUNDLE_VER) \
+	  $(BUILD)/pkg-macos/$(DEMO_BIN)
+	rm -f '$(DIST)/$(DEMO_BIN)-$(VERSION)-macos.dmg'
+	hdiutil create -srcfolder '$(BUILD)/$(APP_NAME).app' \
+	  -volname '$(APP_NAME) $(VERSION)' -format UDZO \
+	  '$(DIST)/$(DEMO_BIN)-$(VERSION)-macos.dmg'
+	codesign -s - --force '$(DIST)/$(DEMO_BIN)-$(VERSION)-macos.dmg'
+
+# Every artifact the release workflow attaches. package-macos needs a Mac;
+# on Linux run package-linux and package-windows only.
+release: package-linux package-windows package-macos
+	@ls -la $(DIST)
+
 clean-app:
 	rm -f $(DEMO_BIN)
 	rm -rf $(APP_NAME).app
-	rm -rf build
+	rm -rf $(BUILD) $(DIST)
 
 # Clean test cache and built binaries.
 clean:
