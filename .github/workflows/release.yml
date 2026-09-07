@@ -6,187 +6,117 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# Nothing by default; only the final release job needs a token with write
-# access (contents: write to attach assets), and only it declares it.
+# Nothing by default. Only the final job needs a write token, to attach
+# the assets, and only it asks for one.
 permissions: {}
 
+# Each job runs the same Makefile target a developer runs locally, so a
+# release can be rehearsed with `make release` before the tag is pushed.
+#
+# Only macOS needs a matching runner: the Metal backend is the one cgo
+# target. Linux and Windows are cgo-free -- the ConPTY layer is pure-Go
+# syscalls over golang.org/x/sys/windows, go-glyph's shaping stack is
+# pure Go, and go-gui reaches GL through purego -- so one ubuntu runner
+# cross-compiles both, for both architectures, with no C toolchain.
 jobs:
   linux:
     name: Linux
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+        # buildapp stamps the archive name from `git describe`, which
+        # needs the tag history a shallow clone leaves out.
         with:
-          path: go-term
+          fetch-depth: 0
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
           cache: true
-          cache-dependency-path: go-term/go.sum
+          cache-dependency-path: go.sum
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libsdl2-dev \
-            libfreetype6-dev \
-            libharfbuzz-dev \
-            libpango1.0-dev \
-            libfontconfig1-dev \
-            libglib2.0-dev \
-            libhunspell-dev
+      - name: Package amd64 and arm64
+        run: make package-linux
 
-      - name: Build falcon
-        working-directory: go-term
-        run: |
-          VERSION=$(git describe --tags --always 2>/dev/null || echo dev)
-          go build -tags prod \
-            -ldflags "-X main.version=${VERSION}" \
-            -o falcon ./examples/falcon
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-
-      - name: Package
-        working-directory: go-term
-        run: |
-          mkdir -p stage
-          cp falcon stage/
-          cp packaging/falcon.desktop stage/
-          cp packaging/install.txt stage/
-          cp examples/falcon/icon/falcon.png stage/
-          tar czf "falcon-${VERSION}-linux-amd64.tar.gz" -C stage .
-
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: linux-asset
-          path: go-term/falcon-*-linux-amd64.tar.gz
-
-  macos:
-    name: macOS
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          path: go-term
-
-      - uses: actions/setup-go@v6
-        with:
-          go-version: "1.26"
-          cache: true
-          cache-dependency-path: go-term/go.sum
-
-      - name: Install system deps
-        run: |
-          brew install \
-            sdl2 \
-            freetype \
-            harfbuzz \
-            pango \
-            fontconfig \
-            glib \
-            hunspell
-
-      - name: Build falcon
-        working-directory: go-term
-        run: |
-          VERSION=$(git describe --tags --always 2>/dev/null || echo dev)
-          go build -tags prod \
-            -ldflags "-X main.version=${VERSION}" \
-            -o falcon ./examples/falcon
-          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
-
-      - name: Bundle .app
-        working-directory: go-term
-        run: |
-          go build -o buildapp github.com/go-gui-org/go-gui/cmd/buildapp
-          ./buildapp -bundle-deps -name Falcon \
-            -id github.com.go-gui-org.go-term \
-            -icon examples/falcon/icon/falcon.icns \
-            -version "${VERSION#v}" falcon
-
-      - name: Package
-        working-directory: go-term
-        run: |
-          hdiutil create -srcfolder "Falcon.app" \
-            -volname "Falcon ${VERSION}" \
-            -format UDZO "falcon-${VERSION}-macos.dmg"
-          # Ad-hoc sign for now — notarized Developer ID signing is a
-          # follow-up once an Apple Developer account exists (issue #105).
-          codesign -s - --force "falcon-${VERSION}-macos.dmg"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: macos-asset
-          path: go-term/falcon-*-macos.dmg
+          path: dist/falcon-*-linux-*.tar.gz
 
   windows:
     name: Windows
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
+    # Cross-compiled from Linux. The build is cgo-free, so the result is
+    # identical to one produced on a windows runner, and a single job
+    # covers both architectures without msys2.
+    runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
-          path: go-term
+          fetch-depth: 0
 
-      # Pinned to commit 66cd2cc of the v2 tag (supply-chain hardening; bump
-      # by resolving refs/tags/v2 via `git ls-remote`).
-      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884
-        with:
-          msystem: MINGW64
-          update: false
-          release: false
-          path-type: inherit
-          install: >-
-            mingw-w64-x86_64-gcc
-            mingw-w64-x86_64-pkg-config
-            zip
-
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v5
         with:
           go-version: "1.26"
           cache: true
-          cache-dependency-path: go-term/go.sum
+          cache-dependency-path: go.sum
 
-      - name: Build falcon
-        working-directory: go-term
-        run: |
-          VERSION=$(git describe --tags --always 2>/dev/null || echo dev)
-          CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=gcc \
-            go build -tags prod \
-            -ldflags "-X main.version=${VERSION}" \
-            -o falcon.exe ./examples/falcon
+      # Injects falcon.ico as the exe's icon resource and marks the PE as
+      # a GUI-subsystem image, so no console window opens behind falcon.
+      - name: Package amd64 and arm64
+        run: make package-windows
 
-      - name: Package
-        working-directory: go-term
-        run: |
-          VERSION=$(git describe --tags --always 2>/dev/null || echo dev)
-          zip "falcon-${VERSION}-windows-amd64.zip" falcon.exe
-
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: windows-asset
-          path: go-term/falcon-*-windows-amd64.zip
+          path: dist/falcon-*-windows-*.zip
+
+  macos:
+    name: macOS
+    # A Mac is required: the Metal backend is cgo, and the bundle needs
+    # iconutil, lipo, hdiutil and codesign.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache: true
+          cache-dependency-path: go.sum
+
+      # Builds arm64 and amd64, fuses them with lipo, bundles the result
+      # as Falcon.app and writes an ad-hoc signed .dmg. One download
+      # serves Apple silicon and Intel.
+      - name: Package universal .dmg
+        run: make package-macos
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-asset
+          path: dist/falcon-*-macos.dmg
 
   release:
     name: Attach to GitHub Release
-    needs: [linux, macos, windows]
+    needs: [linux, windows, macos]
     runs-on: ubuntu-latest
-    # Creating the release (action-gh-release) needs a write token; the build
-    # jobs above run with the workflow's empty permission set.
+    # Only this job writes. The build jobs above keep the workflow's
+    # empty permission set.
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v4
         with:
           pattern: '*-asset'
           merge-multiple: true
-          path: assets
+          path: dist
 
-      # Pinned to commit 3d0d988 (v3 tag, annotated — dereferenced via
-      # refs/tags/v3^{} for supply-chain hardening).
-      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228
+      # Pinned to a commit rather than the v3 tag: a tag can be moved to
+      # point at different code, a commit cannot.  This commit is release
+      # 3.0.3, which is what refs/tags/v3 dereferenced to when it was
+      # written.  Bump it deliberately, after reading the diff.
+      - uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64
         with:
-          files: assets/*
+          files: dist/*
           generate_release_notes: true
