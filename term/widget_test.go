@@ -3971,3 +3971,73 @@ func TestShowSizeBadge_SuppressedUntilFirstResize(t *testing.T) {
 			tm.resize.badgeRows, tm.resize.badgeCols)
 	}
 }
+
+// SGR 2;4 (dim + underline, what `gh issue list` prints for its header) must
+// underline in the dimmed text color, not the raw foreground: a default
+// underline color follows whatever the text is finally painted with.
+func TestCellRunKey_DefaultULColorFollowsDimmedText(t *testing.T) {
+	g := newGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	c := cell{
+		Ch: 'A', FG: 7, BG: defaultColor, ULColor: defaultColor,
+		Width: 1, ULStyle: ulSingle, Attrs: attrDim,
+	}
+	k := cellRunKey(c, base, g, -1, -1, false, false)
+	if k.ulColor != k.color {
+		t.Errorf("ulColor = %+v, want text color %+v", k.ulColor, k.color)
+	}
+}
+
+// An explicit SGR 58 underline color is not dimmed with the text.
+func TestCellRunKey_ExplicitULColorIgnoresDim(t *testing.T) {
+	g := newGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	want := gui.RGB(255, 161, 1)
+	c := cell{
+		Ch: 'A', FG: 7, BG: defaultColor, Width: 1, ULStyle: ulSingle,
+		ULColor: rgbColor(255, 161, 1), Attrs: attrDim,
+	}
+	if got := cellRunKey(c, base, g, -1, -1, false, false).ulColor; got != want {
+		t.Errorf("ulColor = %+v, want %+v", got, want)
+	}
+}
+
+// A default underline color follows the contrast-clamped text color, so the
+// underline stays the same color as the text actually painted.
+func TestCellRunKey_DefaultULColorFollowsContrast(t *testing.T) {
+	g := newGrid(4, 8)
+	g.setTheme(mustBundled(t, "Catppuccin Latte"))
+	g.MinContrast = 4.5
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	c := cell{
+		Ch: 'A', FG: rgbColor(255, 161, 1), BG: defaultColor,
+		ULColor: defaultColor, Width: 1, ULStyle: ulSingle,
+	}
+	k := cellRunKey(c, base, g, -1, -1, false, false)
+	if k.ulColor != k.color {
+		t.Errorf("ulColor = %+v, want clamped text color %+v", k.ulColor, k.color)
+	}
+	if r := contrastRatio(k.ulColor, g.bgOf(c)); r < 4.5 {
+		t.Errorf("underline ratio %.2f, want >= 4.5", r)
+	}
+}
+
+// A default underline color follows the Cmd-hover recolor, so a hovered link
+// underlines in the blue it is painted with rather than the unhovered color.
+func TestCellRunKey_DefaultULColorFollowsHover(t *testing.T) {
+	g := newGrid(4, 8)
+	base := gui.TextStyle{Typeface: glyph.TypefaceRegular}
+	c := cell{
+		Ch: 'A', FG: 7, BG: defaultColor, ULColor: defaultColor,
+		Width: 1, ULStyle: ulSingle,
+	}
+	plain := cellRunKey(c, base, g, -1, -1, false, false)
+	hovered := cellRunKey(c, base, g, -1, -1, false, true)
+	if hovered.color == plain.color {
+		t.Fatal("premise broken: hover recolor did not change the text color")
+	}
+	if hovered.ulColor != hovered.color {
+		t.Errorf("ulColor = %+v, want hovered text color %+v",
+			hovered.ulColor, hovered.color)
+	}
+}
